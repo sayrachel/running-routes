@@ -1,0 +1,34 @@
+{
+  "expo": {
+    "name": "RouteForge",
+    "slug": "routeforge",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "scheme": "routeforge",
+    "splash": {
+      "backgroundColor": "#0b0f14"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.routeforge.app",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "RouteForge needs your location to generate running routes near you."
+      }
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "RouteForge needs your location to generate running routes near you."
+        }
+      ],
+      "expo-asset"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}
