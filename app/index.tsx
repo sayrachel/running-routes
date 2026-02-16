@@ -5,6 +5,8 @@ import {
   Pressable,
   StyleSheet,
   ActivityIndicator,
+  TextInput,
+  Keyboard,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
@@ -41,6 +43,12 @@ export default function SetupScreen() {
   const [hasEndLocation, setHasEndLocation] = useState(false);
   const [drawerVisible, setDrawerVisible] = useState(false);
   const [previewFavorite, setPreviewFavorite] = useState<FavoriteRoute | null>(null);
+  const [showAddressInput, setShowAddressInput] = useState(false);
+  const [addressText, setAddressText] = useState('');
+  const [isGeocoding, setIsGeocoding] = useState(false);
+  const [showEndAddressInput, setShowEndAddressInput] = useState(false);
+  const [endAddressText, setEndAddressText] = useState('');
+  const [isEndGeocoding, setIsEndGeocoding] = useState(false);
 
   // Auth redirect
   useEffect(() => {
@@ -90,6 +98,34 @@ export default function SetupScreen() {
     }
   }, [ctx]);
 
+  const handleLocationCardPress = useCallback(() => {
+    if (ctx.hasLocation) {
+      setAddressText('');
+      setShowAddressInput(true);
+    } else {
+      handleLocateMe();
+    }
+  }, [ctx.hasLocation, handleLocateMe]);
+
+  const handleAddressSubmit = useCallback(async () => {
+    if (!addressText.trim()) return;
+    setIsGeocoding(true);
+    try {
+      const results = await Location.geocodeAsync(addressText.trim());
+      if (results.length > 0) {
+        ctx.setCenter({ lat: results[0].latitude, lng: results[0].longitude });
+        ctx.setHasLocation(true);
+        setShowAddressInput(false);
+        setAddressText('');
+        Keyboard.dismiss();
+      }
+    } catch {
+      // keep existing location
+    } finally {
+      setIsGeocoding(false);
+    }
+  }, [addressText, ctx]);
+
   const handleSetEndLocation = useCallback(async () => {
     if (localRouteStyle !== 'point-to-point') {
       setLocalRouteStyle('point-to-point');
@@ -118,6 +154,36 @@ export default function SetupScreen() {
       setHasEndLocation(true);
     }
   }, [localRouteStyle, ctx]);
+
+  const handleEndLocationCardPress = useCallback(() => {
+    setEndAddressText('');
+    setShowEndAddressInput(true);
+    if (localRouteStyle !== 'point-to-point') {
+      setLocalRouteStyle('point-to-point');
+    }
+  }, [localRouteStyle]);
+
+  const handleEndAddressSubmit = useCallback(async () => {
+    if (!endAddressText.trim()) return;
+    setIsEndGeocoding(true);
+    try {
+      const results = await Location.geocodeAsync(endAddressText.trim());
+      if (results.length > 0) {
+        if (localRouteStyle !== 'point-to-point') {
+          setLocalRouteStyle('point-to-point');
+        }
+        ctx.setEndLocation({ lat: results[0].latitude, lng: results[0].longitude });
+        setHasEndLocation(true);
+        setShowEndAddressInput(false);
+        setEndAddressText('');
+        Keyboard.dismiss();
+      }
+    } catch {
+      // keep existing
+    } finally {
+      setIsEndGeocoding(false);
+    }
+  }, [endAddressText, ctx, localRouteStyle]);
 
   const handleClearEndLocation = useCallback(() => {
     ctx.setEndLocation(null);
@@ -198,7 +264,7 @@ export default function SetupScreen() {
           <View style={styles.section}>
             <Text style={styles.sectionLabel}>STARTING LOCATION</Text>
             <Pressable
-              onPress={handleLocateMe}
+              onPress={handleLocationCardPress}
               style={[
                 styles.locationCard,
                 ctx.hasLocation ? styles.locationCardActive : styles.locationCardDefault,
@@ -217,7 +283,19 @@ export default function SetupScreen() {
                 )}
               </View>
               <View style={styles.locationText}>
-                {ctx.hasLocation ? (
+                {showAddressInput ? (
+                  <TextInput
+                    style={styles.inlineAddressInput}
+                    placeholder="Enter an address..."
+                    placeholderTextColor={Colors.mutedForeground}
+                    value={addressText}
+                    onChangeText={setAddressText}
+                    onSubmitEditing={handleAddressSubmit}
+                    onBlur={() => { if (!addressText.trim()) setShowAddressInput(false); }}
+                    returnKeyType="search"
+                    autoFocus
+                  />
+                ) : ctx.hasLocation ? (
                   <>
                     <Text style={styles.locationTitle}>Location set</Text>
                     <Text style={styles.locationCoords}>
@@ -231,15 +309,23 @@ export default function SetupScreen() {
                   </>
                 )}
               </View>
-              {ctx.hasLocation && (
+              {showAddressInput ? (
+                isGeocoding ? (
+                  <ActivityIndicator size="small" color={Colors.primary} />
+                ) : (
+                  <Pressable onPress={handleAddressSubmit}>
+                    <Ionicons name="arrow-forward-circle" size={22} color={Colors.primary} />
+                  </Pressable>
+                )
+              ) : ctx.hasLocation ? (
                 <Text style={styles.changeLabel}>Change</Text>
-              )}
+              ) : null}
             </Pressable>
 
             {/* End Location — always visible, dimmed unless point-to-point */}
             <View style={styles.endLocationConnector} />
             <Pressable
-              onPress={hasEndLocation ? handleClearEndLocation : handleSetEndLocation}
+              onPress={handleEndLocationCardPress}
               style={[
                 styles.locationCard,
                 hasEndLocation && localRouteStyle === 'point-to-point'
@@ -267,7 +353,19 @@ export default function SetupScreen() {
                 />
               </View>
               <View style={styles.locationText}>
-                {hasEndLocation && ctx.endLocation ? (
+                {showEndAddressInput ? (
+                  <TextInput
+                    style={styles.inlineAddressInput}
+                    placeholder="Enter destination address..."
+                    placeholderTextColor={Colors.mutedForeground}
+                    value={endAddressText}
+                    onChangeText={setEndAddressText}
+                    onSubmitEditing={handleEndAddressSubmit}
+                    onBlur={() => { if (!endAddressText.trim()) setShowEndAddressInput(false); }}
+                    returnKeyType="search"
+                    autoFocus
+                  />
+                ) : hasEndLocation && ctx.endLocation ? (
                   <>
                     <Text style={[styles.locationTitle, localRouteStyle !== 'point-to-point' && styles.locationTitleDimmed]}>Destination set</Text>
                     <Text style={styles.locationCoords}>
@@ -283,8 +381,18 @@ export default function SetupScreen() {
                   </>
                 )}
               </View>
-              {hasEndLocation && localRouteStyle === 'point-to-point' ? (
-                <Text style={styles.clearLabel}>Clear</Text>
+              {showEndAddressInput ? (
+                isEndGeocoding ? (
+                  <ActivityIndicator size="small" color={Colors.primary} />
+                ) : (
+                  <Pressable onPress={handleEndAddressSubmit}>
+                    <Ionicons name="arrow-forward-circle" size={22} color={Colors.primary} />
+                  </Pressable>
+                )
+              ) : hasEndLocation && localRouteStyle === 'point-to-point' ? (
+                <Pressable onPress={(e) => { e.stopPropagation(); handleClearEndLocation(); }} hitSlop={8}>
+                  <Text style={styles.clearLabel}>Clear</Text>
+                </Pressable>
               ) : (
                 <Ionicons name="arrow-forward" size={16} color={Colors.mutedForeground} />
               )}
@@ -535,6 +643,12 @@ const styles = StyleSheet.create({
     fontFamily: Fonts.sansSemiBold,
     fontSize: 10,
     color: Colors.destructive,
+  },
+  inlineAddressInput: {
+    fontFamily: Fonts.sans,
+    fontSize: 14,
+    color: Colors.foreground,
+    paddingVertical: 2,
   },
   endLocationConnector: {
     width: 1,

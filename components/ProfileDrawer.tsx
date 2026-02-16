@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { View, Text, Pressable, ScrollView, StyleSheet, Alert, Image } from 'react-native';
 import { useRouter } from 'expo-router';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 export type { FavoriteRoute };
@@ -58,6 +59,7 @@ interface ProfileDrawerProps {
 
 export function ProfileDrawer({ visible, onClose, onPreviewFavorite }: ProfileDrawerProps) {
   const router = useRouter();
+  const insets = useSafeAreaInsets();
   const ctx = useAppContext();
   const translateX = useSharedValue(400);
   const [mounted, setMounted] = useState(false);
@@ -152,12 +154,7 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite }: ProfileDr
 
     return (
       <>
-        <Pressable style={styles.backRow} onPress={() => { setView('history'); setSelectedRun(null); }}>
-          <Ionicons name="chevron-back" size={16} color={Colors.mutedForeground} />
-          <Text style={styles.backText}>History</Text>
-        </Pressable>
-
-        <Text style={styles.subViewTitle}>{selectedRun.routeName}</Text>
+        <Text style={[styles.subViewTitle, { marginTop: 16 }]}>{selectedRun.routeName}</Text>
         <Text style={styles.runDetailDate}>{selectedRun.date}</Text>
 
         <ScrollView
@@ -213,10 +210,23 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite }: ProfileDr
       <Pressable style={styles.backdrop} onPress={onClose} />
 
       <Animated.View style={[styles.drawer, drawerStyle]}>
-        {/* Close button */}
-        <Pressable onPress={onClose} style={styles.closeBtn}>
-          <Ionicons name="close" size={24} color={Colors.mutedForeground} />
+        {/* Close button (always visible, top-right) */}
+        <Pressable onPress={onClose} style={[styles.closeBtn, { top: insets.top + 8 }]}>
+          <Ionicons name="chevron-forward" size={24} color={Colors.mutedForeground} />
         </Pressable>
+
+        {/* Back button for sub-views (top-left, same height as close) */}
+        {view !== 'profile' && (
+          <Pressable
+            onPress={() => {
+              if (view === 'run-detail') { setView('history'); setSelectedRun(null); }
+              else { setView('profile'); }
+            }}
+            style={[styles.backBtn, { top: insets.top + 8 }]}
+          >
+            <Ionicons name="chevron-back" size={24} color={Colors.mutedForeground} />
+          </Pressable>
+        )}
 
         {view === 'profile' ? (
           <>
@@ -284,13 +294,7 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite }: ProfileDr
           renderRunDetail()
         ) : (
           <>
-            {/* Sub-view header */}
-            <Pressable style={styles.backRow} onPress={() => setView('profile')}>
-              <Ionicons name="chevron-back" size={16} color={Colors.mutedForeground} />
-              <Text style={styles.backText}>Profile</Text>
-            </Pressable>
-
-            <Text style={styles.subViewTitle}>
+            <Text style={[styles.subViewTitle, { marginTop: 16 }]}>
               {view === 'history' ? 'History' : 'Favorites'}
             </Text>
 
@@ -391,13 +395,23 @@ const styles = StyleSheet.create({
   },
   closeBtn: {
     position: 'absolute',
-    top: 54,
     right: 16,
     width: 36,
     height: 36,
     borderRadius: 18,
     alignItems: 'center',
     justifyContent: 'center',
+    zIndex: 10,
+  },
+  backBtn: {
+    position: 'absolute',
+    left: 16,
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 10,
   },
   profileSection: {
     alignItems: 'center',
@@ -488,18 +502,6 @@ const styles = StyleSheet.create({
     color: Colors.mutedForeground,
   },
   // Sub-view styles
-  backRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    marginTop: 8,
-    marginBottom: 12,
-  },
-  backText: {
-    fontFamily: Fonts.sansSemiBold,
-    fontSize: 13,
-    color: Colors.mutedForeground,
-  },
   subViewTitle: {
     fontFamily: Fonts.sansBold,
     fontSize: 18,

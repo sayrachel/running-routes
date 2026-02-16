@@ -162,7 +162,6 @@ export default function RunScreen() {
           style={[styles.headerBtn, !showStats && isRunning && { opacity: 0.4 }]}
         >
           <Ionicons name="chevron-back" size={16} color={Colors.mutedForeground} />
-          <Text style={styles.headerBtnText}>{showStats ? 'Back' : 'Edit'}</Text>
         </Pressable>
 
         {/* Center: recording indicator */}

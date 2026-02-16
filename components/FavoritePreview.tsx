@@ -75,7 +75,6 @@ export function FavoritePreview({ favorite, onClose }: FavoritePreviewProps) {
       <View style={[styles.header, { paddingTop: insets.top + 8 }]}>
         <Pressable onPress={onClose} style={styles.headerBtn}>
           <Ionicons name="chevron-back" size={16} color={Colors.mutedForeground} />
-          <Text style={styles.headerBtnText}>Back</Text>
         </Pressable>
       </View>
 
