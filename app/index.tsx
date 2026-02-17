@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   View,
   Text,
@@ -6,7 +6,6 @@ import {
   StyleSheet,
   ActivityIndicator,
   TextInput,
-  Keyboard,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
@@ -15,10 +14,10 @@ import { Ionicons } from '@expo/vector-icons';
 import { RouteMap } from '@/components/RouteMap';
 import { GpsSignal } from '@/components/GpsSignal';
 import { ProfileDrawer } from '@/components/ProfileDrawer';
-import type { FavoriteRoute } from '@/components/ProfileDrawer';
 import { FavoritePreview } from '@/components/FavoritePreview';
-import { useAppContext, type RouteStyle, type RunPreferences } from '@/lib/AppContext';
+import { useAppContext, type RouteStyle, type RunPreferences, type FavoriteRoute } from '@/lib/AppContext';
 import { generateRoutes } from '@/lib/route-generator';
+import { BottomTabBar } from '@/components/BottomTabBar';
 import { Colors, Fonts } from '@/lib/theme';
 
 const ROUTE_STYLES: { value: RouteStyle; label: string; desc: string }[] = [
@@ -43,12 +42,14 @@ export default function SetupScreen() {
   const [hasEndLocation, setHasEndLocation] = useState(false);
   const [drawerVisible, setDrawerVisible] = useState(false);
   const [previewFavorite, setPreviewFavorite] = useState<FavoriteRoute | null>(null);
-  const [showAddressInput, setShowAddressInput] = useState(false);
-  const [addressText, setAddressText] = useState('');
-  const [isGeocoding, setIsGeocoding] = useState(false);
-  const [showEndAddressInput, setShowEndAddressInput] = useState(false);
+  const [showStartSearch, setShowStartSearch] = useState(false);
+  const [startAddressText, setStartAddressText] = useState('');
+  const [isStartGeocoding, setIsStartGeocoding] = useState(false);
+  const [showEndSearch, setShowEndSearch] = useState(false);
   const [endAddressText, setEndAddressText] = useState('');
   const [isEndGeocoding, setIsEndGeocoding] = useState(false);
+  const startInputRef = useRef<TextInput>(null);
+  const endInputRef = useRef<TextInput>(null);
 
   // Auth redirect
   useEffect(() => {
@@ -100,31 +101,29 @@ export default function SetupScreen() {
 
   const handleLocationCardPress = useCallback(() => {
     if (ctx.hasLocation) {
-      setAddressText('');
-      setShowAddressInput(true);
+      setStartAddressText('');
+      setShowStartSearch(true);
+      setTimeout(() => startInputRef.current?.focus(), 100);
     } else {
       handleLocateMe();
     }
   }, [ctx.hasLocation, handleLocateMe]);
 
-  const handleAddressSubmit = useCallback(async () => {
-    if (!addressText.trim()) return;
-    setIsGeocoding(true);
+  const handleStartSearchSubmit = useCallback(async () => {
+    if (!startAddressText.trim() || isStartGeocoding) return;
+    setIsStartGeocoding(true);
     try {
-      const results = await Location.geocodeAsync(addressText.trim());
+      const results = await Location.geocodeAsync(startAddressText.trim());
       if (results.length > 0) {
         ctx.setCenter({ lat: results[0].latitude, lng: results[0].longitude });
         ctx.setHasLocation(true);
-        setShowAddressInput(false);
-        setAddressText('');
-        Keyboard.dismiss();
+        setShowStartSearch(false);
+        setStartAddressText('');
       }
-    } catch {
-      // keep existing location
     } finally {
-      setIsGeocoding(false);
+      setIsStartGeocoding(false);
     }
-  }, [addressText, ctx]);
+  }, [startAddressText, isStartGeocoding, ctx]);
 
   const handleSetEndLocation = useCallback(async () => {
     if (localRouteStyle !== 'point-to-point') {
@@ -157,14 +156,15 @@ export default function SetupScreen() {
 
   const handleEndLocationCardPress = useCallback(() => {
     setEndAddressText('');
-    setShowEndAddressInput(true);
+    setShowEndSearch(true);
     if (localRouteStyle !== 'point-to-point') {
       setLocalRouteStyle('point-to-point');
     }
+    setTimeout(() => endInputRef.current?.focus(), 100);
   }, [localRouteStyle]);
 
-  const handleEndAddressSubmit = useCallback(async () => {
-    if (!endAddressText.trim()) return;
+  const handleEndSearchSubmit = useCallback(async () => {
+    if (!endAddressText.trim() || isEndGeocoding) return;
     setIsEndGeocoding(true);
     try {
       const results = await Location.geocodeAsync(endAddressText.trim());
@@ -174,16 +174,13 @@ export default function SetupScreen() {
         }
         ctx.setEndLocation({ lat: results[0].latitude, lng: results[0].longitude });
         setHasEndLocation(true);
-        setShowEndAddressInput(false);
+        setShowEndSearch(false);
         setEndAddressText('');
-        Keyboard.dismiss();
       }
-    } catch {
-      // keep existing
     } finally {
       setIsEndGeocoding(false);
     }
-  }, [endAddressText, ctx, localRouteStyle]);
+  }, [endAddressText, isEndGeocoding, ctx, localRouteStyle]);
 
   const handleClearEndLocation = useCallback(() => {
     ctx.setEndLocation(null);
@@ -223,7 +220,7 @@ export default function SetupScreen() {
       ctx.setRoutes(newRoutes);
       ctx.setSelectedRoute(newRoutes[0] || null);
       ctx.setIsGenerating(false);
-      router.push('/run');
+      router.replace('/run');
     }, 700);
   }, [ctx, localRouteStyle, localPrefs, hasEndLocation, router]);
 
@@ -283,21 +280,30 @@ export default function SetupScreen() {
                 )}
               </View>
               <View style={styles.locationText}>
-                {showAddressInput ? (
-                  <TextInput
-                    style={styles.inlineAddressInput}
-                    placeholder="Enter an address..."
-                    placeholderTextColor={Colors.mutedForeground}
-                    value={addressText}
-                    onChangeText={setAddressText}
-                    onSubmitEditing={handleAddressSubmit}
-                    onBlur={() => { if (!addressText.trim()) setShowAddressInput(false); }}
-                    returnKeyType="search"
-                    autoFocus
-                  />
+                {showStartSearch ? (
+                  <View style={styles.inlineInputRow}>
+                    <Ionicons name="search" size={14} color={Colors.mutedForeground} />
+                    <TextInput
+                      ref={startInputRef}
+                      style={styles.inlineInput}
+                      placeholder="Enter an address..."
+                      placeholderTextColor={Colors.mutedForeground}
+                      value={startAddressText}
+                      onChangeText={setStartAddressText}
+                      onSubmitEditing={handleStartSearchSubmit}
+                      onBlur={() => { if (!startAddressText.trim()) setShowStartSearch(false); }}
+                      returnKeyType="search"
+                      autoFocus
+                    />
+                    {startAddressText.length > 0 && !isStartGeocoding && (
+                      <Pressable onPress={() => setStartAddressText('')} hitSlop={8}>
+                        <Ionicons name="close-circle" size={16} color={Colors.mutedForeground} />
+                      </Pressable>
+                    )}
+                  </View>
                 ) : ctx.hasLocation ? (
                   <>
-                    <Text style={styles.locationTitle}>Location set</Text>
+                    <Text style={styles.locationTitle}>Location</Text>
                     <Text style={styles.locationCoords}>
                       {ctx.center.lat.toFixed(4)}, {ctx.center.lng.toFixed(4)}
                     </Text>
@@ -309,12 +315,16 @@ export default function SetupScreen() {
                   </>
                 )}
               </View>
-              {showAddressInput ? (
-                isGeocoding ? (
+              {showStartSearch ? (
+                isStartGeocoding ? (
                   <ActivityIndicator size="small" color={Colors.primary} />
+                ) : startAddressText.trim() ? (
+                  <Pressable onPress={handleStartSearchSubmit}>
+                    <Ionicons name="arrow-forward-circle" size={24} color={Colors.primary} />
+                  </Pressable>
                 ) : (
-                  <Pressable onPress={handleAddressSubmit}>
-                    <Ionicons name="arrow-forward-circle" size={22} color={Colors.primary} />
+                  <Pressable onPress={() => setShowStartSearch(false)}>
+                    <Text style={styles.cancelLabel}>Cancel</Text>
                   </Pressable>
                 )
               ) : ctx.hasLocation ? (
@@ -353,18 +363,27 @@ export default function SetupScreen() {
                 />
               </View>
               <View style={styles.locationText}>
-                {showEndAddressInput ? (
-                  <TextInput
-                    style={styles.inlineAddressInput}
-                    placeholder="Enter destination address..."
-                    placeholderTextColor={Colors.mutedForeground}
-                    value={endAddressText}
-                    onChangeText={setEndAddressText}
-                    onSubmitEditing={handleEndAddressSubmit}
-                    onBlur={() => { if (!endAddressText.trim()) setShowEndAddressInput(false); }}
-                    returnKeyType="search"
-                    autoFocus
-                  />
+                {showEndSearch ? (
+                  <View style={styles.inlineInputRow}>
+                    <Ionicons name="search" size={14} color={Colors.mutedForeground} />
+                    <TextInput
+                      ref={endInputRef}
+                      style={styles.inlineInput}
+                      placeholder="Enter destination..."
+                      placeholderTextColor={Colors.mutedForeground}
+                      value={endAddressText}
+                      onChangeText={setEndAddressText}
+                      onSubmitEditing={handleEndSearchSubmit}
+                      onBlur={() => { if (!endAddressText.trim()) setShowEndSearch(false); }}
+                      returnKeyType="search"
+                      autoFocus
+                    />
+                    {endAddressText.length > 0 && !isEndGeocoding && (
+                      <Pressable onPress={() => setEndAddressText('')} hitSlop={8}>
+                        <Ionicons name="close-circle" size={16} color={Colors.mutedForeground} />
+                      </Pressable>
+                    )}
+                  </View>
                 ) : hasEndLocation && ctx.endLocation ? (
                   <>
                     <Text style={[styles.locationTitle, localRouteStyle !== 'point-to-point' && styles.locationTitleDimmed]}>Destination set</Text>
@@ -381,12 +400,16 @@ export default function SetupScreen() {
                   </>
                 )}
               </View>
-              {showEndAddressInput ? (
+              {showEndSearch ? (
                 isEndGeocoding ? (
                   <ActivityIndicator size="small" color={Colors.primary} />
+                ) : endAddressText.trim() ? (
+                  <Pressable onPress={handleEndSearchSubmit}>
+                    <Ionicons name="arrow-forward-circle" size={24} color={Colors.primary} />
+                  </Pressable>
                 ) : (
-                  <Pressable onPress={handleEndAddressSubmit}>
-                    <Ionicons name="arrow-forward-circle" size={22} color={Colors.primary} />
+                  <Pressable onPress={() => setShowEndSearch(false)}>
+                    <Text style={styles.cancelLabel}>Cancel</Text>
                   </Pressable>
                 )
               ) : hasEndLocation && localRouteStyle === 'point-to-point' ? (
@@ -457,10 +480,7 @@ export default function SetupScreen() {
 
         {/* Fixed button area at bottom */}
         <View
-          style={[
-            styles.fixedButtonArea,
-            { paddingBottom: Math.max(insets.bottom, 20) + 12 },
-          ]}
+          style={styles.fixedButtonArea}
         >
           <Pressable
             onPress={handleGenerate}
@@ -505,6 +525,9 @@ export default function SetupScreen() {
           onClose={() => setPreviewFavorite(null)}
         />
       )}
+
+      {/* Bottom Tab Bar */}
+      <BottomTabBar />
     </View>
   );
 }
@@ -639,16 +662,32 @@ const styles = StyleSheet.create({
     fontSize: 10,
     color: Colors.primary,
   },
+  cancelLabel: {
+    fontFamily: Fonts.sansSemiBold,
+    fontSize: 12,
+    color: Colors.mutedForeground,
+  },
+  inlineInputRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: Colors.secondary,
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    marginVertical: -2,
+  },
+  inlineInput: {
+    flex: 1,
+    fontFamily: Fonts.sans,
+    fontSize: 14,
+    color: Colors.foreground,
+    padding: 0,
+  },
   clearLabel: {
     fontFamily: Fonts.sansSemiBold,
     fontSize: 10,
     color: Colors.destructive,
-  },
-  inlineAddressInput: {
-    fontFamily: Fonts.sans,
-    fontSize: 14,
-    color: Colors.foreground,
-    paddingVertical: 2,
   },
   endLocationConnector: {
     width: 1,
@@ -716,6 +755,7 @@ const styles = StyleSheet.create({
     backgroundColor: Colors.card,
     paddingHorizontal: 20,
     paddingTop: 16,
+    paddingBottom: 12,
   },
   generateButton: {
     flexDirection: 'row',

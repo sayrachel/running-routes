@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "RouteForge",
+    "name": "Running Routes",
     "slug": "routeforge",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -14,7 +14,7 @@
       "supportsTablet": false,
       "bundleIdentifier": "com.routeforge.app",
       "infoPlist": {
-        "NSLocationWhenInUseUsageDescription": "RouteForge needs your location to generate running routes near you."
+        "NSLocationWhenInUseUsageDescription": "Running Routes needs your location to generate running routes near you."
       }
     },
     "plugins": [
@@ -22,13 +22,17 @@
       [
         "expo-location",
         {
-          "locationWhenInUsePermission": "RouteForge needs your location to generate running routes near you."
+          "locationWhenInUsePermission": "Running Routes needs your location to generate running routes near you."
         }
       ],
       "expo-asset"
     ],
     "experiments": {
       "typedRoutes": true
+    },
+    "web": {
+      "name": "Running Routes",
+      "bundler": "metro"
     }
   }
 }

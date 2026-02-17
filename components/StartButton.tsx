@@ -12,21 +12,24 @@ import Animated, {
 } from 'react-native-reanimated';
 import { Colors, Fonts } from '@/lib/theme';
 
+type RunState = 'idle' | 'running' | 'paused';
+
 interface StartButtonProps {
-  isRunning: boolean;
-  onToggle: () => void;
+  runState: RunState;
+  onStart: () => void;
+  onPause: () => void;
+  onResume: () => void;
+  onFinish: () => void;
   disabled?: boolean;
 }
 
-export function StartButton({ isRunning, onToggle, disabled }: StartButtonProps) {
-  // Pulse glow animation
+export function StartButton({ runState, onStart, onPause, onResume, onFinish, disabled }: StartButtonProps) {
   const glowOpacity = useSharedValue(0.3);
-  // Ping ring animation
   const pingScale = useSharedValue(1);
   const pingOpacity = useSharedValue(0.6);
 
   useEffect(() => {
-    if (!isRunning && !disabled) {
+    if (runState === 'idle' && !disabled) {
       glowOpacity.value = withRepeat(
         withSequence(
           withTiming(0.5, { duration: 1200, easing: Easing.inOut(Easing.ease) }),
@@ -50,7 +53,7 @@ export function StartButton({ isRunning, onToggle, disabled }: StartButtonProps)
       pingScale.value = 1;
       pingOpacity.value = 0;
     }
-  }, [isRunning, disabled]);
+  }, [runState, disabled]);
 
   const glowStyle = useAnimatedStyle(() => ({
     opacity: glowOpacity.value,
@@ -61,24 +64,64 @@ export function StartButton({ isRunning, onToggle, disabled }: StartButtonProps)
     opacity: pingOpacity.value,
   }));
 
-  const handlePress = () => {
+  const handleMainPress = () => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
-    onToggle();
+    if (runState === 'idle') onStart();
+    else if (runState === 'running') onPause();
+    else if (runState === 'paused') onResume();
   };
+
+  const handleFinish = () => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+    onFinish();
+  };
+
+  if (runState === 'paused') {
+    return (
+      <View style={styles.pausedWrapper}>
+        <View style={styles.pausedRow}>
+          {/* Resume button */}
+          <Pressable
+            onPress={handleMainPress}
+            style={({ pressed }) => [
+              styles.pausedButton,
+              styles.resumeButton,
+              pressed && { transform: [{ scale: 0.95 }] },
+            ]}
+          >
+            <Ionicons name="play" size={24} color={Colors.primaryForeground} style={{ marginLeft: 2 }} />
+          </Pressable>
+
+          {/* Finish button */}
+          <Pressable
+            onPress={handleFinish}
+            style={({ pressed }) => [
+              styles.pausedButton,
+              styles.finishButton,
+              pressed && { transform: [{ scale: 0.95 }] },
+            ]}
+          >
+            <Ionicons name="stop" size={22} color={Colors.destructiveForeground} />
+          </Pressable>
+        </View>
+        <View style={styles.pausedLabels}>
+          <Text style={styles.resumeLabel}>RESUME</Text>
+          <Text style={styles.finishLabel}>FINISH</Text>
+        </View>
+      </View>
+    );
+  }
 
   return (
     <View style={styles.wrapper}>
       <View style={styles.buttonContainer}>
-        {/* Ping ring */}
-        {!isRunning && !disabled && (
+        {runState === 'idle' && !disabled && (
           <Animated.View
             style={[styles.pingRing, pingStyle]}
             pointerEvents="none"
           />
         )}
-
-        {/* Glow */}
-        {!isRunning && !disabled && (
+        {runState === 'idle' && !disabled && (
           <Animated.View
             style={[styles.glow, glowStyle]}
             pointerEvents="none"
@@ -86,17 +129,17 @@ export function StartButton({ isRunning, onToggle, disabled }: StartButtonProps)
         )}
 
         <Pressable
-          onPress={handlePress}
+          onPress={handleMainPress}
           disabled={disabled}
           style={({ pressed }) => [
             styles.button,
-            isRunning ? styles.buttonStop : styles.buttonStart,
+            runState === 'running' ? styles.buttonPause : styles.buttonStart,
             disabled && styles.buttonDisabled,
             pressed && { transform: [{ scale: 0.95 }] },
           ]}
         >
-          {isRunning ? (
-            <Ionicons name="stop" size={28} color={Colors.destructiveForeground} />
+          {runState === 'running' ? (
+            <Ionicons name="pause" size={28} color={Colors.foreground} />
           ) : (
             <Ionicons
               name="play"
@@ -111,14 +154,14 @@ export function StartButton({ isRunning, onToggle, disabled }: StartButtonProps)
       <Text
         style={[
           styles.label,
-          isRunning
-            ? styles.labelStop
+          runState === 'running'
+            ? styles.labelPause
             : disabled
               ? styles.labelDisabled
               : styles.labelStart,
         ]}
       >
-        {isRunning ? 'STOP' : 'START RUN'}
+        {runState === 'running' ? 'PAUSE' : 'START RUN'}
       </Text>
     </View>
   );
@@ -159,8 +202,10 @@ const styles = StyleSheet.create({
   buttonStart: {
     backgroundColor: Colors.primary,
   },
-  buttonStop: {
-    backgroundColor: Colors.destructive,
+  buttonPause: {
+    backgroundColor: Colors.muted,
+    borderWidth: 2,
+    borderColor: Colors.border,
   },
   buttonDisabled: {
     opacity: 0.4,
@@ -173,10 +218,53 @@ const styles = StyleSheet.create({
   labelStart: {
     color: Colors.primary,
   },
-  labelStop: {
-    color: Colors.destructive,
+  labelPause: {
+    color: Colors.mutedForeground,
   },
   labelDisabled: {
     color: Colors.mutedForeground,
+  },
+  // Paused state styles
+  pausedWrapper: {
+    alignItems: 'center',
+    gap: 10,
+  },
+  pausedRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 24,
+  },
+  pausedButton: {
+    width: 64,
+    height: 64,
+    borderRadius: 32,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  resumeButton: {
+    backgroundColor: Colors.primary,
+  },
+  finishButton: {
+    backgroundColor: Colors.destructive,
+  },
+  pausedLabels: {
+    flexDirection: 'row',
+    gap: 24,
+  },
+  resumeLabel: {
+    width: 64,
+    textAlign: 'center',
+    fontFamily: Fonts.sansBold,
+    fontSize: 11,
+    letterSpacing: 2,
+    color: Colors.primary,
+  },
+  finishLabel: {
+    width: 64,
+    textAlign: 'center',
+    fontFamily: Fonts.sansBold,
+    fontSize: 11,
+    letterSpacing: 2,
+    color: Colors.destructive,
   },
 });

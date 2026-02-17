@@ -57,7 +57,7 @@ export function generateGpx(route: GeneratedRoute): string {
     .join('\n');
 
   return `<?xml version="1.0" encoding="UTF-8"?>
-<gpx version="1.1" creator="RouteForge"
+<gpx version="1.1" creator="Running Routes"
   xmlns="http://www.topografix.com/GPX/1/1"
   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
   xsi:schemaLocation="http://www.topografix.com/GPX/1/1 http://www.topografix.com/GPX/1/1/gpx.xsd">

@@ -1,5 +1,5 @@
 import React from 'react';
-import { View, Text, FlatList, StyleSheet } from 'react-native';
+import { View, Text, ScrollView, Pressable, StyleSheet } from 'react-native';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { Colors, Fonts } from '@/lib/theme';
 
@@ -13,6 +13,11 @@ interface StatsViewProps {
   avgPace: string;
   splits: { km: number; pace: string }[];
   isRunning: boolean;
+  isFinished?: boolean;
+  isFavorited?: boolean;
+  onToggleFavorite?: () => void;
+  onDiscard?: () => void;
+  onSave?: () => void;
 }
 
 function StatCard({
@@ -36,14 +41,114 @@ function StatCard({
 }
 
 export function StatsView({
+  pace,
+  distance,
+  time,
   calories,
   elevation,
   avgPace,
   splits,
+  isRunning,
+  isFinished,
+  isFavorited,
+  onToggleFavorite,
+  onDiscard,
+  onSave,
 }: StatsViewProps) {
+  // Finished state — match history run-detail layout
+  if (isFinished) {
+    return (
+      <ScrollView
+        style={styles.finishedContainer}
+        contentContainerStyle={styles.finishedContent}
+        showsVerticalScrollIndicator={false}
+      >
+        {/* Stats grid */}
+        <View style={styles.statsGrid}>
+          <View style={styles.statCell}>
+            <Text style={styles.statCellValue}>{distance}</Text>
+            <Text style={styles.statCellLabel}>km</Text>
+          </View>
+          <View style={styles.statCell}>
+            <Text style={styles.statCellValue}>{time}</Text>
+            <Text style={styles.statCellLabel}>time</Text>
+          </View>
+          <View style={styles.statCell}>
+            <Text style={styles.statCellValue}>{avgPace || pace}</Text>
+            <Text style={styles.statCellLabel}>min/km</Text>
+          </View>
+          <View style={styles.statCell}>
+            <Text style={styles.statCellValue}>{elevation}</Text>
+            <Text style={styles.statCellLabel}>m elev</Text>
+          </View>
+          <View style={styles.statCell}>
+            <Text style={styles.statCellValue}>{calories}</Text>
+            <Text style={styles.statCellLabel}>cal</Text>
+          </View>
+        </View>
+
+        {/* Splits table */}
+        {splits.length > 0 && (
+          <>
+            <Text style={styles.finishedSplitsTitle}>Splits</Text>
+            <View style={styles.splitsTable}>
+              <View style={styles.splitsTableHeader}>
+                <Text style={styles.splitsHeaderText}>KM</Text>
+                <Text style={styles.splitsHeaderText}>PACE</Text>
+              </View>
+              {splits.map((split) => (
+                <View key={split.km} style={styles.splitsTableRow}>
+                  <Text style={styles.splitsTableKm}>{split.km}</Text>
+                  <Text style={styles.splitsTablePace}>{split.pace} min/km</Text>
+                </View>
+              ))}
+            </View>
+          </>
+        )}
+
+        {/* Favorite */}
+        {onToggleFavorite && (
+          <Pressable
+            onPress={(e) => { e.stopPropagation(); onToggleFavorite(); }}
+            style={styles.favoriteBtn}
+          >
+            <Ionicons
+              name={isFavorited ? 'heart' : 'heart-outline'}
+              size={22}
+              color={isFavorited ? Colors.destructive : Colors.mutedForeground}
+            />
+            <Text style={[styles.favoriteLabel, isFavorited && { color: Colors.destructive }]}>
+              {isFavorited ? 'Favorited' : 'Add to Favorites'}
+            </Text>
+          </Pressable>
+        )}
+
+        {/* Discard / Save */}
+        {onDiscard && onSave && (
+          <View style={styles.actionsRow}>
+            <Pressable
+              onPress={(e) => { e.stopPropagation(); onDiscard(); }}
+              style={({ pressed }) => [styles.actionBtn, styles.discardBtn, pressed && { opacity: 0.7 }]}
+            >
+              <Ionicons name="trash-outline" size={18} color={Colors.mutedForeground} />
+              <Text style={styles.discardLabel}>Discard</Text>
+            </Pressable>
+            <Pressable
+              onPress={(e) => { e.stopPropagation(); onSave(); }}
+              style={({ pressed }) => [styles.actionBtn, styles.saveBtn, pressed && { opacity: 0.7 }]}
+            >
+              <Ionicons name="checkmark" size={18} color={Colors.primaryForeground} />
+              <Text style={styles.saveLabel}>Save Activity</Text>
+            </Pressable>
+          </View>
+        )}
+      </ScrollView>
+    );
+  }
+
+  // In-run stats view (tap stats row to see)
   return (
     <View style={styles.container}>
-      {/* Metrics grid */}
       <View style={styles.metricsGrid}>
         <StatCard
           icon={<Ionicons name="flame" size={20} color={Colors.primary} />}
@@ -51,27 +156,21 @@ export function StatsView({
           value={String(calories)}
         />
         <StatCard
-          icon={<MaterialCommunityIcons name="mountain" size={20} color={Colors.primary} />}
+          icon={<Ionicons name="trending-up" size={20} color={Colors.primary} />}
           label="ELEVATION"
           value={`${elevation}m`}
         />
       </View>
 
-      {/* Splits */}
       {splits.length > 0 && (
         <View style={styles.splitsSection}>
-          <Text style={styles.splitsTitle}>SPLITS</Text>
-          <FlatList
-            data={splits}
-            keyExtractor={(item) => String(item.km)}
-            scrollEnabled={false}
-            renderItem={({ item }) => (
-              <View style={styles.splitRow}>
-                <Text style={styles.splitKm}>KM {item.km}</Text>
-                <Text style={styles.splitPace}>{item.pace}</Text>
-              </View>
-            )}
-          />
+          <Text style={styles.inRunSplitsTitle}>SPLITS</Text>
+          {splits.map((item) => (
+            <View key={item.km} style={styles.inRunSplitRow}>
+              <Text style={styles.inRunSplitKm}>KM {item.km}</Text>
+              <Text style={styles.inRunSplitPace}>{item.pace}</Text>
+            </View>
+          ))}
         </View>
       )}
     </View>
@@ -79,6 +178,7 @@ export function StatsView({
 }
 
 const styles = StyleSheet.create({
+  // In-run stats
   container: {
     flex: 1,
     backgroundColor: Colors.background,
@@ -125,14 +225,14 @@ const styles = StyleSheet.create({
   splitsSection: {
     marginTop: 16,
   },
-  splitsTitle: {
+  inRunSplitsTitle: {
     fontFamily: Fonts.sansBold,
     fontSize: 10,
     letterSpacing: 2,
     color: Colors.mutedForeground,
     marginBottom: 8,
   },
-  splitRow: {
+  inRunSplitRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
@@ -142,14 +242,148 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
     marginBottom: 4,
   },
-  splitKm: {
+  inRunSplitKm: {
     fontFamily: Fonts.sans,
     fontSize: 12,
     color: Colors.mutedForeground,
   },
-  splitPace: {
+  inRunSplitPace: {
     fontFamily: Fonts.monoBold,
     fontSize: 14,
     color: Colors.primary,
+  },
+
+  // Finished stats (matches history run-detail)
+  finishedContainer: {
+    flex: 1,
+    backgroundColor: Colors.background,
+  },
+  finishedContent: {
+    paddingHorizontal: 20,
+    paddingTop: 80,
+    paddingBottom: 40,
+    gap: 16,
+  },
+  statsGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  statCell: {
+    width: '30%',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    backgroundColor: Colors.card,
+    padding: 12,
+    alignItems: 'center',
+    gap: 2,
+  },
+  statCellValue: {
+    fontFamily: Fonts.sansBold,
+    fontSize: 18,
+    color: Colors.primary,
+  },
+  statCellLabel: {
+    fontFamily: Fonts.sans,
+    fontSize: 10,
+    color: Colors.mutedForeground,
+    textTransform: 'uppercase',
+  },
+  finishedSplitsTitle: {
+    fontFamily: Fonts.sansBold,
+    fontSize: 14,
+    color: Colors.foreground,
+  },
+  splitsTable: {
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    backgroundColor: Colors.card,
+    overflow: 'hidden',
+  },
+  splitsTableHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: Colors.border,
+  },
+  splitsHeaderText: {
+    fontFamily: Fonts.sansBold,
+    fontSize: 10,
+    color: Colors.mutedForeground,
+    textTransform: 'uppercase',
+    letterSpacing: 1,
+  },
+  splitsTableRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: Colors.border,
+  },
+  splitsTableKm: {
+    fontFamily: Fonts.sansSemiBold,
+    fontSize: 13,
+    color: Colors.foreground,
+  },
+  splitsTablePace: {
+    fontFamily: Fonts.sansMedium,
+    fontSize: 13,
+    color: Colors.mutedForeground,
+  },
+
+  // Favorite button
+  favoriteBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    backgroundColor: Colors.card,
+    paddingVertical: 14,
+  },
+  favoriteLabel: {
+    fontFamily: Fonts.sansSemiBold,
+    fontSize: 14,
+    color: Colors.mutedForeground,
+  },
+
+  // Discard / Save
+  actionsRow: {
+    flexDirection: 'row',
+    gap: 12,
+  },
+  actionBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    borderRadius: 16,
+    paddingVertical: 16,
+  },
+  discardBtn: {
+    borderWidth: 1,
+    borderColor: Colors.border,
+    backgroundColor: Colors.card,
+  },
+  saveBtn: {
+    backgroundColor: Colors.primary,
+  },
+  discardLabel: {
+    fontFamily: Fonts.sansBold,
+    fontSize: 14,
+    color: Colors.mutedForeground,
+  },
+  saveLabel: {
+    fontFamily: Fonts.sansBold,
+    fontSize: 14,
+    color: Colors.primaryForeground,
   },
 });

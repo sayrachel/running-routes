@@ -15,6 +15,15 @@ export interface RunPreferences {
   lowTraffic: boolean;
 }
 
+export interface FavoriteRoute {
+  id: string;
+  routeName: string;
+  distance: number;
+  terrain: 'Loop' | 'Out & Back' | 'Point to Point';
+  lat: number;
+  lng: number;
+}
+
 interface AppState {
   isLoggedIn: boolean;
   setIsLoggedIn: (v: boolean) => void;
@@ -40,7 +49,16 @@ interface AppState {
   setIsGenerating: (v: boolean) => void;
   endLocation: RoutePoint | null;
   setEndLocation: (v: RoutePoint | null) => void;
+  favorites: FavoriteRoute[];
+  addFavorite: (fav: FavoriteRoute) => void;
+  removeFavorite: (id: string) => void;
 }
+
+const INITIAL_FAVORITES: FavoriteRoute[] = [
+  { id: '1', routeName: 'Lakeside Loop', distance: 7.5, terrain: 'Loop', lat: 40.7580, lng: -73.9855 },
+  { id: '2', routeName: 'Forest Path', distance: 5.0, terrain: 'Out & Back', lat: 40.7829, lng: -73.9654 },
+  { id: '3', routeName: 'City Circuit', distance: 10.2, terrain: 'Loop', lat: 40.7484, lng: -73.9857 },
+];
 
 const DEFAULT_CENTER: RoutePoint = { lat: 40.7128, lng: -74.006 };
 
@@ -63,6 +81,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [selectedRoute, setSelectedRoute] = useState<GeneratedRoute | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
   const [endLocation, setEndLocation] = useState<RoutePoint | null>(null);
+  const [favorites, setFavorites] = useState<FavoriteRoute[]>(INITIAL_FAVORITES);
+
+  const addFavorite = (fav: FavoriteRoute) => {
+    setFavorites((prev) => {
+      if (prev.some((f) => f.id === fav.id)) return prev;
+      return [...prev, fav];
+    });
+  };
+
+  const removeFavorite = (id: string) => {
+    setFavorites((prev) => prev.filter((f) => f.id !== id));
+  };
 
   return (
     <AppContext.Provider
@@ -91,6 +121,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setIsGenerating,
         endLocation,
         setEndLocation,
+        favorites,
+        addFavorite,
+        removeFavorite,
       }}
     >
       {children}

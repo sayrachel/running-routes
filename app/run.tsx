@@ -14,6 +14,7 @@ import { RouteMap } from '@/components/RouteMap';
 import { RunStats } from '@/components/RunStats';
 import { StartButton } from '@/components/StartButton';
 import { StatsView } from '@/components/StatsView';
+import { BottomTabBar } from '@/components/BottomTabBar';
 import { useAppContext } from '@/lib/AppContext';
 import { buildGoogleMapsUrl } from '@/lib/route-export';
 import { Colors, Fonts } from '@/lib/theme';
@@ -42,9 +43,36 @@ export default function RunScreen() {
   const ctx = useAppContext();
 
   const [showStats, setShowStats] = useState(false);
-  const [isRunning, setIsRunning] = useState(false);
+  const [runState, setRunState] = useState<'idle' | 'running' | 'paused'>('idle');
+  const [isFinished, setIsFinished] = useState(false);
+  const [finishedSplits, setFinishedSplits] = useState<{ km: number; pace: string }[]>([]);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const isRunning = runState === 'running';
+  const isPaused = runState === 'paused';
+  const hasStarted = runState !== 'idle';
+
+  const isFavorited = ctx.selectedRoute
+    ? ctx.favorites.some((f) => f.id === `run-${ctx.selectedRoute!.id}`)
+    : false;
+
+  const handleToggleFavorite = useCallback(() => {
+    if (!ctx.selectedRoute) return;
+    const favId = `run-${ctx.selectedRoute.id}`;
+    if (isFavorited) {
+      ctx.removeFavorite(favId);
+    } else {
+      ctx.addFavorite({
+        id: favId,
+        routeName: ctx.selectedRoute.name,
+        distance: parseFloat(ctx.selectedRoute.distance.toFixed(1)),
+        terrain: (ctx.selectedRoute.terrain as 'Loop' | 'Out & Back' | 'Point to Point') || 'Loop',
+        lat: ctx.center.lat,
+        lng: ctx.center.lng,
+      });
+    }
+  }, [ctx, isFavorited]);
 
   // Recording indicator ping animation
   const recordingPing = useSharedValue(1);
@@ -65,9 +93,9 @@ export default function RunScreen() {
     transform: [{ scale: 1 + (1 - recordingPing.value) * 0.6 }],
   }));
 
-  // Timer
+  // Timer — only ticks while running, pauses when paused
   useEffect(() => {
-    if (isRunning) {
+    if (runState === 'running') {
       intervalRef.current = setInterval(() => {
         setElapsedSeconds((prev) => prev + 1);
       }, 1000);
@@ -78,19 +106,68 @@ export default function RunScreen() {
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
-  }, [isRunning]);
+  }, [runState]);
 
-  const handleToggleRun = useCallback(() => {
-    setIsRunning((prev) => !prev);
+  const handleStart = useCallback(() => {
+    setRunState('running');
   }, []);
 
+  const handlePause = useCallback(() => {
+    setRunState('paused');
+  }, []);
+
+  const handleResume = useCallback(() => {
+    setRunState('running');
+  }, []);
+
+  const handleFinish = useCallback(() => {
+    // Snapshot splits in the same format as the history page
+    const dist = elapsedSeconds > 0 ? (elapsedSeconds / 60) / 5.5 : 0;
+    const timeMin = elapsedSeconds / 60;
+    const avgPace = dist > 0 ? timeMin / dist : 0;
+    const fullKms = Math.floor(dist);
+    const snapshotSplits: { km: number; pace: string }[] = [];
+    for (let i = 1; i <= fullKms; i++) {
+      const variation = (Math.random() - 0.5) * 0.6;
+      snapshotSplits.push({ km: i, pace: (avgPace + variation).toFixed(1) });
+    }
+    const remaining = dist - fullKms;
+    if (remaining > 0.1) {
+      const variation = (Math.random() - 0.5) * 0.6;
+      snapshotSplits.push({ km: parseFloat(dist.toFixed(1)), pace: (avgPace + variation).toFixed(1) });
+    }
+    setFinishedSplits(snapshotSplits);
+    setRunState('idle');
+    setIsFinished(true);
+    setShowStats(true);
+  }, [elapsedSeconds]);
+
+  const handleDiscard = useCallback(() => {
+    setIsFinished(false);
+    setShowStats(false);
+    setElapsedSeconds(0);
+    ctx.setRoutes([]);
+    ctx.setSelectedRoute(null);
+    router.replace('/');
+  }, [ctx, router]);
+
+  const handleSave = useCallback(() => {
+    // Save to history would go here in a real app
+    setIsFinished(false);
+    setShowStats(false);
+    setElapsedSeconds(0);
+    ctx.setRoutes([]);
+    ctx.setSelectedRoute(null);
+    router.replace('/');
+  }, [ctx, router]);
+
   const handleBack = useCallback(() => {
-    if (isRunning) return;
+    if (hasStarted) return;
     ctx.setRoutes([]);
     ctx.setSelectedRoute(null);
     setElapsedSeconds(0);
-    router.back();
-  }, [isRunning, ctx, router]);
+    router.replace('/');
+  }, [hasStarted, ctx, router]);
 
   const handleOpenGoogleMaps = useCallback(() => {
     if (!ctx.selectedRoute) return;
@@ -100,7 +177,7 @@ export default function RunScreen() {
 
   // Derived run data
   const currentPace = simulatePace(elapsedSeconds);
-  const runDistance = isRunning
+  const runDistance = elapsedSeconds > 0
     ? ((elapsedSeconds / 60) / 5.5).toFixed(2)
     : ctx.selectedRoute
       ? ctx.selectedRoute.distance.toFixed(2)
@@ -119,100 +196,123 @@ export default function RunScreen() {
   );
 
   return (
-    <View style={styles.container}>
-      {/* Full-screen map or stats */}
-      {showStats ? (
-        <Pressable style={StyleSheet.absoluteFill} onPress={() => setShowStats(false)}>
-          <StatsView
-            pace={currentPace}
-            distance={runDistance}
-            time={timeStr}
-            calories={calories}
-            elevation={elevation}
-            cadence={
-              isRunning
-                ? 168 + Math.floor(Math.sin(elapsedSeconds * 0.1) * 6)
-                : 0
-            }
-            avgPace={
-              isRunning
-                ? simulatePace(Math.floor(elapsedSeconds / 2))
-                : '--:--'
-            }
-            splits={splits}
-            isRunning={isRunning}
-          />
-        </Pressable>
-      ) : (
-        <View style={StyleSheet.absoluteFill}>
-          <RouteMap
-            center={ctx.center}
-            routes={ctx.routes}
-            selectedRouteId={ctx.selectedRoute?.id || null}
-          />
-        </View>
-      )}
-
-      {/* Header overlay */}
-      <View style={[styles.header, { paddingTop: insets.top + 8 }]}>
-        {/* Back */}
-        <Pressable
-          onPress={showStats ? () => setShowStats(false) : handleBack}
-          disabled={!showStats && isRunning}
-          style={[styles.headerBtn, !showStats && isRunning && { opacity: 0.4 }]}
-        >
-          <Ionicons name="chevron-back" size={16} color={Colors.mutedForeground} />
-        </Pressable>
-
-        {/* Center: recording indicator */}
-        {isRunning && (
-          <View style={styles.headerChip}>
-            <View style={styles.recordingDotContainer}>
-              <Animated.View style={[styles.recordingPing, recordingPingStyle]} />
-              <View style={styles.recordingDot} />
-            </View>
-            <Text style={styles.recordingLabel}>RECORDING</Text>
+    <View style={styles.outerContainer}>
+      <View style={styles.container}>
+        {/* Full-screen map or stats */}
+        {showStats ? (
+          <Pressable
+            style={StyleSheet.absoluteFill}
+            onPress={isFinished ? undefined : () => setShowStats(false)}
+            disabled={isFinished}
+          >
+            <StatsView
+              pace={currentPace}
+              distance={runDistance}
+              time={timeStr}
+              calories={calories}
+              elevation={elevation}
+              cadence={
+                isRunning
+                  ? 168 + Math.floor(Math.sin(elapsedSeconds * 0.1) * 6)
+                  : 0
+              }
+              avgPace={
+                isRunning
+                  ? simulatePace(Math.floor(elapsedSeconds / 2))
+                  : '--:--'
+              }
+              splits={isFinished ? finishedSplits : splits}
+              isRunning={isRunning}
+              isFinished={isFinished}
+              isFavorited={isFavorited}
+              onToggleFavorite={handleToggleFavorite}
+              onDiscard={handleDiscard}
+              onSave={handleSave}
+            />
+          </Pressable>
+        ) : (
+          <View style={StyleSheet.absoluteFill}>
+            <RouteMap
+              center={ctx.center}
+              routes={ctx.routes}
+              selectedRouteId={ctx.selectedRoute?.id || null}
+            />
           </View>
         )}
 
-        {/* Right: actions */}
-        <View style={styles.headerActions}>
-          {ctx.selectedRoute && !isRunning && (
-            <Pressable onPress={handleOpenGoogleMaps} style={styles.headerIconBtn}>
-              <Ionicons name="open-outline" size={16} color={Colors.mutedForeground} />
-            </Pressable>
+        {/* Header overlay */}
+        <View style={[styles.header, { paddingTop: insets.top + 8 }]}>
+          {/* Back */}
+          <Pressable
+            onPress={showStats ? () => setShowStats(false) : handleBack}
+            disabled={!showStats && hasStarted}
+            style={[styles.headerBtn, !showStats && hasStarted && { opacity: 0.4 }]}
+          >
+            <Ionicons name="chevron-back" size={16} color={Colors.mutedForeground} />
+          </Pressable>
+
+          {/* Center: recording indicator */}
+          {hasStarted && (
+            <View style={styles.headerChip}>
+              <View style={styles.recordingDotContainer}>
+                <Animated.View style={[styles.recordingPing, recordingPingStyle]} />
+                <View style={styles.recordingDot} />
+              </View>
+              <Text style={styles.recordingLabel}>{isPaused ? 'PAUSED' : 'RECORDING'}</Text>
+            </View>
           )}
+
+          {/* Right: actions */}
+          <View style={styles.headerActions}>
+            {ctx.selectedRoute && !hasStarted && (
+              <Pressable onPress={handleOpenGoogleMaps} style={styles.headerIconBtn}>
+                <Ionicons name="open-outline" size={16} color={Colors.mutedForeground} />
+              </Pressable>
+            )}
+          </View>
         </View>
-      </View>
 
-      {/* Bottom sheet */}
-      <View style={[styles.bottomSheet, { paddingBottom: Math.max(insets.bottom, 20) + 12 }]}>
-        {/* Grab handle */}
-        <View style={styles.grabHandle} />
+        {/* Bottom sheet — hidden when finished */}
+        {!isFinished && (
+        <View style={styles.bottomSheet}>
+          {/* Grab handle */}
+          <View style={styles.grabHandle} />
 
-        {/* Stats row */}
-        <RunStats
-          pace={currentPace}
-          distance={runDistance}
-          time={timeStr}
-          isRunning={isRunning}
-          onStatPress={() => setShowStats((prev) => !prev)}
-        />
-
-        {/* Start button */}
-        <View style={styles.startRow}>
-          <StartButton
+          {/* Stats row */}
+          <RunStats
+            pace={currentPace}
+            distance={runDistance}
+            time={timeStr}
             isRunning={isRunning}
-            onToggle={handleToggleRun}
-            disabled={!ctx.hasLocation || ctx.gpsStrength < 2}
+            onStatPress={() => setShowStats((prev) => !prev)}
           />
+
+          {/* Start button */}
+          <View style={styles.startRow}>
+            <StartButton
+              runState={runState}
+              onStart={handleStart}
+              onPause={handlePause}
+              onResume={handleResume}
+              onFinish={handleFinish}
+              disabled={!ctx.hasLocation || ctx.gpsStrength < 2}
+            />
+          </View>
         </View>
+        )}
       </View>
+
+      {/* Bottom Tab Bar */}
+      <BottomTabBar />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
+  outerContainer: {
+    flex: 1,
+    backgroundColor: Colors.background,
+  },
   container: {
     flex: 1,
     backgroundColor: Colors.background,
@@ -303,6 +403,7 @@ const styles = StyleSheet.create({
     backgroundColor: Colors.card + '99',
     paddingHorizontal: 20,
     paddingTop: 12,
+    paddingBottom: 12,
   },
   grabHandle: {
     alignSelf: 'center',

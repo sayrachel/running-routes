@@ -57,7 +57,7 @@ export function FavoritePreview({ favorite, onClose }: FavoritePreviewProps) {
     ctx.setRoutes(routes);
     ctx.setSelectedRoute(routes[0] || null);
     onClose();
-    router.push('/run');
+    router.replace('/run');
   };
 
   return (

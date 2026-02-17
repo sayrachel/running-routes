@@ -21,7 +21,7 @@ export default function LandingScreen() {
     <View style={[styles.container, { paddingTop: insets.top, paddingBottom: insets.bottom }]}>
       <View style={styles.content}>
         <Ionicons name="walk" size={80} color={Colors.primary} />
-        <Text style={styles.appName}>RouteForge</Text>
+        <Text style={styles.appName}>Running Routes</Text>
         <Text style={styles.tagline}>Plan the perfect running route, every time</Text>
       </View>
 
