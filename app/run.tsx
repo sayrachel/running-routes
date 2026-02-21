@@ -1,5 +1,6 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { View, Text, Pressable, StyleSheet, Linking } from 'react-native';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { View, Text, Pressable, StyleSheet, Linking, ActivityIndicator } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
@@ -14,8 +15,11 @@ import { RouteMap } from '@/components/RouteMap';
 import { RunStats } from '@/components/RunStats';
 import { StartButton } from '@/components/StartButton';
 import { StatsView } from '@/components/StatsView';
-import { BottomTabBar } from '@/components/BottomTabBar';
+import { ProfileDrawer, type DrawerView } from '@/components/ProfileDrawer';
 import { useAppContext } from '@/lib/AppContext';
+import { useLocationTracking, accuracyToStrength } from '@/lib/useLocationTracking';
+import { saveRunRecord, addPendingRun, getCachedRunHistory } from '@/lib/firestore';
+import { generateOSRMRoutes } from '@/lib/osrm';
 import { buildGoogleMapsUrl } from '@/lib/route-export';
 import { Colors, Fonts } from '@/lib/theme';
 
@@ -28,51 +32,42 @@ function formatTime(seconds: number): string {
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }
 
-function simulatePace(seconds: number): string {
-  const base = 5.5;
-  const variation = Math.sin(seconds * 0.05) * 0.4;
-  const pace = base + variation;
-  const mins = Math.floor(pace);
-  const secs = Math.round((pace - mins) * 60);
-  return `${mins}:${String(secs).padStart(2, '0')}`;
-}
-
 export default function RunScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const ctx = useAppContext();
+  const tracking = useLocationTracking();
 
   const [showStats, setShowStats] = useState(false);
   const [runState, setRunState] = useState<'idle' | 'running' | 'paused'>('idle');
   const [isFinished, setIsFinished] = useState(false);
-  const [finishedSplits, setFinishedSplits] = useState<{ km: number; pace: string }[]>([]);
-  const [elapsedSeconds, setElapsedSeconds] = useState(0);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [finishedSplits, setFinishedSplits] = useState<{ km: number; pace: string; time: string }[]>([]);
+  const [isRegenerating, setIsRegenerating] = useState(false);
+  const [drawerVisible, setDrawerVisible] = useState(false);
+  const [drawerInitialView, setDrawerInitialView] = useState<DrawerView>('profile');
+  const runSessionId = useRef(`run-${Date.now()}`);
 
   const isRunning = runState === 'running';
   const isPaused = runState === 'paused';
   const hasStarted = runState !== 'idle';
 
-  const isFavorited = ctx.selectedRoute
-    ? ctx.favorites.some((f) => f.id === `run-${ctx.selectedRoute!.id}`)
-    : false;
+  const favId = ctx.selectedRoute ? `run-${ctx.selectedRoute.id}` : runSessionId.current;
+  const isFavorited = ctx.favorites.some((f) => f.id === favId);
 
   const handleToggleFavorite = useCallback(() => {
-    if (!ctx.selectedRoute) return;
-    const favId = `run-${ctx.selectedRoute.id}`;
     if (isFavorited) {
       ctx.removeFavorite(favId);
     } else {
       ctx.addFavorite({
         id: favId,
-        routeName: ctx.selectedRoute.name,
-        distance: parseFloat(ctx.selectedRoute.distance.toFixed(1)),
-        terrain: (ctx.selectedRoute.terrain as 'Loop' | 'Out & Back' | 'Point to Point') || 'Loop',
+        routeName: ctx.selectedRoute?.name || 'Run',
+        distance: parseFloat((ctx.selectedRoute?.distance || tracking.stats.totalDistanceKm).toFixed(1)),
+        terrain: (ctx.selectedRoute?.terrain as 'Loop' | 'Out & Back' | 'Point to Point') || 'Loop',
         lat: ctx.center.lat,
         lng: ctx.center.lng,
       });
     }
-  }, [ctx, isFavorited]);
+  }, [ctx, isFavorited, favId, tracking.stats.totalDistanceKm]);
 
   // Recording indicator ping animation
   const recordingPing = useSharedValue(1);
@@ -93,79 +88,111 @@ export default function RunScreen() {
     transform: [{ scale: 1 + (1 - recordingPing.value) * 0.6 }],
   }));
 
-  // Timer — only ticks while running, pauses when paused
+  // Update GPS strength from tracking accuracy
   useEffect(() => {
-    if (runState === 'running') {
-      intervalRef.current = setInterval(() => {
-        setElapsedSeconds((prev) => prev + 1);
-      }, 1000);
-    } else if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
+    if (tracking.stats.accuracy !== null) {
+      ctx.setGpsStrength(accuracyToStrength(tracking.stats.accuracy));
     }
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-    };
-  }, [runState]);
+  }, [tracking.stats.accuracy]);
 
-  const handleStart = useCallback(() => {
+  const handleStart = useCallback(async () => {
     setRunState('running');
-  }, []);
+    try {
+      await tracking.startTracking();
+    } catch {
+      // Location tracking may not be available (e.g. on web)
+    }
+  }, [tracking]);
 
   const handlePause = useCallback(() => {
     setRunState('paused');
-  }, []);
+    try {
+      tracking.pauseTracking();
+    } catch {
+      // Tracking may not have started
+    }
+  }, [tracking]);
 
-  const handleResume = useCallback(() => {
+  const handleResume = useCallback(async () => {
     setRunState('running');
-  }, []);
+    setShowStats(false);
+    try {
+      await tracking.resumeTracking();
+    } catch {
+      // Location tracking may not be available
+    }
+  }, [tracking]);
 
-  const handleFinish = useCallback(() => {
-    // Snapshot splits in the same format as the history page
-    const dist = elapsedSeconds > 0 ? (elapsedSeconds / 60) / 5.5 : 0;
-    const timeMin = elapsedSeconds / 60;
-    const avgPace = dist > 0 ? timeMin / dist : 0;
-    const fullKms = Math.floor(dist);
-    const snapshotSplits: { km: number; pace: string }[] = [];
-    for (let i = 1; i <= fullKms; i++) {
-      const variation = (Math.random() - 0.5) * 0.6;
-      snapshotSplits.push({ km: i, pace: (avgPace + variation).toFixed(1) });
+  const handleFinish = useCallback(async () => {
+    try {
+      await tracking.stopTracking();
+    } catch {
+      // Tracking may not have started
     }
-    const remaining = dist - fullKms;
-    if (remaining > 0.1) {
-      const variation = (Math.random() - 0.5) * 0.6;
-      snapshotSplits.push({ km: parseFloat(dist.toFixed(1)), pace: (avgPace + variation).toFixed(1) });
-    }
-    setFinishedSplits(snapshotSplits);
+
+    // Snapshot final stats
+    const { splits, totalDistanceKm, elapsedSeconds, avgPace } = tracking.stats;
+    setFinishedSplits(splits.length > 0 ? splits : []);
     setRunState('idle');
     setIsFinished(true);
     setShowStats(true);
-  }, [elapsedSeconds]);
+  }, [tracking]);
 
   const handleDiscard = useCallback(() => {
     setIsFinished(false);
     setShowStats(false);
-    setElapsedSeconds(0);
     ctx.setRoutes([]);
     ctx.setSelectedRoute(null);
     router.replace('/');
   }, [ctx, router]);
 
-  const handleSave = useCallback(() => {
-    // Save to history would go here in a real app
+  const handleSave = useCallback(async () => {
+    const { totalDistanceKm, elapsedSeconds, avgPace, currentPace, splits, coordinates } = tracking.stats;
+
+    const runData = {
+      date: Date.now(),
+      routeName: ctx.selectedRoute?.name || 'Run',
+      distance: Math.round(totalDistanceKm * 100) / 100,
+      duration: elapsedSeconds,
+      pace: currentPace,
+      avgPace,
+      calories: Math.round(elapsedSeconds * 0.18),
+      elevation: ctx.selectedRoute?.elevationGain || 0,
+      splits,
+      gpsTrack: coordinates,
+      terrain: ctx.selectedRoute?.terrain || 'Loop',
+    };
+
+    // Save to local cache immediately so history drawer shows it
+    const runRecord = { id: `local-${Date.now()}`, ...runData };
+    try {
+      const cached = await getCachedRunHistory();
+      cached.unshift(runRecord as any);
+      await AsyncStorage.setItem('@running_routes_run_history', JSON.stringify(cached));
+    } catch {}
+
+    // Save to Firestore, queue offline if it fails
+    if (ctx.firebaseUid) {
+      try {
+        await saveRunRecord(ctx.firebaseUid, runData);
+      } catch {
+        await addPendingRun(ctx.firebaseUid, runData);
+      }
+    }
+
     setIsFinished(false);
     setShowStats(false);
-    setElapsedSeconds(0);
     ctx.setRoutes([]);
     ctx.setSelectedRoute(null);
-    router.replace('/');
-  }, [ctx, router]);
+    // Open history view after saving
+    setDrawerInitialView('history');
+    setDrawerVisible(true);
+  }, [ctx, tracking.stats]);
 
   const handleBack = useCallback(() => {
     if (hasStarted) return;
     ctx.setRoutes([]);
     ctx.setSelectedRoute(null);
-    setElapsedSeconds(0);
     router.replace('/');
   }, [hasStarted, ctx, router]);
 
@@ -175,25 +202,41 @@ export default function RunScreen() {
     Linking.openURL(url);
   }, [ctx.selectedRoute]);
 
-  // Derived run data
-  const currentPace = simulatePace(elapsedSeconds);
-  const runDistance = elapsedSeconds > 0
-    ? ((elapsedSeconds / 60) / 5.5).toFixed(2)
+  const handleRegenerate = useCallback(async () => {
+    if (isRegenerating || hasStarted) return;
+    setIsRegenerating(true);
+    try {
+      const end =
+        ctx.routeStyle === 'point-to-point' && ctx.endLocation
+          ? ctx.endLocation
+          : null;
+      const newRoutes = await generateOSRMRoutes(
+        ctx.center,
+        ctx.distance * 1.60934,
+        ctx.routeStyle === 'point-to-point' ? 'point-to-point' : ctx.routeStyle === 'out-and-back' ? 'out-and-back' : 'loop',
+        1,
+        ctx.prefs,
+        end
+      );
+      ctx.setRoutes(newRoutes);
+      ctx.setSelectedRoute(newRoutes[0] || null);
+    } catch (err) {
+      console.error('Route regeneration error:', err);
+    } finally {
+      setIsRegenerating(false);
+    }
+  }, [ctx, isRegenerating, hasStarted]);
+
+  // Real GPS-derived stats
+  const { totalDistanceKm, elapsedSeconds, currentPace, avgPace, splits, coordinates, currentPosition } = tracking.stats;
+  const runDistance = hasStarted
+    ? totalDistanceKm.toFixed(2)
     : ctx.selectedRoute
       ? ctx.selectedRoute.distance.toFixed(2)
       : '0.00';
   const timeStr = formatTime(elapsedSeconds);
   const calories = Math.round(elapsedSeconds * 0.18);
   const elevation = ctx.selectedRoute ? ctx.selectedRoute.elevationGain : 0;
-
-  const completedKms = Math.floor(parseFloat(runDistance));
-  const splits = Array.from(
-    { length: Math.min(completedKms, 10) },
-    (_, i) => ({
-      km: i + 1,
-      pace: simulatePace((i + 1) * 330 + i * 17),
-    })
-  );
 
   return (
     <View style={styles.outerContainer}>
@@ -211,16 +254,8 @@ export default function RunScreen() {
               time={timeStr}
               calories={calories}
               elevation={elevation}
-              cadence={
-                isRunning
-                  ? 168 + Math.floor(Math.sin(elapsedSeconds * 0.1) * 6)
-                  : 0
-              }
-              avgPace={
-                isRunning
-                  ? simulatePace(Math.floor(elapsedSeconds / 2))
-                  : '--:--'
-              }
+              cadence={0}
+              avgPace={avgPace}
               splits={isFinished ? finishedSplits : splits}
               isRunning={isRunning}
               isFinished={isFinished}
@@ -236,6 +271,8 @@ export default function RunScreen() {
               center={ctx.center}
               routes={ctx.routes}
               selectedRouteId={ctx.selectedRoute?.id || null}
+              gpsTrack={hasStarted ? coordinates : undefined}
+              currentPosition={hasStarted ? currentPosition : undefined}
             />
           </View>
         )}
@@ -264,10 +301,23 @@ export default function RunScreen() {
 
           {/* Right: actions */}
           <View style={styles.headerActions}>
-            {ctx.selectedRoute && !hasStarted && (
-              <Pressable onPress={handleOpenGoogleMaps} style={styles.headerIconBtn}>
-                <Ionicons name="open-outline" size={16} color={Colors.mutedForeground} />
-              </Pressable>
+            {ctx.selectedRoute && !hasStarted && !isFinished && (
+              <>
+                <Pressable
+                  onPress={handleRegenerate}
+                  disabled={isRegenerating}
+                  style={[styles.headerIconBtn, isRegenerating && { opacity: 0.5 }]}
+                >
+                  {isRegenerating ? (
+                    <ActivityIndicator size="small" color={Colors.mutedForeground} />
+                  ) : (
+                    <Ionicons name="refresh" size={16} color={Colors.mutedForeground} />
+                  )}
+                </Pressable>
+                <Pressable onPress={handleOpenGoogleMaps} style={styles.headerIconBtn}>
+                  <Ionicons name="open-outline" size={16} color={Colors.mutedForeground} />
+                </Pressable>
+              </>
             )}
           </View>
         </View>
@@ -284,7 +334,6 @@ export default function RunScreen() {
             distance={runDistance}
             time={timeStr}
             isRunning={isRunning}
-            onStatPress={() => setShowStats((prev) => !prev)}
           />
 
           {/* Start button */}
@@ -295,15 +344,18 @@ export default function RunScreen() {
               onPause={handlePause}
               onResume={handleResume}
               onFinish={handleFinish}
-              disabled={!ctx.hasLocation || ctx.gpsStrength < 2}
             />
           </View>
         </View>
         )}
       </View>
 
-      {/* Bottom Tab Bar */}
-      <BottomTabBar />
+      {/* Profile Drawer */}
+      <ProfileDrawer
+        visible={drawerVisible}
+        onClose={() => setDrawerVisible(false)}
+        initialView={drawerInitialView}
+      />
     </View>
   );
 }
@@ -337,11 +389,6 @@ const styles = StyleSheet.create({
     borderRadius: 9999,
     paddingHorizontal: 14,
     paddingVertical: 8,
-  },
-  headerBtnText: {
-    fontFamily: Fonts.sansSemiBold,
-    fontSize: 12,
-    color: Colors.mutedForeground,
   },
   headerChip: {
     flexDirection: 'row',
@@ -402,8 +449,8 @@ const styles = StyleSheet.create({
     borderTopColor: Colors.border + '4D',
     backgroundColor: Colors.card + '99',
     paddingHorizontal: 20,
-    paddingTop: 12,
-    paddingBottom: 12,
+    paddingTop: 4,
+    paddingBottom: 4,
   },
   grabHandle: {
     alignSelf: 'center',
@@ -411,10 +458,10 @@ const styles = StyleSheet.create({
     height: 4,
     borderRadius: 2,
     backgroundColor: Colors.mutedForeground + '4D',
-    marginBottom: 16,
+    marginBottom: 6,
   },
   startRow: {
     alignItems: 'center',
-    marginTop: 16,
+    marginTop: 4,
   },
 });

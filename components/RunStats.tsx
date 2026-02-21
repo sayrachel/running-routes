@@ -1,5 +1,5 @@
 import React from 'react';
-import { View, Text, Pressable, StyleSheet } from 'react-native';
+import { View, Text, StyleSheet } from 'react-native';
 import { Colors, Fonts } from '@/lib/theme';
 
 interface RunStatsProps {
@@ -7,32 +7,28 @@ interface RunStatsProps {
   distance: string;
   time: string;
   isRunning: boolean;
-  onStatPress?: () => void;
 }
 
-export function RunStats({ pace, distance, time, onStatPress }: RunStatsProps) {
+export function RunStats({ pace, distance, time }: RunStatsProps) {
   return (
     <View style={styles.grid}>
-      {/* Pace */}
-      <Pressable style={[styles.cell, styles.cellSide]} onPress={onStatPress}>
-        <Text style={styles.label}>AVG PACE</Text>
-        <Text style={[styles.value, styles.valuePrimary]}>{pace}</Text>
-        <Text style={styles.unit}>min/km</Text>
-      </Pressable>
-
-      {/* Distance */}
-      <Pressable style={[styles.cell, styles.cellSide]} onPress={onStatPress}>
-        <Text style={styles.label}>DISTANCE</Text>
-        <Text style={[styles.value, styles.valuePrimary]}>{distance}</Text>
-        <Text style={styles.unit}>km</Text>
-      </Pressable>
-
       {/* Time */}
-      <Pressable style={[styles.cell, styles.cellSide]} onPress={onStatPress}>
+      <View style={[styles.cell, styles.cellSide]}>
         <Text style={styles.label}>TIME</Text>
         <Text style={[styles.value, styles.valuePrimary]}>{time}</Text>
-        <Text style={styles.unit}>elapsed</Text>
-      </Pressable>
+      </View>
+
+      {/* Pace */}
+      <View style={[styles.cell, styles.cellSide]}>
+        <Text style={styles.label} numberOfLines={1}>AVG PACE (/MI)</Text>
+        <Text style={[styles.value, styles.valuePrimary]}>{pace}</Text>
+      </View>
+
+      {/* Distance */}
+      <View style={[styles.cell, styles.cellSide]}>
+        <Text style={styles.label} numberOfLines={1}>DISTANCE (MI)</Text>
+        <Text style={[styles.value, styles.valuePrimary]}>{distance}</Text>
+      </View>
     </View>
   );
 }
@@ -48,8 +44,8 @@ const styles = StyleSheet.create({
     gap: 4,
     borderRadius: 16,
     borderWidth: 1,
-    paddingHorizontal: 10,
-    paddingVertical: 14,
+    paddingHorizontal: 6,
+    paddingVertical: 10,
   },
   cellSide: {
     borderColor: Colors.border + '80',
@@ -57,13 +53,13 @@ const styles = StyleSheet.create({
   },
   label: {
     fontFamily: Fonts.sansBold,
-    fontSize: 10,
-    letterSpacing: 1.5,
+    fontSize: 9,
+    letterSpacing: 1,
     color: Colors.mutedForeground,
   },
   value: {
     fontFamily: Fonts.monoBold,
-    lineHeight: 32,
+    lineHeight: 28,
   },
   valuePrimary: {
     fontSize: 26,
