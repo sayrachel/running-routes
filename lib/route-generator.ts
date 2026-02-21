@@ -110,37 +110,8 @@ function generateOutAndBackRoute(
 }
 
 export interface RoutePreferences {
-  elevation: "flat" | "hilly"
-  scenic: boolean
   lowTraffic: boolean
 }
-
-const routeNamesFlat = [
-  "River Walk",
-  "Lakeside Loop",
-  "Canal Path",
-  "Promenade Run",
-  "Flat Track Circuit",
-  "Waterfront Trail",
-]
-
-const routeNamesHilly = [
-  "Hilltop Circuit",
-  "Ridgeline Run",
-  "Summit Trail",
-  "Valley Climb",
-  "Highland Loop",
-  "Hillside Explorer",
-]
-
-const routeNamesScenic = [
-  "Park Perimeter",
-  "Heritage Trail",
-  "Garden Circuit",
-  "Sunset Boulevard",
-  "Botanical Run",
-  "Landmark Loop",
-]
 
 const routeNamesQuiet = [
   "Backstreet Run",
@@ -161,11 +132,7 @@ const routeNamesDefault = [
 ]
 
 function pickRouteName(prefs: RoutePreferences, index: number, startLat: number): string {
-  let names = routeNamesDefault
-  if (prefs.scenic) names = routeNamesScenic
-  else if (prefs.lowTraffic) names = routeNamesQuiet
-  else if (prefs.elevation === "hilly") names = routeNamesHilly
-  else if (prefs.elevation === "flat") names = routeNamesFlat
+  const names = prefs.lowTraffic ? routeNamesQuiet : routeNamesDefault
   const idx = Math.abs((index + Math.floor(startLat * 10)) % names.length)
   return names[idx]
 }
@@ -203,7 +170,7 @@ export function generateRoutes(
   targetDistanceKm: number,
   routeType: "loop" | "out-and-back" | "any",
   count: number = 3,
-  prefs: RoutePreferences = { elevation: "flat", scenic: false, lowTraffic: false },
+  prefs: RoutePreferences = { lowTraffic: false },
   end?: RoutePoint | null
 ): GeneratedRoute[] {
   const routes: GeneratedRoute[] = []
@@ -247,16 +214,12 @@ export function generateRoutes(
     const pace = 5 + seed * 2 // min/km
     const estimatedTime = Math.round(actualDistance * pace)
 
-    // Elevation gain influenced by preference
-    const baseElevation = prefs.elevation === "hilly"
-      ? 60 + seed * 140 * (actualDistance / 5)
-      : 5 + seed * 20 * (actualDistance / 5)
+    // Elevation gain — hardcoded flat defaults
+    const baseElevation = 5 + seed * 20 * (actualDistance / 5)
     const elevationGain = Math.round(baseElevation)
 
     const difficulty: "easy" | "moderate" | "hard" =
-      prefs.elevation === "hilly"
-        ? actualDistance < 5 ? "moderate" : "hard"
-        : actualDistance < 5 ? "easy" : actualDistance < 10 ? "moderate" : "hard"
+      actualDistance < 5 ? "easy" : actualDistance < 10 ? "moderate" : "hard"
 
     routes.push({
       id: `route-${i}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,

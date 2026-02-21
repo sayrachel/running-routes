@@ -1,9 +1,9 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, Pressable, ScrollView, StyleSheet, Alert, Image, Dimensions, ActionSheetIOS, Platform } from 'react-native';
+import { View, Text, Pressable, ScrollView, StyleSheet, Image, Dimensions, Share, Linking } from 'react-native';
+import * as Clipboard from 'expo-clipboard';
 import { useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
-import * as ImagePicker from 'expo-image-picker';
 import Animated, {
   useSharedValue,
   useAnimatedStyle,
@@ -12,35 +12,34 @@ import Animated, {
 } from 'react-native-reanimated';
 import { useAppContext, type FavoriteRoute } from '@/lib/AppContext';
 export type { FavoriteRoute };
+import { getRunHistory, getCachedRunHistory } from '@/lib/firestore';
+import type { RunRecord } from '@/lib/types';
 import { Colors, Fonts } from '@/lib/theme';
 
-type DrawerView = 'profile' | 'history' | 'favorites' | 'run-detail';
+export type DrawerView = 'profile' | 'history' | 'favorites' | 'run-detail' | 'contact';
 
 const SCREEN_WIDTH = Dimensions.get('window').width;
 
-const MOCK_HISTORY = [
-  { id: '1', routeName: 'Morning Loop', distance: 5.2, time: 32, date: 'Feb 15, 2026', elevation: 48, calories: 345 },
-  { id: '2', routeName: 'River Trail', distance: 8.4, time: 54, date: 'Feb 13, 2026', elevation: 22, calories: 580 },
-  { id: '3', routeName: 'Hill Climb', distance: 6.1, time: 42, date: 'Feb 10, 2026', elevation: 134, calories: 460 },
-  { id: '4', routeName: 'Park Circuit', distance: 3.8, time: 22, date: 'Feb 8, 2026', elevation: 12, calories: 230 },
-];
-
-type HistoryRun = typeof MOCK_HISTORY[0];
+function formatSplitTime(seconds: number): string {
+  const mins = Math.floor(seconds / 60);
+  const secs = Math.round(seconds % 60);
+  return `${mins}:${String(secs).padStart(2, '0')}`;
+}
 
 function generateSplits(distance: number, time: number) {
   const fullKms = Math.floor(distance);
   const avgPace = time / distance;
-  const splits: { km: number; pace: string }[] = [];
+  const splits: { km: number; pace: string; time: string }[] = [];
   for (let i = 1; i <= fullKms; i++) {
     const variation = (Math.random() - 0.5) * 0.6;
     const pace = avgPace + variation;
-    splits.push({ km: i, pace: pace.toFixed(1) });
+    splits.push({ km: i, pace: pace.toFixed(1), time: formatSplitTime(pace * 60) });
   }
   const remaining = distance - fullKms;
   if (remaining > 0.1) {
     const variation = (Math.random() - 0.5) * 0.6;
     const pace = avgPace + variation;
-    splits.push({ km: parseFloat(distance.toFixed(1)), pace: pace.toFixed(1) });
+    splits.push({ km: parseFloat(distance.toFixed(1)), pace: pace.toFixed(1), time: formatSplitTime(pace * 60) });
   }
   return splits;
 }
@@ -49,9 +48,10 @@ interface ProfileDrawerProps {
   visible: boolean;
   onClose: () => void;
   onPreviewFavorite?: (favorite: FavoriteRoute) => void;
+  initialView?: DrawerView;
 }
 
-export function ProfileDrawer({ visible, onClose, onPreviewFavorite }: ProfileDrawerProps) {
+export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView }: ProfileDrawerProps) {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const ctx = useAppContext();
@@ -59,16 +59,44 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite }: ProfileDr
   const [mounted, setMounted] = useState(false);
   const [deleteLabel, setDeleteLabel] = useState('Delete Account');
   const [view, setView] = useState<DrawerView>('profile');
-  const [selectedRun, setSelectedRun] = useState<HistoryRun | null>(null);
-  const [profileImage, setProfileImage] = useState<string | null>(null);
+  const [selectedRun, setSelectedRun] = useState<RunRecord | null>(null);
+  const [runHistory, setRunHistory] = useState<RunRecord[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyFromCache, setHistoryFromCache] = useState(false);
 
   useEffect(() => {
     if (visible) {
       setMounted(true);
       setDeleteLabel('Delete Account');
-      setView('profile');
+      setView(initialView || 'profile');
       setSelectedRun(null);
       translateX.value = withTiming(0, { duration: 300 });
+
+      // Load run history: try Firestore first, fall back to cache
+      setHistoryLoading(true);
+      setHistoryFromCache(false);
+      if (ctx.firebaseUid) {
+        getRunHistory(ctx.firebaseUid)
+          .then((runs) => {
+            setRunHistory(runs);
+            setHistoryFromCache(false);
+          })
+          .catch(async () => {
+            const cached = await getCachedRunHistory();
+            setRunHistory(cached);
+            setHistoryFromCache(cached.length > 0);
+          })
+          .finally(() => setHistoryLoading(false));
+      } else {
+        // No auth — load from local cache
+        getCachedRunHistory()
+          .then((cached) => {
+            setRunHistory(cached);
+            setHistoryFromCache(cached.length > 0);
+          })
+          .catch(() => {})
+          .finally(() => setHistoryLoading(false));
+      }
     } else {
       translateX.value = withTiming(SCREEN_WIDTH, { duration: 300 }, (finished) => {
         if (finished) {
@@ -86,6 +114,9 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite }: ProfileDr
     if (view === 'run-detail') {
       setView('history');
       setSelectedRun(null);
+    } else if (view !== 'profile' && initialView && initialView !== 'profile') {
+      // Opened directly to history/favorites — back closes the drawer
+      onClose();
     } else if (view !== 'profile') {
       setView('profile');
     } else {
@@ -93,9 +124,23 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite }: ProfileDr
     }
   };
 
-  const handleLogout = () => {
-    ctx.setIsLoggedIn(false);
-    ctx.setUser(null);
+  const SUPPORT_EMAIL = 'support@runroutes.app';
+
+  const [emailCopied, setEmailCopied] = useState(false);
+
+  const handleCopyEmail = async () => {
+    await Clipboard.setStringAsync(SUPPORT_EMAIL);
+    setEmailCopied(true);
+    setTimeout(() => setEmailCopied(false), 2000);
+  };
+
+  const handleOpenGmail = () => {
+    const gmailUrl = `https://mail.google.com/mail/?view=cm&to=${SUPPORT_EMAIL}&su=Running%20Routes%20Support`;
+    Linking.openURL(gmailUrl);
+  };
+
+  const handleLogout = async () => {
+    await ctx.signOutUser();
     onClose();
     router.replace('/landing');
   };
@@ -105,8 +150,7 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite }: ProfileDr
       setDeleteLabel('Tap again to confirm');
       return;
     }
-    ctx.setIsLoggedIn(false);
-    ctx.setUser(null);
+    ctx.signOutUser();
     onClose();
     router.replace('/landing');
   };
@@ -120,82 +164,26 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite }: ProfileDr
     onPreviewFavorite?.(route);
   };
 
-  const [showPhotoMenu, setShowPhotoMenu] = useState(false);
-
-  const handleAvatarPress = () => {
-    if (Platform.OS === 'ios') {
-      const hasPhoto = !!profileImage;
-      const options = hasPhoto
-        ? ['Choose Existing', 'Take Picture', 'Delete Picture', 'Cancel']
-        : ['Choose Existing', 'Take Picture', 'Cancel'];
-      const cancelIndex = options.length - 1;
-      const destructiveIndex = hasPhoto ? 2 : undefined;
-
-      ActionSheetIOS.showActionSheetWithOptions(
-        { options, cancelButtonIndex: cancelIndex, destructiveButtonIndex: destructiveIndex },
-        (index) => {
-          if (index === 0) pickFromLibrary();
-          else if (index === 1) takePhoto();
-          else if (hasPhoto && index === 2) setProfileImage(null);
-        },
-      );
-    } else if (Platform.OS === 'android') {
-      const hasPhoto = !!profileImage;
-      const buttons: { text: string; onPress?: () => void; style?: 'destructive' | 'cancel' }[] = [
-        { text: 'Choose Existing', onPress: pickFromLibrary },
-        { text: 'Take Picture', onPress: takePhoto },
-      ];
-      if (hasPhoto) {
-        buttons.push({ text: 'Delete Picture', style: 'destructive', onPress: () => setProfileImage(null) });
-      }
-      buttons.push({ text: 'Cancel', style: 'cancel' });
-      Alert.alert('Profile Photo', undefined, buttons);
-    } else {
-      setShowPhotoMenu(true);
-    }
-  };
-
-  const pickFromLibrary = async () => {
-    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
-    if (status !== 'granted') {
-      Alert.alert('Permission needed', 'Please allow access to your photo library.');
-      return;
-    }
-    const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ['images'],
-      allowsEditing: true,
-      aspect: [1, 1],
-      quality: 0.8,
-    });
-    if (!result.canceled && result.assets[0]) {
-      setProfileImage(result.assets[0].uri);
-    }
-  };
-
-  const takePhoto = async () => {
-    const { status } = await ImagePicker.requestCameraPermissionsAsync();
-    if (status !== 'granted') {
-      Alert.alert('Permission needed', 'Please allow access to your camera.');
-      return;
-    }
-    const result = await ImagePicker.launchCameraAsync({
-      allowsEditing: true,
-      aspect: [1, 1],
-      quality: 0.8,
-    });
-    if (!result.canceled && result.assets[0]) {
-      setProfileImage(result.assets[0].uri);
-    }
-  };
-
   if (!mounted) return null;
 
-  const viewTitle = view === 'history' ? 'History' : view === 'favorites' ? 'Favorites' : view === 'run-detail' && selectedRun ? selectedRun.routeName : 'Settings';
+  const viewTitle = view === 'history' ? 'History' : view === 'favorites' ? 'Favorites' : view === 'contact' ? 'Contact Us' : view === 'run-detail' && selectedRun ? selectedRun.routeName : 'Settings';
+
+  const formatRunDate = (timestamp: number) => {
+    const d = new Date(timestamp);
+    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  };
+
+  const formatDuration = (seconds: number) => {
+    return Math.round(seconds / 60);
+  };
 
   const renderRunDetail = () => {
     if (!selectedRun) return null;
-    const pace = (selectedRun.time / selectedRun.distance).toFixed(1);
-    const splits = generateSplits(selectedRun.distance, selectedRun.time);
+    const durationMin = formatDuration(selectedRun.duration);
+    const pace = selectedRun.avgPace || (durationMin / selectedRun.distance).toFixed(1);
+    const splits = selectedRun.splits && selectedRun.splits.length > 0
+      ? selectedRun.splits
+      : generateSplits(selectedRun.distance, durationMin);
 
     return (
       <ScrollView
@@ -203,29 +191,21 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite }: ProfileDr
         contentContainerStyle={styles.scrollContentInner}
         showsVerticalScrollIndicator={false}
       >
-        <Text style={styles.runDetailDate}>{selectedRun.date}</Text>
+        <Text style={styles.runDetailDate}>{formatRunDate(selectedRun.date)}</Text>
 
         {/* Stats grid */}
         <View style={styles.statsGrid}>
           <View style={styles.statCell}>
-            <Text style={styles.statCellValue}>{selectedRun.distance}</Text>
-            <Text style={styles.statCellLabel}>km</Text>
-          </View>
-          <View style={styles.statCell}>
-            <Text style={styles.statCellValue}>{selectedRun.time}</Text>
+            <Text style={styles.statCellValue}>{durationMin}</Text>
             <Text style={styles.statCellLabel}>min</Text>
           </View>
           <View style={styles.statCell}>
             <Text style={styles.statCellValue}>{pace}</Text>
-            <Text style={styles.statCellLabel}>min/km</Text>
+            <Text style={styles.statCellLabel}>min/mi</Text>
           </View>
           <View style={styles.statCell}>
-            <Text style={styles.statCellValue}>{selectedRun.elevation}</Text>
-            <Text style={styles.statCellLabel}>m elev</Text>
-          </View>
-          <View style={styles.statCell}>
-            <Text style={styles.statCellValue}>{selectedRun.calories}</Text>
-            <Text style={styles.statCellLabel}>cal</Text>
+            <Text style={styles.statCellValue}>{selectedRun.distance}</Text>
+            <Text style={styles.statCellLabel}>mi</Text>
           </View>
         </View>
 
@@ -233,13 +213,13 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite }: ProfileDr
         <Text style={styles.splitsTitle}>Splits</Text>
         <View style={styles.splitsTable}>
           <View style={styles.splitsHeader}>
-            <Text style={styles.splitsHeaderText}>KM</Text>
-            <Text style={styles.splitsHeaderText}>PACE</Text>
+            <Text style={styles.splitsHeaderText}>MILE</Text>
+            <Text style={styles.splitsHeaderText}>TIME</Text>
           </View>
           {splits.map((split) => (
             <View key={split.km} style={styles.splitRow}>
               <Text style={styles.splitKm}>{split.km}</Text>
-              <Text style={styles.splitPace}>{split.pace} min/km</Text>
+              <Text style={styles.splitPace}>{split.time || split.pace}</Text>
             </View>
           ))}
         </View>
@@ -268,22 +248,20 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite }: ProfileDr
           >
             {/* Profile */}
             <View style={styles.profileSection}>
-              <Pressable onPress={handleAvatarPress}>
-                <View style={styles.avatar}>
-                  {profileImage ? (
-                    <Image source={{ uri: profileImage }} style={styles.avatarImage} />
-                  ) : (
-                    <Ionicons name="person" size={40} color={Colors.primary} />
-                  )}
-                </View>
-              </Pressable>
-              <Text style={styles.userName}>{ctx.user?.name ?? 'User'}</Text>
+              <View style={styles.avatar}>
+                {ctx.user?.avatar ? (
+                  <Image source={{ uri: ctx.user.avatar }} style={styles.avatarImage} />
+                ) : (
+                  <Ionicons name="person" size={40} color={Colors.primary} />
+                )}
+              </View>
               <Text style={styles.userEmail}>{ctx.user?.email ?? ''}</Text>
             </View>
 
             <View style={styles.divider} />
 
-            {/* Menu */}
+            {/* Runs */}
+            <Text style={styles.sectionLabel}>RUNS</Text>
             <View style={styles.menuSection}>
               <Pressable style={styles.menuRow} onPress={() => setView('history')}>
                 <Ionicons name="time-outline" size={20} color={Colors.mutedForeground} />
@@ -298,67 +276,142 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite }: ProfileDr
               </Pressable>
             </View>
 
-            <View style={styles.actionsSpacer} />
+            {/* Support */}
+            <Text style={styles.sectionLabel}>SUPPORT</Text>
+            <View style={styles.menuSection}>
+              <Pressable style={styles.menuRow} onPress={async () => {
+                try {
+                  await Share.share({
+                    message: 'Discover Run Routes: your personal running route generator based on your preferences. https://runroutes.app',
+                  });
+                } catch {}
+              }}>
+                <Ionicons name="share-outline" size={20} color={Colors.mutedForeground} />
+                <Text style={styles.menuLabel}>Share Run Routes</Text>
+                <Ionicons name="chevron-forward" size={16} color={Colors.mutedForeground} />
+              </Pressable>
 
-            {/* Actions */}
-            <View style={styles.actionsSection}>
+              <Pressable style={styles.menuRow} onPress={() => setView('contact')}>
+                <Ionicons name="mail-outline" size={20} color={Colors.mutedForeground} />
+                <Text style={styles.menuLabel}>Contact Us</Text>
+                <Ionicons name="chevron-forward" size={16} color={Colors.mutedForeground} />
+              </Pressable>
+            </View>
+
+            {/* Legal */}
+            <Text style={styles.sectionLabel}>LEGAL</Text>
+            <View style={styles.menuSection}>
+              <Pressable style={styles.menuRow} onPress={() => Linking.openURL('https://runroutes.app/terms')}>
+                <Ionicons name="document-text-outline" size={20} color={Colors.mutedForeground} />
+                <Text style={styles.menuLabel}>Terms of Service</Text>
+                <Ionicons name="chevron-forward" size={16} color={Colors.mutedForeground} />
+              </Pressable>
+
+              <Pressable style={styles.menuRow} onPress={() => Linking.openURL('https://runroutes.app/privacy')}>
+                <Ionicons name="shield-checkmark-outline" size={20} color={Colors.mutedForeground} />
+                <Text style={styles.menuLabel}>Privacy Policy</Text>
+                <Ionicons name="chevron-forward" size={16} color={Colors.mutedForeground} />
+              </Pressable>
+            </View>
+
+            {/* Account */}
+            <Text style={styles.sectionLabel}>ACCOUNT</Text>
+            <View style={styles.menuSection}>
               <Pressable
                 onPress={handleLogout}
-                style={({ pressed }) => [
-                  styles.secondaryButton,
-                  pressed && { opacity: 0.7 },
-                ]}
+                style={styles.menuRow}
               >
-                <Text style={styles.secondaryButtonText}>Log Out</Text>
+                <Ionicons name="log-out-outline" size={20} color={Colors.mutedForeground} />
+                <Text style={styles.menuLabel}>Log Out</Text>
+                <Ionicons name="chevron-forward" size={16} color={Colors.mutedForeground} />
               </Pressable>
 
               <Pressable
                 onPress={handleDelete}
-                style={({ pressed }) => [
-                  styles.secondaryButton,
-                  pressed && { opacity: 0.7 },
-                ]}
+                style={styles.menuRow}
               >
-                <Text style={styles.deleteButtonText}>{deleteLabel}</Text>
+                <Ionicons name="trash-outline" size={20} color={Colors.destructive} />
+                <Text style={[styles.menuLabel, { color: Colors.destructive }]}>{deleteLabel}</Text>
+                <Ionicons name="chevron-forward" size={16} color={Colors.mutedForeground} />
               </Pressable>
             </View>
           </ScrollView>
         ) : view === 'run-detail' ? (
           renderRunDetail()
+        ) : view === 'contact' ? (
+          <ScrollView
+            style={styles.scrollContent}
+            contentContainerStyle={styles.scrollContentInner}
+            showsVerticalScrollIndicator={false}
+          >
+            <Text style={styles.contactDescription}>
+              Our customer service team is here to help you with any questions or issues you might have with Running Routes.
+            </Text>
+
+            <Text style={styles.sectionLabel}>EMAIL SUPPORT</Text>
+            <View style={styles.contactEmailCard}>
+              <Ionicons name="mail-outline" size={20} color={Colors.primary} />
+              <Text style={styles.contactEmail}>{SUPPORT_EMAIL}</Text>
+              <Pressable onPress={handleCopyEmail} hitSlop={8}>
+                <Ionicons name={emailCopied ? "checkmark-circle" : "copy-outline"} size={20} color={emailCopied ? Colors.primary : Colors.mutedForeground} />
+              </Pressable>
+              <Pressable onPress={handleOpenGmail} hitSlop={8}>
+                <Ionicons name="open-outline" size={20} color={Colors.mutedForeground} />
+              </Pressable>
+            </View>
+          </ScrollView>
         ) : (
           <ScrollView
             style={styles.scrollContent}
             contentContainerStyle={styles.scrollContentInner}
             showsVerticalScrollIndicator={false}
           >
-            {view === 'history' &&
-              MOCK_HISTORY.map((run) => {
-                const pace = (run.time / run.distance).toFixed(1);
-                return (
-                  <Pressable
-                    key={run.id}
-                    style={styles.card}
-                    onPress={() => { setSelectedRun(run); setView('run-detail'); }}
-                  >
-                    <Text style={styles.cardTitle}>{run.routeName}</Text>
-                    <Text style={styles.cardSubtitle}>{run.date}</Text>
-                    <View style={styles.statsRow}>
-                      <View style={styles.stat}>
-                        <Ionicons name="navigate-outline" size={12} color={Colors.mutedForeground} />
-                        <Text style={styles.statText}>{run.distance} km</Text>
-                      </View>
-                      <View style={styles.stat}>
-                        <Ionicons name="time-outline" size={12} color={Colors.mutedForeground} />
-                        <Text style={styles.statText}>{run.time} min</Text>
-                      </View>
-                      <View style={styles.stat}>
-                        <Ionicons name="speedometer-outline" size={12} color={Colors.mutedForeground} />
-                        <Text style={styles.statText}>{pace} min/km</Text>
-                      </View>
-                    </View>
-                  </Pressable>
-                );
-              })}
+            {view === 'history' && (
+              historyLoading ? (
+                <View style={styles.emptyState}>
+                  <Text style={styles.emptyText}>Loading history...</Text>
+                </View>
+              ) : runHistory.length === 0 ? (
+                <View style={styles.emptyState}>
+                  <Ionicons name="time-outline" size={32} color={Colors.mutedForeground} />
+                  <Text style={styles.emptyText}>No runs yet</Text>
+                </View>
+              ) : (
+                <>
+                  {historyFromCache && (
+                    <Text style={styles.cacheIndicator}>Showing cached data (offline)</Text>
+                  )}
+                  {runHistory.map((run) => {
+                    const durationMin = formatDuration(run.duration);
+                    const pace = run.avgPace || (durationMin / run.distance).toFixed(1);
+                    return (
+                      <Pressable
+                        key={run.id}
+                        style={styles.card}
+                        onPress={() => { setSelectedRun(run); setView('run-detail'); }}
+                      >
+                        <Text style={styles.cardTitle}>{run.routeName}</Text>
+                        <Text style={styles.cardSubtitle}>{formatRunDate(run.date)}</Text>
+                        <View style={styles.statsRow}>
+                          <View style={styles.stat}>
+                            <Ionicons name="time-outline" size={12} color={Colors.mutedForeground} />
+                            <Text style={styles.statText}>{durationMin} min</Text>
+                          </View>
+                          <View style={styles.stat}>
+                            <Ionicons name="speedometer-outline" size={12} color={Colors.mutedForeground} />
+                            <Text style={styles.statText}>{pace} min/mi</Text>
+                          </View>
+                          <View style={styles.stat}>
+                            <Ionicons name="navigate-outline" size={12} color={Colors.mutedForeground} />
+                            <Text style={styles.statText}>{run.distance} mi</Text>
+                          </View>
+                        </View>
+                      </Pressable>
+                    );
+                  })}
+                </>
+              )
+            )}
 
             {view === 'favorites' &&
               (ctx.favorites.length === 0 ? (
@@ -375,7 +428,7 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite }: ProfileDr
                         <View style={styles.statsRow}>
                           <View style={styles.stat}>
                             <Ionicons name="navigate-outline" size={12} color={Colors.mutedForeground} />
-                            <Text style={styles.statText}>{route.distance} km</Text>
+                            <Text style={styles.statText}>{route.distance} mi</Text>
                           </View>
                           <View style={styles.stat}>
                             <Ionicons name="map-outline" size={12} color={Colors.mutedForeground} />
@@ -396,50 +449,6 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite }: ProfileDr
           </ScrollView>
         )}
       </View>
-
-      {/* Web action sheet for profile photo */}
-      {showPhotoMenu && (
-        <>
-          <Pressable style={styles.photoMenuBackdrop} onPress={() => setShowPhotoMenu(false)} />
-          <View style={styles.photoMenuContainer}>
-            <View style={styles.photoMenuGroup}>
-              <Pressable
-                style={styles.photoMenuItem}
-                onPress={() => { setShowPhotoMenu(false); pickFromLibrary(); }}
-              >
-                <Ionicons name="images-outline" size={20} color={Colors.foreground} />
-                <Text style={styles.photoMenuText}>Choose Existing</Text>
-              </Pressable>
-              <View style={styles.photoMenuDivider} />
-              <Pressable
-                style={styles.photoMenuItem}
-                onPress={() => { setShowPhotoMenu(false); takePhoto(); }}
-              >
-                <Ionicons name="camera-outline" size={20} color={Colors.foreground} />
-                <Text style={styles.photoMenuText}>Take Picture</Text>
-              </Pressable>
-              {profileImage && (
-                <>
-                  <View style={styles.photoMenuDivider} />
-                  <Pressable
-                    style={styles.photoMenuItem}
-                    onPress={() => { setShowPhotoMenu(false); setProfileImage(null); }}
-                  >
-                    <Ionicons name="trash-outline" size={20} color={Colors.destructive} />
-                    <Text style={[styles.photoMenuText, { color: Colors.destructive }]}>Delete Picture</Text>
-                  </Pressable>
-                </>
-              )}
-            </View>
-            <Pressable
-              style={styles.photoMenuCancel}
-              onPress={() => setShowPhotoMenu(false)}
-            >
-              <Text style={styles.photoMenuCancelText}>Cancel</Text>
-            </Pressable>
-          </View>
-        </>
-      )}
     </Animated.View>
   );
 }
@@ -523,6 +532,14 @@ const styles = StyleSheet.create({
   },
   menuSection: {
     gap: 8,
+  },
+  sectionLabel: {
+    fontFamily: Fonts.sansBold,
+    fontSize: 10,
+    letterSpacing: 2,
+    color: Colors.mutedForeground,
+    marginTop: 16,
+    marginBottom: 4,
   },
   menuRow: {
     flexDirection: 'row',
@@ -612,6 +629,52 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: Colors.mutedForeground,
   },
+  cacheIndicator: {
+    fontFamily: Fonts.sans,
+    fontSize: 11,
+    color: Colors.mutedForeground,
+    textAlign: 'center',
+    fontStyle: 'italic',
+    marginBottom: 8,
+  },
+  contactDescription: {
+    fontFamily: Fonts.sans,
+    fontSize: 14,
+    color: Colors.foreground,
+    lineHeight: 22,
+    marginBottom: 20,
+  },
+  contactEmailCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    backgroundColor: Colors.card,
+    padding: 16,
+  },
+  contactEmail: {
+    flex: 1,
+    fontFamily: Fonts.sansSemiBold,
+    fontSize: 14,
+    color: Colors.foreground,
+  },
+  contactButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    backgroundColor: Colors.primary,
+    borderRadius: 16,
+    paddingVertical: 16,
+    marginTop: 12,
+  },
+  contactButtonText: {
+    fontFamily: Fonts.sansBold,
+    fontSize: 14,
+    color: Colors.primaryForeground,
+  },
   runDetailDate: {
     fontFamily: Fonts.sans,
     fontSize: 13,
@@ -689,52 +752,6 @@ const styles = StyleSheet.create({
   splitPace: {
     fontFamily: Fonts.sansMedium,
     fontSize: 13,
-    color: Colors.mutedForeground,
-  },
-  photoMenuBackdrop: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(0,0,0,0.5)',
-    zIndex: 2000,
-  },
-  photoMenuContainer: {
-    position: 'absolute',
-    bottom: 40,
-    left: 16,
-    right: 16,
-    zIndex: 2001,
-    gap: 8,
-  },
-  photoMenuGroup: {
-    backgroundColor: Colors.card,
-    borderRadius: 14,
-    overflow: 'hidden',
-  },
-  photoMenuItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
-    paddingVertical: 16,
-    paddingHorizontal: 20,
-  },
-  photoMenuText: {
-    fontFamily: Fonts.sansSemiBold,
-    fontSize: 16,
-    color: Colors.foreground,
-  },
-  photoMenuDivider: {
-    height: 1,
-    backgroundColor: Colors.border,
-    marginHorizontal: 16,
-  },
-  photoMenuCancel: {
-    backgroundColor: Colors.card,
-    borderRadius: 14,
-    alignItems: 'center',
-    paddingVertical: 16,
-  },
-  photoMenuCancelText: {
-    fontFamily: Fonts.sansBold,
-    fontSize: 16,
     color: Colors.mutedForeground,
   },
 });

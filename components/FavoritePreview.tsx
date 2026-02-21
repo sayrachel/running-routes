@@ -1,12 +1,13 @@
-import React from 'react';
-import { View, Text, Pressable, StyleSheet, Linking } from 'react-native';
+import React, { useState } from 'react';
+import { View, Text, Pressable, StyleSheet, Linking, ActivityIndicator } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { RouteMap } from '@/components/RouteMap';
 import { useAppContext } from '@/lib/AppContext';
 import { generateRoutes } from '@/lib/route-generator';
-import type { FavoriteRoute } from '@/components/ProfileDrawer';
+import { generateOSRMRoutes } from '@/lib/osrm';
+import type { FavoriteRoute } from '@/lib/AppContext';
 import { Colors, Fonts } from '@/lib/theme';
 
 interface FavoritePreviewProps {
@@ -14,25 +15,26 @@ interface FavoritePreviewProps {
   onClose: () => void;
 }
 
-function mapTerrain(terrain: string): 'loop' | 'out-and-back' | 'any' {
+function mapTerrain(terrain: string): 'loop' | 'out-and-back' | 'point-to-point' {
   if (terrain === 'Loop') return 'loop';
   if (terrain === 'Out & Back') return 'out-and-back';
-  return 'out-and-back';
+  return 'point-to-point';
 }
 
 export function FavoritePreview({ favorite, onClose }: FavoritePreviewProps) {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const ctx = useAppContext();
+  const [loading, setLoading] = useState(false);
 
   const center = { lat: favorite.lat, lng: favorite.lng };
   const routeType = mapTerrain(favorite.terrain);
 
-  // Generate a preview route from the favorite data
+  // Use mock generator for quick preview (synchronous, no API call)
   const previewRoutes = generateRoutes(
     center,
     favorite.distance,
-    routeType,
+    routeType === 'point-to-point' ? 'out-and-back' : routeType,
     1,
     ctx.prefs,
   );
@@ -44,20 +46,36 @@ export function FavoritePreview({ favorite, onClose }: FavoritePreviewProps) {
     );
   };
 
-  const handleStartFromHere = () => {
-    // Generate route from user's current location
-    const currentRouteType = mapTerrain(favorite.terrain);
-    const routes = generateRoutes(
-      ctx.center,
-      favorite.distance,
-      currentRouteType,
-      1,
-      ctx.prefs,
-    );
-    ctx.setRoutes(routes);
-    ctx.setSelectedRoute(routes[0] || null);
-    onClose();
-    router.replace('/run');
+  const handleStartFromHere = async () => {
+    setLoading(true);
+    try {
+      const routes = await generateOSRMRoutes(
+        ctx.center,
+        favorite.distance,
+        routeType,
+        1,
+        ctx.prefs,
+      );
+      ctx.setRoutes(routes);
+      ctx.setSelectedRoute(routes[0] || null);
+      onClose();
+      router.replace('/run');
+    } catch {
+      // Fallback to mock routes
+      const routes = generateRoutes(
+        ctx.center,
+        favorite.distance,
+        routeType === 'point-to-point' ? 'out-and-back' : routeType,
+        1,
+        ctx.prefs,
+      );
+      ctx.setRoutes(routes);
+      ctx.setSelectedRoute(routes[0] || null);
+      onClose();
+      router.replace('/run');
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -110,13 +128,21 @@ export function FavoritePreview({ favorite, onClose }: FavoritePreviewProps) {
 
           <Pressable
             onPress={handleStartFromHere}
+            disabled={loading}
             style={({ pressed }) => [
               styles.primaryBtn,
-              pressed && { transform: [{ scale: 0.98 }] },
+              pressed && !loading && { transform: [{ scale: 0.98 }] },
+              loading && { opacity: 0.7 },
             ]}
           >
-            <Ionicons name="play" size={18} color={Colors.primaryForeground} />
-            <Text style={styles.primaryBtnText}>Start from Here</Text>
+            {loading ? (
+              <ActivityIndicator size="small" color={Colors.primaryForeground} />
+            ) : (
+              <Ionicons name="play" size={18} color={Colors.primaryForeground} />
+            )}
+            <Text style={styles.primaryBtnText}>
+              {loading ? 'Generating...' : 'Start from Here'}
+            </Text>
           </Pressable>
         </View>
       </View>
@@ -149,11 +175,6 @@ const styles = StyleSheet.create({
     borderRadius: 9999,
     paddingHorizontal: 14,
     paddingVertical: 8,
-  },
-  headerBtnText: {
-    fontFamily: Fonts.sansSemiBold,
-    fontSize: 12,
-    color: Colors.mutedForeground,
   },
   bottomPanel: {
     position: 'absolute',

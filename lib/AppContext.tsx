@@ -1,5 +1,18 @@
-import React, { createContext, useContext, useState } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import type { GeneratedRoute, RoutePoint, RoutePreferences } from './route-generator';
+import { useAuth } from './useAuth';
+import {
+  addFavoriteRoute,
+  removeFavoriteRoute,
+  onFavoritesSnapshot,
+  updateUserProfile,
+  getCachedFavorites,
+  flushPendingRuns,
+} from './firestore';
+import type { FavoriteRouteRecord } from './types';
+
+const DISTANCE_STORAGE_KEY = '@running_routes_last_distance_v3';
 
 export type RouteStyle = 'loop' | 'point-to-point' | 'out-and-back';
 
@@ -10,8 +23,6 @@ export interface User {
 }
 
 export interface RunPreferences {
-  elevation: 'flat' | 'hilly';
-  scenic: boolean;
   lowTraffic: boolean;
 }
 
@@ -29,6 +40,12 @@ interface AppState {
   setIsLoggedIn: (v: boolean) => void;
   user: User | null;
   setUser: (v: User | null) => void;
+  firebaseUid: string | null;
+  authLoading: boolean;
+  signInWithGoogle: () => Promise<any>;
+  signInWithApple: () => Promise<any>;
+  signInWithEmail: (email: string, password: string) => Promise<any>;
+  signOutUser: () => Promise<void>;
   center: RoutePoint;
   setCenter: (p: RoutePoint) => void;
   hasLocation: boolean;
@@ -54,45 +71,151 @@ interface AppState {
   removeFavorite: (id: string) => void;
 }
 
-const INITIAL_FAVORITES: FavoriteRoute[] = [
-  { id: '1', routeName: 'Lakeside Loop', distance: 7.5, terrain: 'Loop', lat: 40.7580, lng: -73.9855 },
-  { id: '2', routeName: 'Forest Path', distance: 5.0, terrain: 'Out & Back', lat: 40.7829, lng: -73.9654 },
-  { id: '3', routeName: 'City Circuit', distance: 10.2, terrain: 'Loop', lat: 40.7484, lng: -73.9857 },
-];
-
 const DEFAULT_CENTER: RoutePoint = { lat: 40.7128, lng: -74.006 };
 
 const AppContext = createContext<AppState | null>(null);
 
 export function AppProvider({ children }: { children: React.ReactNode }) {
-  const [isLoggedIn, setIsLoggedIn] = useState(false);
-  const [user, setUser] = useState<User | null>(null);
+  const { user: firebaseUser, loading: authLoading, isAuthenticated, signInWithGoogle, signInWithApple, signInWithEmail, signOut } = useAuth();
+
+  const [isLoggedIn, setIsLoggedIn] = useState(true); // TODO: revert to false when done testing
+  const [user, setUser] = useState<User | null>({ name: 'Test User', email: 'test@example.com', avatar: '' }); // TODO: revert to null
   const [center, setCenter] = useState<RoutePoint>(DEFAULT_CENTER);
   const [hasLocation, setHasLocation] = useState(false);
   const [gpsStrength, setGpsStrength] = useState<0 | 1 | 2 | 3>(0);
-  const [distance, setDistance] = useState(5);
+  const [distance, setDistanceRaw] = useState(3);
   const [routeStyle, setRouteStyle] = useState<RouteStyle>('loop');
+
+  // Persist distance and load last used distance on mount
+  const setDistance = useCallback((v: number) => {
+    setDistanceRaw(v);
+    AsyncStorage.setItem(DISTANCE_STORAGE_KEY, String(v)).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    AsyncStorage.getItem(DISTANCE_STORAGE_KEY).then((val) => {
+      if (val !== null) {
+        const parsed = parseFloat(val);
+        if (!isNaN(parsed) && parsed > 0) setDistanceRaw(parsed);
+      }
+    }).catch(() => {});
+  }, []);
   const [prefs, setPrefs] = useState<RunPreferences>({
-    elevation: 'flat',
-    scenic: true,
-    lowTraffic: true,
+    lowTraffic: false,
   });
   const [routes, setRoutes] = useState<GeneratedRoute[]>([]);
   const [selectedRoute, setSelectedRoute] = useState<GeneratedRoute | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
   const [endLocation, setEndLocation] = useState<RoutePoint | null>(null);
-  const [favorites, setFavorites] = useState<FavoriteRoute[]>(INITIAL_FAVORITES);
+  const [favorites, setFavorites] = useState<FavoriteRoute[]>([]);
 
-  const addFavorite = (fav: FavoriteRoute) => {
-    setFavorites((prev) => {
-      if (prev.some((f) => f.id === fav.id)) return prev;
-      return [...prev, fav];
+  // Load cached favorites on mount for instant offline display
+  useEffect(() => {
+    getCachedFavorites().then((cached) => {
+      if (cached.length > 0) {
+        setFavorites(
+          cached.map((f) => ({
+            id: f.id!,
+            routeName: f.routeName,
+            distance: f.distance,
+            terrain: f.terrain,
+            lat: f.lat,
+            lng: f.lng,
+          }))
+        );
+      }
+    }).catch(() => {});
+  }, []);
+
+  // Flush any pending runs on mount
+  useEffect(() => {
+    flushPendingRuns().catch(() => {});
+  }, []);
+
+  // Sync Firebase Auth user → app user state
+  // TODO: remove bypass when done testing
+  useEffect(() => {
+    if (firebaseUser) {
+      setUser({
+        name: firebaseUser.displayName || 'Runner',
+        email: firebaseUser.email || '',
+        avatar: firebaseUser.photoURL || '',
+      });
+      setIsLoggedIn(true);
+
+      // Ensure Firestore profile exists
+      updateUserProfile(firebaseUser.uid, {
+        displayName: firebaseUser.displayName || 'Runner',
+        email: firebaseUser.email || '',
+        photoURL: firebaseUser.photoURL || null,
+        createdAt: Date.now(),
+      }).catch(() => {});
+    }
+    // Bypass: don't reset to logged-out when no Firebase user
+  }, [firebaseUser, authLoading]);
+
+  // Real-time Firestore favorites listener
+  useEffect(() => {
+    if (!firebaseUser) return;
+
+    const unsubscribe = onFavoritesSnapshot(firebaseUser.uid, (favRecords) => {
+      setFavorites(
+        favRecords.map((f) => ({
+          id: f.id!,
+          routeName: f.routeName,
+          distance: f.distance,
+          terrain: f.terrain,
+          lat: f.lat,
+          lng: f.lng,
+        }))
+      );
     });
-  };
 
-  const removeFavorite = (id: string) => {
-    setFavorites((prev) => prev.filter((f) => f.id !== id));
-  };
+    return unsubscribe;
+  }, [firebaseUser]);
+
+  const addFavorite = useCallback(
+    (fav: FavoriteRoute) => {
+      // Optimistic update
+      setFavorites((prev) => {
+        if (prev.some((f) => f.id === fav.id)) return prev;
+        return [...prev, fav];
+      });
+
+      // Persist to Firestore
+      if (firebaseUser) {
+        addFavoriteRoute(firebaseUser.uid, {
+          routeName: fav.routeName,
+          distance: fav.distance,
+          terrain: fav.terrain,
+          lat: fav.lat,
+          lng: fav.lng,
+          createdAt: Date.now(),
+        }).catch(console.warn);
+      }
+    },
+    [firebaseUser]
+  );
+
+  const removeFavoriteHandler = useCallback(
+    (id: string) => {
+      // Optimistic update
+      setFavorites((prev) => prev.filter((f) => f.id !== id));
+
+      // Remove from Firestore
+      if (firebaseUser) {
+        removeFavoriteRoute(firebaseUser.uid, id).catch(console.warn);
+      }
+    },
+    [firebaseUser]
+  );
+
+  const signOutUser = useCallback(async () => {
+    await signOut();
+    setIsLoggedIn(false);
+    setUser(null);
+    setFavorites([]);
+  }, [signOut]);
 
   return (
     <AppContext.Provider
@@ -101,6 +224,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setIsLoggedIn,
         user,
         setUser,
+        firebaseUid: firebaseUser?.uid ?? null,
+        authLoading,
+        signInWithGoogle,
+        signInWithApple,
+        signInWithEmail,
+        signOutUser,
         center,
         setCenter,
         hasLocation,
@@ -123,7 +252,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setEndLocation,
         favorites,
         addFavorite,
-        removeFavorite,
+        removeFavorite: removeFavoriteHandler,
       }}
     >
       {children}

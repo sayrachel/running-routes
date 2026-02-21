@@ -11,7 +11,7 @@ interface StatsViewProps {
   elevation: number;
   cadence: number;
   avgPace: string;
-  splits: { km: number; pace: string }[];
+  splits: { km: number; pace: string; time: string }[];
   isRunning: boolean;
   isFinished?: boolean;
   isFavorited?: boolean;
@@ -63,27 +63,22 @@ export function StatsView({
         contentContainerStyle={styles.finishedContent}
         showsVerticalScrollIndicator={false}
       >
+        {/* Header */}
+        <Text style={styles.finishedHeader}>Run Summary</Text>
+
         {/* Stats grid */}
         <View style={styles.statsGrid}>
-          <View style={styles.statCell}>
-            <Text style={styles.statCellValue}>{distance}</Text>
-            <Text style={styles.statCellLabel}>km</Text>
-          </View>
           <View style={styles.statCell}>
             <Text style={styles.statCellValue}>{time}</Text>
             <Text style={styles.statCellLabel}>time</Text>
           </View>
           <View style={styles.statCell}>
             <Text style={styles.statCellValue}>{avgPace || pace}</Text>
-            <Text style={styles.statCellLabel}>min/km</Text>
+            <Text style={styles.statCellLabel}>min/mi</Text>
           </View>
           <View style={styles.statCell}>
-            <Text style={styles.statCellValue}>{elevation}</Text>
-            <Text style={styles.statCellLabel}>m elev</Text>
-          </View>
-          <View style={styles.statCell}>
-            <Text style={styles.statCellValue}>{calories}</Text>
-            <Text style={styles.statCellLabel}>cal</Text>
+            <Text style={styles.statCellValue}>{distance}</Text>
+            <Text style={styles.statCellLabel}>mi</Text>
           </View>
         </View>
 
@@ -93,13 +88,13 @@ export function StatsView({
             <Text style={styles.finishedSplitsTitle}>Splits</Text>
             <View style={styles.splitsTable}>
               <View style={styles.splitsTableHeader}>
-                <Text style={styles.splitsHeaderText}>KM</Text>
-                <Text style={styles.splitsHeaderText}>PACE</Text>
+                <Text style={styles.splitsHeaderText}>MILE</Text>
+                <Text style={styles.splitsHeaderText}>TIME</Text>
               </View>
               {splits.map((split) => (
                 <View key={split.km} style={styles.splitsTableRow}>
                   <Text style={styles.splitsTableKm}>{split.km}</Text>
-                  <Text style={styles.splitsTablePace}>{split.pace} min/km</Text>
+                  <Text style={styles.splitsTablePace}>{split.time}</Text>
                 </View>
               ))}
             </View>
@@ -108,37 +103,40 @@ export function StatsView({
 
         {/* Favorite */}
         {onToggleFavorite && (
-          <Pressable
-            onPress={(e) => { e.stopPropagation(); onToggleFavorite(); }}
-            style={styles.favoriteBtn}
-          >
-            <Ionicons
-              name={isFavorited ? 'heart' : 'heart-outline'}
-              size={22}
-              color={isFavorited ? Colors.destructive : Colors.mutedForeground}
-            />
-            <Text style={[styles.favoriteLabel, isFavorited && { color: Colors.destructive }]}>
-              {isFavorited ? 'Favorited' : 'Add to Favorites'}
-            </Text>
-          </Pressable>
+          <>
+            <View style={styles.actionsDivider} />
+            <Pressable
+              onPress={(e) => { e.stopPropagation(); onToggleFavorite(); }}
+              style={styles.favoriteBtn}
+            >
+              <Ionicons
+                name={isFavorited ? 'heart' : 'heart-outline'}
+                size={22}
+                color={isFavorited ? Colors.destructive : Colors.mutedForeground}
+              />
+              <Text style={[styles.favoriteLabel, isFavorited && { color: Colors.destructive }]}>
+                {isFavorited ? 'Favorited' : 'Add to Favorites'}
+              </Text>
+            </Pressable>
+          </>
         )}
 
         {/* Discard / Save */}
         {onDiscard && onSave && (
-          <View style={styles.actionsRow}>
-            <Pressable
-              onPress={(e) => { e.stopPropagation(); onDiscard(); }}
-              style={({ pressed }) => [styles.actionBtn, styles.discardBtn, pressed && { opacity: 0.7 }]}
-            >
-              <Ionicons name="trash-outline" size={18} color={Colors.mutedForeground} />
-              <Text style={styles.discardLabel}>Discard</Text>
-            </Pressable>
+          <View style={styles.actionsColumn}>
             <Pressable
               onPress={(e) => { e.stopPropagation(); onSave(); }}
-              style={({ pressed }) => [styles.actionBtn, styles.saveBtn, pressed && { opacity: 0.7 }]}
+              style={({ pressed }) => [styles.saveBtn, pressed && { transform: [{ scale: 0.98 }] }]}
             >
-              <Ionicons name="checkmark" size={18} color={Colors.primaryForeground} />
+              <Ionicons name="checkmark" size={20} color={Colors.primaryForeground} />
               <Text style={styles.saveLabel}>Save Activity</Text>
+            </Pressable>
+            <Pressable
+              onPress={(e) => { e.stopPropagation(); onDiscard(); }}
+              style={({ pressed }) => [styles.discardBtn, pressed && { opacity: 0.7 }]}
+            >
+              <Ionicons name="trash-outline" size={16} color={Colors.mutedForeground} />
+              <Text style={styles.discardLabel}>Discard</Text>
             </Pressable>
           </View>
         )}
@@ -167,8 +165,8 @@ export function StatsView({
           <Text style={styles.inRunSplitsTitle}>SPLITS</Text>
           {splits.map((item) => (
             <View key={item.km} style={styles.inRunSplitRow}>
-              <Text style={styles.inRunSplitKm}>KM {item.km}</Text>
-              <Text style={styles.inRunSplitPace}>{item.pace}</Text>
+              <Text style={styles.inRunSplitKm}>MILE {item.km}</Text>
+              <Text style={styles.inRunSplitPace}>{item.time}</Text>
             </View>
           ))}
         </View>
@@ -264,6 +262,11 @@ const styles = StyleSheet.create({
     paddingBottom: 40,
     gap: 16,
   },
+  finishedHeader: {
+    fontFamily: Fonts.sansBold,
+    fontSize: 22,
+    color: Colors.foreground,
+  },
   statsGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
@@ -353,37 +356,40 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: Colors.mutedForeground,
   },
+  actionsDivider: {
+    height: 1,
+    backgroundColor: Colors.border,
+    marginVertical: 4,
+  },
 
   // Discard / Save
-  actionsRow: {
-    flexDirection: 'row',
+  actionsColumn: {
     gap: 12,
   },
-  actionBtn: {
-    flex: 1,
+  saveBtn: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 8,
+    gap: 10,
     borderRadius: 16,
     paddingVertical: 16,
-  },
-  discardBtn: {
-    borderWidth: 1,
-    borderColor: Colors.border,
-    backgroundColor: Colors.card,
-  },
-  saveBtn: {
     backgroundColor: Colors.primary,
-  },
-  discardLabel: {
-    fontFamily: Fonts.sansBold,
-    fontSize: 14,
-    color: Colors.mutedForeground,
   },
   saveLabel: {
     fontFamily: Fonts.sansBold,
     fontSize: 14,
     color: Colors.primaryForeground,
+  },
+  discardBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    paddingVertical: 12,
+  },
+  discardLabel: {
+    fontFamily: Fonts.sansSemiBold,
+    fontSize: 13,
+    color: Colors.mutedForeground,
   },
 });

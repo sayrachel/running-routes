@@ -1,31 +1,48 @@
 {
   "expo": {
     "name": "Running Routes",
-    "slug": "routeforge",
+    "slug": "run-routes",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
-    "scheme": "routeforge",
+    "scheme": "runroutes",
     "splash": {
       "backgroundColor": "#0b0f14"
     },
     "ios": {
       "supportsTablet": false,
-      "bundleIdentifier": "com.routeforge.app",
+      "bundleIdentifier": "com.runroutes.app",
       "infoPlist": {
-        "NSLocationWhenInUseUsageDescription": "Running Routes needs your location to generate running routes near you."
+        "NSLocationWhenInUseUsageDescription": "Running Routes needs your location to generate running routes near you.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "Running Routes needs background location access to track your run even when the app is in the background.",
+        "UIBackgroundModes": ["location"]
       }
+    },
+    "android": {
+      "softwareKeyboardLayoutMode": "pan",
+      "permissions": [
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_LOCATION"
+      ]
     },
     "plugins": [
       "expo-router",
       [
         "expo-location",
         {
-          "locationWhenInUsePermission": "Running Routes needs your location to generate running routes near you."
+          "locationWhenInUsePermission": "Running Routes needs your location to generate running routes near you.",
+          "locationAlwaysAndWhenInUsePermission": "Running Routes needs background location access to track your run even when the app is in the background.",
+          "isIosBackgroundLocationEnabled": true,
+          "isAndroidBackgroundLocationEnabled": true,
+          "isAndroidForegroundServiceEnabled": true
         }
       ],
-      "expo-asset"
+      "expo-asset",
+      "expo-web-browser"
     ],
     "experiments": {
       "typedRoutes": true

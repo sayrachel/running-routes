@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { Platform } from 'react-native';
+import { View, ActivityIndicator, Platform, StyleSheet } from 'react-native';
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import * as SplashScreen from 'expo-splash-screen';
@@ -11,7 +11,7 @@ import {
   Inter_700Bold,
 } from '@expo-google-fonts/inter';
 import { SpaceMono_400Regular, SpaceMono_700Bold } from '@expo-google-fonts/space-mono';
-import { AppProvider } from '@/lib/AppContext';
+import { AppProvider, useAppContext } from '@/lib/AppContext';
 import { Colors } from '@/lib/theme';
 
 SplashScreen.preventAutoHideAsync();
@@ -56,6 +56,20 @@ function useWebMobileFrame() {
   }, []);
 }
 
+function AuthGate({ children }: { children: React.ReactNode }) {
+  // TODO: remove bypass when done testing
+  return <>{children}</>;
+}
+
+const layoutStyles = StyleSheet.create({
+  loadingContainer: {
+    flex: 1,
+    backgroundColor: Colors.background,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+});
+
 export default function RootLayout() {
   useWebMobileFrame();
   const [fontsLoaded, fontError] = useFonts({
@@ -79,18 +93,20 @@ export default function RootLayout() {
 
   return (
     <AppProvider>
-      <StatusBar style="light" />
-      <Stack
-        screenOptions={{
-          headerShown: false,
-          contentStyle: { backgroundColor: Colors.background },
-          animation: 'slide_from_right',
-        }}
-      >
-        <Stack.Screen name="landing" />
-        <Stack.Screen name="index" />
-        <Stack.Screen name="run" />
-      </Stack>
+      <AuthGate>
+        <StatusBar style="light" />
+        <Stack
+          screenOptions={{
+            headerShown: false,
+            contentStyle: { backgroundColor: Colors.background },
+            animation: 'slide_from_right',
+          }}
+        >
+          <Stack.Screen name="landing" />
+          <Stack.Screen name="index" />
+          <Stack.Screen name="run" />
+        </Stack>
+      </AuthGate>
     </AppProvider>
   );
 }
