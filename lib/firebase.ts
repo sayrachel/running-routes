@@ -15,12 +15,12 @@ import { Platform } from 'react-native';
  * 5. Create a Firestore database (start in test mode)
  */
 const firebaseConfig = {
-  apiKey: 'REDACTED_API_KEY',
-  authDomain: 'running-routes-fea1d.firebaseapp.com',
-  projectId: 'running-routes-fea1d',
-  storageBucket: 'running-routes-fea1d.firebasestorage.app',
-  messagingSenderId: '390142091620',
-  appId: '1:390142091620:web:262aa057291e4202305a71',
+  apiKey: process.env.EXPO_PUBLIC_FIREBASE_API_KEY,
+  authDomain: process.env.EXPO_PUBLIC_FIREBASE_AUTH_DOMAIN,
+  projectId: process.env.EXPO_PUBLIC_FIREBASE_PROJECT_ID,
+  storageBucket: process.env.EXPO_PUBLIC_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: process.env.EXPO_PUBLIC_FIREBASE_MESSAGING_SENDER_ID,
+  appId: process.env.EXPO_PUBLIC_FIREBASE_APP_ID,
 };
 
 // Initialize Firebase app (avoid double-init)
