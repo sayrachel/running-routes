@@ -88,8 +88,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   // Persist distance and load last used distance on mount
   const setDistance = useCallback((v: number) => {
-    setDistanceRaw(v);
-    AsyncStorage.setItem(DISTANCE_STORAGE_KEY, String(v)).catch(() => {});
+    const clamped = Math.max(1, Math.min(30, v));
+    setDistanceRaw(clamped);
+    AsyncStorage.setItem(DISTANCE_STORAGE_KEY, String(clamped)).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -101,7 +102,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }).catch(() => {});
   }, []);
   const [prefs, setPrefs] = useState<RunPreferences>({
-    lowTraffic: false,
+    lowTraffic: true,
   });
   const [routes, setRoutes] = useState<GeneratedRoute[]>([]);
   const [selectedRoute, setSelectedRoute] = useState<GeneratedRoute | null>(null);

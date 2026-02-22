@@ -4,6 +4,15 @@ const OVERPASS_URL = 'https://overpass-api.de/api/interpreter';
 const TIMEOUT_MS = 5000;
 const BBOX_BUFFER_DEG = 0.002; // ~200m buffer in degrees
 
+/** Enriched green space with metadata for waypoint selection */
+export interface GreenSpace {
+  point: RoutePoint;
+  tier: 1 | 2;
+  kind: 'park' | 'garden' | 'nature' | 'path' | 'cycleway' | 'footway' | 'route' | 'other';
+  name: string | null;
+  areaSize: number; // estimated area in km², 0 for linear features
+}
+
 /**
  * In-memory caches keyed by rounded keys.
  * Prevents redundant API calls for overlapping route candidates.
@@ -11,6 +20,7 @@ const BBOX_BUFFER_DEG = 0.002; // ~200m buffer in degrees
 const scenicCache = new Map<string, number>();
 const quietCache = new Map<string, number>();
 const greenSpaceCache = new Map<string, RoutePoint[]>();
+const enrichedGreenSpaceCache = new Map<string, GreenSpace[]>();
 
 /**
  * Compute bounding box from route points with a small buffer.
@@ -231,22 +241,20 @@ function haversineDistance(p1: RoutePoint, p2: RoutePoint): number {
 }
 
 /**
- * Fetch green space locations (parks, trails, greenways, car-free paths)
+ * Fetch enriched green space data (parks, trails, greenways, car-free paths)
  * near a center point within a given radius.
  *
- * Results are tiered and deduplicated:
- * - Tier 1 (high value): Parks + named paths/cycleways
- * - Tier 2 (lower value): Unnamed footways, paths, cycleways
- * Returns all Tier 1 + fills to 15 total from Tier 2 (nearest first).
+ * Returns GreenSpace objects with tier, kind, name, and estimated area.
+ * Uses `out center bb tags;` to get bounding box data for area estimation.
  *
  * Returns [] on failure — callers skip biasing.
  */
-export async function fetchGreenSpaceLocations(
+export async function fetchGreenSpacesEnriched(
   center: RoutePoint,
   radiusKm: number
-): Promise<RoutePoint[]> {
-  const cacheKey = `${center.lat.toFixed(3)},${center.lng.toFixed(3)},${radiusKm.toFixed(3)}`;
-  const cached = greenSpaceCache.get(cacheKey);
+): Promise<GreenSpace[]> {
+  const cacheKey = `enriched:${center.lat.toFixed(3)},${center.lng.toFixed(3)},${radiusKm.toFixed(3)}`;
+  const cached = enrichedGreenSpaceCache.get(cacheKey);
   if (cached !== undefined) return cached;
 
   const radiusMeters = Math.round(radiusKm * 1000);
@@ -265,7 +273,12 @@ export async function fetchGreenSpaceLocations(
     way["highway"="path"](around:${radiusMeters},${lat},${lng});
     way["highway"="pedestrian"](around:${radiusMeters},${lat},${lng});
     way["highway"="track"](around:${radiusMeters},${lat},${lng});
-  );out center tags;`;
+    relation["route"="foot"](around:${radiusMeters},${lat},${lng});
+    relation["route"="bicycle"](around:${radiusMeters},${lat},${lng});
+    relation["route"="running"](around:${radiusMeters},${lat},${lng});
+    way["foot"="designated"](around:${radiusMeters},${lat},${lng});
+    way["bicycle"="designated"]["highway"](around:${radiusMeters},${lat},${lng});
+  );out center bb tags;`;
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -279,22 +292,19 @@ export async function fetchGreenSpaceLocations(
     });
 
     if (!res.ok) {
-      console.warn(`Overpass green space API returned ${res.status}`);
-      greenSpaceCache.set(cacheKey, []);
+      console.warn(`Overpass enriched green space API returned ${res.status}`);
+      enrichedGreenSpaceCache.set(cacheKey, []);
       return [];
     }
 
     const data = await res.json();
     if (!data.elements || data.elements.length === 0) {
-      greenSpaceCache.set(cacheKey, []);
+      enrichedGreenSpaceCache.set(cacheKey, []);
       return [];
     }
 
-    // Parse elements into points with tier info
-    const tier1: RoutePoint[] = [];
-    const tier2: RoutePoint[] = [];
-
     const leisureTypes = new Set(['park', 'nature_reserve', 'garden']);
+    const results: GreenSpace[] = [];
 
     for (const el of data.elements) {
       let point: RoutePoint | null = null;
@@ -302,6 +312,8 @@ export async function fetchGreenSpaceLocations(
       if (el.type === 'node' && el.lat != null && el.lon != null) {
         point = { lat: el.lat, lng: el.lon };
       } else if (el.type === 'way' && el.center?.lat != null && el.center?.lon != null) {
+        point = { lat: el.center.lat, lng: el.center.lon };
+      } else if (el.type === 'relation' && el.center?.lat != null && el.center?.lon != null) {
         point = { lat: el.center.lat, lng: el.center.lon };
       }
 
@@ -311,47 +323,93 @@ export async function fetchGreenSpaceLocations(
       const leisure = tags.leisure;
       const highway = tags.highway;
       const hasName = !!tags.name;
+      const footDesignated = tags.foot === 'designated';
+      const bicycleDesignated = tags.bicycle === 'designated';
+      const isRoute = el.type === 'relation' && (tags.route === 'foot' || tags.route === 'bicycle' || tags.route === 'running');
 
-      // Tier 1: Parks or named paths/cycleways
-      if (leisureTypes.has(leisure) || (highway && hasName)) {
-        tier1.push(point);
-      } else {
-        tier2.push(point);
+      // Classify kind
+      let kind: GreenSpace['kind'];
+      if (leisure === 'park') kind = 'park';
+      else if (leisure === 'garden') kind = 'garden';
+      else if (leisure === 'nature_reserve') kind = 'nature';
+      else if (highway === 'cycleway') kind = 'cycleway';
+      else if (highway === 'footway') kind = 'footway';
+      else if (highway === 'path' || highway === 'pedestrian' || highway === 'track') kind = 'path';
+      else if (isRoute) kind = 'route';
+      else kind = 'other';
+
+      // Classify tier
+      const tier: 1 | 2 =
+        leisureTypes.has(leisure) || (highway && hasName) || footDesignated || bicycleDesignated || isRoute
+          ? 1
+          : 2;
+
+      // Estimate area from bounding box (ways only)
+      let areaSize = 0;
+      if (el.bounds && el.bounds.minlat != null) {
+        const latSpan = Math.abs(el.bounds.maxlat - el.bounds.minlat);
+        const lngSpan = Math.abs(el.bounds.maxlon - el.bounds.minlon);
+        // Convert degrees to approximate km (1° lat ≈ 111km, 1° lng ≈ 111*cos(lat) km)
+        const latKm = latSpan * 111;
+        const lngKm = lngSpan * 111 * Math.cos((point.lat * Math.PI) / 180);
+        areaSize = latKm * lngKm;
+      }
+
+      results.push({
+        point,
+        tier,
+        kind,
+        name: tags.name || null,
+        areaSize,
+      });
+    }
+
+    // Deduplicate within 50m
+    const dedupThreshold = 0.05;
+    const deduped: GreenSpace[] = [];
+    for (const gs of results) {
+      if (!deduped.some((r) => haversineDistance(r.point, gs.point) < dedupThreshold)) {
+        deduped.push(gs);
       }
     }
 
-    // Deduplicate within 50m (0.05 km)
-    const dedupThreshold = 0.05;
-    const dedup = (points: RoutePoint[]): RoutePoint[] => {
-      const result: RoutePoint[] = [];
-      for (const p of points) {
-        if (!result.some((r) => haversineDistance(r, p) < dedupThreshold)) {
-          result.push(p);
-        }
-      }
-      return result;
-    };
+    // Sort: tier 1 first, then by area descending
+    deduped.sort((a, b) => {
+      if (a.tier !== b.tier) return a.tier - b.tier;
+      return b.areaSize - a.areaSize;
+    });
 
-    const dedupedTier1 = dedup(tier1);
-    const dedupedTier2 = dedup(tier2);
-
-    // Sort tier 2 by distance from center (nearest first)
-    dedupedTier2.sort(
-      (a, b) => haversineDistance(center, a) - haversineDistance(center, b)
-    );
-
-    // All tier 1 + fill to 15 from tier 2
-    const maxTotal = 15;
-    const remaining = Math.max(0, maxTotal - dedupedTier1.length);
-    const result = [...dedupedTier1, ...dedupedTier2.slice(0, remaining)];
-
-    greenSpaceCache.set(cacheKey, result);
-    return result;
+    // Cap at 50 results
+    const capped = deduped.slice(0, 50);
+    enrichedGreenSpaceCache.set(cacheKey, capped);
+    return capped;
   } catch (err) {
-    console.warn('Overpass green space query failed:', err);
-    greenSpaceCache.set(cacheKey, []);
+    console.warn('Overpass enriched green space query failed:', err);
+    enrichedGreenSpaceCache.set(cacheKey, []);
     return [];
   } finally {
     clearTimeout(timeout);
   }
+}
+
+/**
+ * Fetch green space locations (parks, trails, greenways, car-free paths)
+ * near a center point within a given radius.
+ *
+ * Wraps fetchGreenSpacesEnriched and returns just the points for backward compatibility.
+ *
+ * Returns [] on failure — callers skip biasing.
+ */
+export async function fetchGreenSpaceLocations(
+  center: RoutePoint,
+  radiusKm: number
+): Promise<RoutePoint[]> {
+  const cacheKey = `${center.lat.toFixed(3)},${center.lng.toFixed(3)},${radiusKm.toFixed(3)}`;
+  const cached = greenSpaceCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+
+  const enriched = await fetchGreenSpacesEnriched(center, radiusKm);
+  const result = enriched.map((gs) => gs.point);
+  greenSpaceCache.set(cacheKey, result);
+  return result;
 }

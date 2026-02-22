@@ -92,7 +92,7 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
         getCachedRunHistory()
           .then((cached) => {
             setRunHistory(cached);
-            setHistoryFromCache(cached.length > 0);
+            setHistoryFromCache(false);
           })
           .catch(() => {})
           .finally(() => setHistoryLoading(false));

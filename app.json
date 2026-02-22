@@ -16,7 +16,11 @@
       "infoPlist": {
         "NSLocationWhenInUseUsageDescription": "Running Routes needs your location to generate running routes near you.",
         "NSLocationAlwaysAndWhenInUseUsageDescription": "Running Routes needs background location access to track your run even when the app is in the background.",
-        "UIBackgroundModes": ["location"]
+        "UIBackgroundModes": [
+          "location",
+          "location"
+        ],
+        "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {
@@ -26,7 +30,12 @@
         "ACCESS_COARSE_LOCATION",
         "ACCESS_BACKGROUND_LOCATION",
         "FOREGROUND_SERVICE",
-        "FOREGROUND_SERVICE_LOCATION"
+        "FOREGROUND_SERVICE_LOCATION",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_BACKGROUND_LOCATION",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_LOCATION"
       ]
     },
     "plugins": [
@@ -50,6 +59,12 @@
     "web": {
       "name": "Running Routes",
       "bundler": "metro"
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "cbab5abb-443f-4980-b641-0728a9dde070"
+      }
     }
   }
 }

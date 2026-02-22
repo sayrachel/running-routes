@@ -14,6 +14,11 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import * as Location from 'expo-location';
 import { Ionicons } from '@expo/vector-icons';
+import Animated, {
+  useSharedValue,
+  useAnimatedStyle,
+  withTiming,
+} from 'react-native-reanimated';
 import { RouteMap } from '@/components/RouteMap';
 import { ProfileDrawer } from '@/components/ProfileDrawer';
 import { FavoritePreview } from '@/components/FavoritePreview';
@@ -35,37 +40,61 @@ function haversineDistanceMiles(lat1: number, lng1: number, lat2: number, lng2: 
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-/** Continuous slider for distance selection (1–30 mi, whole-mile increments).
- *  First half: 1–5 mi equally spaced. Second half: 5–30 mi equally spaced. */
-function DistanceSlider({ value, onChange, disabled }: { value: number; onChange: (v: number) => void; disabled?: boolean }) {
+/** Continuous slider for distance selection (1–30 mi, whole-mile output).
+ *  Thumb follows finger smoothly; displayed value snaps to whole miles.
+ *  First half of track: 1–5 mi. Second half: 5–30 mi. */
+function DistanceSlider({
+  value,
+  onChange,
+  disabled,
+  onDragStart,
+  onDragEnd,
+}: {
+  value: number;
+  onChange: (v: number) => void;
+  disabled?: boolean;
+  onDragStart?: () => void;
+  onDragEnd?: () => void;
+}) {
   const sliderRef = useRef<View>(null);
-  const STEP = 1;
+  const trackLayout = useRef({ pageX: 0, width: 0 });
+  const lastRounded = useRef(value);
+  const [dragging, setDragging] = useState(false);
+  const [rawFraction, setRawFraction] = useState(() => valueToFractionFn(value));
 
   // Piecewise linear: [0, 0.5] → [1, 5], [0.5, 1] → [5, 30]
-  const valueToFraction = (v: number) => {
-    if (v <= 5) return ((v - 1) / 4) * 0.5;
-    return 0.5 + ((v - 5) / 25) * 0.5;
-  };
+  const fraction = dragging ? rawFraction : valueToFractionFn(value);
 
-  const fractionToValue = (f: number) => {
-    if (f <= 0.5) return 1 + (f / 0.5) * 4;
-    return 5 + ((f - 0.5) / 0.5) * 25;
-  };
-
-  const fraction = Math.max(0, Math.min(1, valueToFraction(value)));
-
-  const snapToStep = (raw: number) => {
-    const clamped = Math.max(1, Math.min(30, raw));
-    return Math.round(clamped / STEP) * STEP;
-  };
-
-  const handleTouch = useCallback((pageX: number) => {
+  const processTouch = useCallback((pageX: number) => {
     if (disabled) return;
-    sliderRef.current?.measure((_x, _y, width, _h, px) => {
-      const relative = Math.max(0, Math.min(1, (pageX - px) / width));
-      onChange(snapToStep(fractionToValue(relative)));
-    });
+    const { pageX: trackX, width } = trackLayout.current;
+    if (width === 0) return;
+    const relative = Math.max(0, Math.min(1, (pageX - trackX) / width));
+    setRawFraction(relative);
+    const raw = fractionToValueFn(relative);
+    const clamped = Math.max(1, Math.min(30, raw));
+    const rounded = Math.round(clamped);
+    if (rounded !== lastRounded.current) {
+      lastRounded.current = rounded;
+      onChange(rounded);
+    }
   }, [onChange, disabled]);
+
+  const handleGrant = useCallback((e: any) => {
+    if (disabled) return;
+    setDragging(true);
+    lastRounded.current = value;
+    onDragStart?.();
+    sliderRef.current?.measure((_x: number, _y: number, width: number, _h: number, px: number) => {
+      trackLayout.current = { pageX: px, width };
+      processTouch(e.nativeEvent.pageX);
+    });
+  }, [processTouch, disabled, onDragStart, value]);
+
+  const handleRelease = useCallback(() => {
+    setDragging(false);
+    onDragEnd?.();
+  }, [onDragEnd]);
 
   return (
     <View style={disabled ? { opacity: 0.45 } : undefined}>
@@ -78,10 +107,14 @@ function DistanceSlider({ value, onChange, disabled }: { value: number; onChange
         style={styles.sliderTrack}
         onStartShouldSetResponder={() => !disabled}
         onMoveShouldSetResponder={() => !disabled}
-        onResponderGrant={(e) => handleTouch(e.nativeEvent.pageX)}
-        onResponderMove={(e) => handleTouch(e.nativeEvent.pageX)}
+        onResponderGrant={handleGrant}
+        onResponderMove={(e) => processTouch(e.nativeEvent.pageX)}
+        onResponderRelease={handleRelease}
+        onResponderTerminate={handleRelease}
       >
-        <View style={[styles.sliderFill, { width: `${fraction * 100}%` }]} />
+        <View style={styles.sliderTrackBar}>
+          <View style={[styles.sliderFill, { width: `${fraction * 100}%` }]} />
+        </View>
         <View style={[styles.sliderThumb, { left: `${fraction * 100}%` }]} />
       </View>
       <View style={styles.sliderRangeLabels}>
@@ -93,9 +126,18 @@ function DistanceSlider({ value, onChange, disabled }: { value: number; onChange
   );
 }
 
+function valueToFractionFn(v: number) {
+  if (v <= 5) return ((v - 1) / 4) * 0.5;
+  return 0.5 + ((v - 5) / 25) * 0.5;
+}
+
+function fractionToValueFn(f: number) {
+  if (f <= 0.5) return 1 + (f / 0.5) * 4;
+  return 5 + ((f - 0.5) / 0.5) * 25;
+}
+
 const ROUTE_STYLES: { value: RouteStyle; label: string; desc: string }[] = [
   { value: 'loop', label: 'Loop', desc: 'Start and finish at the same spot' },
-  { value: 'out-and-back', label: 'Out & Back', desc: 'Run out, then retrace your steps' },
   { value: 'point-to-point', label: 'Point to Point', desc: 'Run from A to B in one direction' },
 ];
 
@@ -143,6 +185,28 @@ export default function SetupScreen() {
   const [hasEndLocation, setHasEndLocation] = useState(false);
   const [drawerVisible, setDrawerVisible] = useState(false);
   const [previewFavorite, setPreviewFavorite] = useState<FavoriteRoute | null>(null);
+  const [sliderActive, setSliderActive] = useState(false);
+
+  // Bottom sheet collapse
+  const [isSheetCollapsed, setIsSheetCollapsed] = useState(false);
+  const sheetContentHeight = useSharedValue(500);
+  const sheetGestureY = useRef(0);
+
+  const toggleSheet = useCallback(() => {
+    if (isSheetCollapsed) {
+      sheetContentHeight.value = withTiming(500, { duration: 300 });
+      setIsSheetCollapsed(false);
+    } else {
+      sheetContentHeight.value = withTiming(0, { duration: 300 });
+      setIsSheetCollapsed(true);
+    }
+  }, [isSheetCollapsed]);
+
+  const sheetContentStyle = useAnimatedStyle(() => ({
+    maxHeight: sheetContentHeight.value,
+    overflow: 'hidden' as const,
+    opacity: sheetContentHeight.value > 10 ? 1 : 0,
+  }));
   const [startLocationName, setStartLocationName] = useState<string | null>(null);
   const [endLocationName, setEndLocationName] = useState<string | null>(null);
   const [currentLocationAddress, setCurrentLocationAddress] = useState<string | null>(null);
@@ -402,6 +466,13 @@ export default function SetupScreen() {
     setLocalPrefs((prev) => ({ ...prev, lowTraffic: !prev.lowTraffic }));
   };
 
+  const p2pDistance = useMemo(() => {
+    if (localRouteStyle === 'point-to-point' && hasEndLocation && ctx.endLocation) {
+      return Math.round(haversineDistanceMiles(ctx.center.lat, ctx.center.lng, ctx.endLocation.lat, ctx.endLocation.lng) * 10) / 10;
+    }
+    return null;
+  }, [localRouteStyle, hasEndLocation, ctx.center, ctx.endLocation]);
+
   const handleGenerate = useCallback(async () => {
     ctx.setRouteStyle(localRouteStyle);
     ctx.setPrefs(localPrefs);
@@ -413,14 +484,19 @@ export default function SetupScreen() {
         : null;
 
     // Convert miles to km for OSRM
-    const distanceKm = ctx.distance * 1.60934;
+    // For point-to-point, use the actual straight-line distance × road overhead
+    // (the slider is disabled and shows the haversine distance)
+    const distanceKm =
+      localRouteStyle === 'point-to-point' && p2pDistance != null
+        ? p2pDistance * 1.60934 * 1.3
+        : ctx.distance * 1.60934;
 
     try {
       const newRoutes = await generateOSRMRoutes(
         ctx.center,
         distanceKm,
         localRouteStyle === 'point-to-point' ? 'point-to-point' : localRouteStyle === 'out-and-back' ? 'out-and-back' : 'loop',
-        1,
+        3,
         localPrefs,
         end
       );
@@ -433,14 +509,7 @@ export default function SetupScreen() {
       ctx.setIsGenerating(false);
       router.replace('/run');
     }
-  }, [ctx, localRouteStyle, localPrefs, hasEndLocation, router]);
-
-  const p2pDistance = useMemo(() => {
-    if (localRouteStyle === 'point-to-point' && hasEndLocation && ctx.endLocation) {
-      return Math.round(haversineDistanceMiles(ctx.center.lat, ctx.center.lng, ctx.endLocation.lat, ctx.endLocation.lng) * 10) / 10;
-    }
-    return null;
-  }, [localRouteStyle, hasEndLocation, ctx.center, ctx.endLocation]);
+  }, [ctx, localRouteStyle, localPrefs, hasEndLocation, p2pDistance, router]);
 
   const canGenerate = ctx.hasLocation && !ctx.isGenerating && ctx.distance > 0;
 
@@ -477,14 +546,37 @@ export default function SetupScreen() {
 
       {/* Bottom panel */}
       <View style={styles.bottomPanel}>
-        {/* Grab handle */}
-        <View style={styles.grabHandle} />
+        {/* Grab handle with gesture support */}
+        <View
+          style={styles.grabHandleArea}
+          onStartShouldSetResponder={() => true}
+          onMoveShouldSetResponder={() => true}
+          onResponderGrant={(e) => { sheetGestureY.current = e.nativeEvent.pageY; }}
+          onResponderRelease={(e) => {
+            const dy = e.nativeEvent.pageY - sheetGestureY.current;
+            if (dy > 30 && !isSheetCollapsed) {
+              sheetContentHeight.value = withTiming(0, { duration: 300 });
+              setIsSheetCollapsed(true);
+            } else if (dy < -30 && isSheetCollapsed) {
+              sheetContentHeight.value = withTiming(500, { duration: 300 });
+              setIsSheetCollapsed(false);
+            } else if (Math.abs(dy) < 10) {
+              toggleSheet();
+            }
+          }}
+        >
+          <View style={styles.grabHandle} />
+        </View>
 
+        <Animated.View style={sheetContentStyle}>
         <ScrollView
           style={styles.bottomScrollView}
           contentContainerStyle={styles.bottomScrollContent}
           showsVerticalScrollIndicator={false}
           keyboardShouldPersistTaps="handled"
+          scrollEnabled={!sliderActive}
+          bounces={false}
+          overScrollMode="never"
         >
         {/* Controls */}
         <View style={styles.bottomContent}>
@@ -495,7 +587,12 @@ export default function SetupScreen() {
               {ROUTE_STYLES.map((style) => (
                 <Pressable
                   key={style.value}
-                  onPress={() => setLocalRouteStyle(style.value)}
+                  onPress={() => {
+                    setLocalRouteStyle(style.value);
+                    if (style.value !== 'point-to-point') {
+                      handleClearEndLocation();
+                    }
+                  }}
                   style={[
                     styles.routeTypePill,
                     localRouteStyle === style.value
@@ -673,33 +770,40 @@ export default function SetupScreen() {
                 disabled
               />
             ) : (
-              <DistanceSlider value={ctx.distance} onChange={ctx.setDistance} />
+              <DistanceSlider value={ctx.distance} onChange={ctx.setDistance} onDragStart={() => setSliderActive(true)} onDragEnd={() => setSliderActive(false)} />
             )}
           </View>
 
           {/* Preferences */}
           <View style={styles.section}>
             <Text style={styles.sectionLabel}>ROUTE PREFERENCES</Text>
-            <Pressable onPress={toggleTraffic} style={styles.toggleRow}>
-              <View style={styles.toggleLabelRow}>
-                <Ionicons name="car-outline" size={14} color={Colors.mutedForeground} />
-                <Text style={styles.toggleLabel}>Avoid Traffic</Text>
-              </View>
-              <View style={[
-                styles.toggleTrack,
-                localPrefs.lowTraffic ? styles.toggleTrackOn : undefined,
-              ]}>
-                <View style={[
-                  styles.toggleThumb,
-                  localPrefs.lowTraffic ? styles.toggleThumbOn : undefined,
-                ]} />
-              </View>
+            <Pressable
+              onPress={toggleTraffic}
+              style={[
+                styles.prefPill,
+                localPrefs.lowTraffic ? styles.prefPillActive : styles.prefPillInactive,
+              ]}
+            >
+              <Ionicons
+                name={localPrefs.lowTraffic ? 'checkmark-circle' : 'car-outline'}
+                size={16}
+                color={localPrefs.lowTraffic ? Colors.primary : Colors.mutedForeground}
+              />
+              <Text
+                style={[
+                  styles.prefPillLabel,
+                  { color: localPrefs.lowTraffic ? Colors.primary : Colors.mutedForeground },
+                ]}
+              >
+                Avoid Traffic
+              </Text>
             </Pressable>
           </View>
         </View>
 
         {/* Fixed button area at bottom */}
         </ScrollView>
+        </Animated.View>
         <View
           style={styles.fixedButtonArea}
         >
@@ -772,7 +876,6 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     paddingHorizontal: 20,
     paddingBottom: 8,
-    backgroundColor: Colors.background + '99',
   },
   headerRight: {
     flexDirection: 'row',
@@ -809,8 +912,12 @@ const styles = StyleSheet.create({
     height: 4,
     borderRadius: 2,
     backgroundColor: Colors.mutedForeground + '4D',
-    marginTop: 12,
-    marginBottom: 12,
+  },
+  grabHandleArea: {
+    paddingTop: 12,
+    paddingBottom: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   bottomContent: {
     paddingHorizontal: 20,
@@ -983,47 +1090,27 @@ const styles = StyleSheet.create({
     fontSize: 10,
     color: Colors.destructive,
   },
-  toggleRow: {
+  prefPill: {
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
-    borderRadius: 12,
+    alignSelf: 'flex-start',
+    gap: 6,
+    borderRadius: 20,
     borderWidth: 1,
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+  },
+  prefPillActive: {
+    borderColor: Colors.primary + '66',
+    backgroundColor: Colors.primary + '1A',
+  },
+  prefPillInactive: {
     borderColor: Colors.border,
     backgroundColor: Colors.card,
-    paddingVertical: 12,
-    paddingHorizontal: 14,
   },
-  toggleLabelRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
-  toggleLabel: {
+  prefPillLabel: {
     fontFamily: Fonts.sansSemiBold,
-    fontSize: 12,
-    color: Colors.mutedForeground,
-  },
-  toggleTrack: {
-    width: 36,
-    height: 20,
-    borderRadius: 10,
-    backgroundColor: Colors.muted,
-    justifyContent: 'center',
-    paddingHorizontal: 2,
-  },
-  toggleTrackOn: {
-    backgroundColor: Colors.primary + '66',
-  },
-  toggleThumb: {
-    width: 16,
-    height: 16,
-    borderRadius: 8,
-    backgroundColor: Colors.mutedForeground,
-  },
-  toggleThumbOn: {
-    alignSelf: 'flex-end',
-    backgroundColor: Colors.primary,
+    fontSize: 13,
   },
   routeTypeRow: {
     flexDirection: 'row',
@@ -1074,10 +1161,13 @@ const styles = StyleSheet.create({
     color: Colors.mutedForeground,
   },
   sliderTrack: {
+    height: 34,
+    justifyContent: 'center',
+  },
+  sliderTrackBar: {
     height: 6,
     borderRadius: 3,
     backgroundColor: Colors.secondary,
-    justifyContent: 'center',
   },
   sliderFill: {
     position: 'absolute',
@@ -1089,19 +1179,19 @@ const styles = StyleSheet.create({
   },
   sliderThumb: {
     position: 'absolute',
-    width: 22,
-    height: 22,
-    borderRadius: 11,
+    width: 24,
+    height: 24,
+    borderRadius: 12,
     backgroundColor: Colors.primary,
     borderWidth: 3,
     borderColor: Colors.background,
-    marginLeft: -11,
-    top: -8,
+    marginLeft: -12,
+    top: 5,
   },
   sliderRangeLabels: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    marginTop: 8,
+    marginTop: 2,
   },
   sliderLabelText: {
     fontFamily: Fonts.sans,

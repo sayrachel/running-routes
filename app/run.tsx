@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { View, Text, Pressable, StyleSheet, Linking, ActivityIndicator } from 'react-native';
+import { View, Text, Pressable, StyleSheet, Linking } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
@@ -19,7 +19,6 @@ import { ProfileDrawer, type DrawerView } from '@/components/ProfileDrawer';
 import { useAppContext } from '@/lib/AppContext';
 import { useLocationTracking, accuracyToStrength } from '@/lib/useLocationTracking';
 import { saveRunRecord, addPendingRun, getCachedRunHistory } from '@/lib/firestore';
-import { generateOSRMRoutes } from '@/lib/osrm';
 import { buildGoogleMapsUrl } from '@/lib/route-export';
 import { Colors, Fonts } from '@/lib/theme';
 
@@ -42,7 +41,7 @@ export default function RunScreen() {
   const [runState, setRunState] = useState<'idle' | 'running' | 'paused'>('idle');
   const [isFinished, setIsFinished] = useState(false);
   const [finishedSplits, setFinishedSplits] = useState<{ km: number; pace: string; time: string }[]>([]);
-  const [isRegenerating, setIsRegenerating] = useState(false);
+  const [routeIndex, setRouteIndex] = useState(0);
   const [drawerVisible, setDrawerVisible] = useState(false);
   const [drawerInitialView, setDrawerInitialView] = useState<DrawerView>('profile');
   const runSessionId = useRef(`run-${Date.now()}`);
@@ -202,38 +201,29 @@ export default function RunScreen() {
     Linking.openURL(url);
   }, [ctx.selectedRoute]);
 
-  const handleRegenerate = useCallback(async () => {
-    if (isRegenerating || hasStarted) return;
-    setIsRegenerating(true);
-    try {
-      const end =
-        ctx.routeStyle === 'point-to-point' && ctx.endLocation
-          ? ctx.endLocation
-          : null;
-      const newRoutes = await generateOSRMRoutes(
-        ctx.center,
-        ctx.distance * 1.60934,
-        ctx.routeStyle === 'point-to-point' ? 'point-to-point' : ctx.routeStyle === 'out-and-back' ? 'out-and-back' : 'loop',
-        1,
-        ctx.prefs,
-        end
-      );
-      ctx.setRoutes(newRoutes);
-      ctx.setSelectedRoute(newRoutes[0] || null);
-    } catch (err) {
-      console.error('Route regeneration error:', err);
-    } finally {
-      setIsRegenerating(false);
+  const handlePrevRoute = useCallback(() => {
+    const newIndex = Math.max(0, routeIndex - 1);
+    setRouteIndex(newIndex);
+    if (ctx.routes[newIndex]) {
+      ctx.setSelectedRoute(ctx.routes[newIndex]);
     }
-  }, [ctx, isRegenerating, hasStarted]);
+  }, [routeIndex, ctx]);
+
+  const handleNextRoute = useCallback(() => {
+    const newIndex = Math.min(ctx.routes.length - 1, routeIndex + 1);
+    setRouteIndex(newIndex);
+    if (ctx.routes[newIndex]) {
+      ctx.setSelectedRoute(ctx.routes[newIndex]);
+    }
+  }, [routeIndex, ctx]);
 
   // Real GPS-derived stats
   const { totalDistanceKm, elapsedSeconds, currentPace, avgPace, splits, coordinates, currentPosition } = tracking.stats;
   const runDistance = hasStarted
-    ? totalDistanceKm.toFixed(2)
+    ? Math.round(totalDistanceKm * 0.621371).toString()
     : ctx.selectedRoute
-      ? ctx.selectedRoute.distance.toFixed(2)
-      : '0.00';
+      ? String(ctx.selectedRoute.distance)
+      : '0';
   const timeStr = formatTime(elapsedSeconds);
   const calories = Math.round(elapsedSeconds * 0.18);
   const elevation = ctx.selectedRoute ? ctx.selectedRoute.elevationGain : 0;
@@ -279,46 +269,39 @@ export default function RunScreen() {
 
         {/* Header overlay */}
         <View style={[styles.header, { paddingTop: insets.top + 8 }]}>
-          {/* Back */}
-          <Pressable
-            onPress={showStats ? () => setShowStats(false) : handleBack}
-            disabled={!showStats && hasStarted}
-            style={[styles.headerBtn, !showStats && hasStarted && { opacity: 0.4 }]}
-          >
-            <Ionicons name="chevron-back" size={16} color={Colors.mutedForeground} />
-          </Pressable>
+          {/* Left */}
+          <View style={styles.headerSide}>
+            <Pressable
+              onPress={showStats ? () => setShowStats(false) : handleBack}
+              disabled={!showStats && hasStarted}
+              style={[styles.headerBtn, !showStats && hasStarted && { opacity: 0.4 }]}
+            >
+              <Ionicons name="chevron-back" size={16} color={Colors.mutedForeground} />
+            </Pressable>
+          </View>
 
           {/* Center: recording indicator */}
-          {hasStarted && (
-            <View style={styles.headerChip}>
-              <View style={styles.recordingDotContainer}>
-                <Animated.View style={[styles.recordingPing, recordingPingStyle]} />
-                <View style={styles.recordingDot} />
+          <View style={styles.headerCenter}>
+            {hasStarted && (
+              <View style={styles.headerChip}>
+                <View style={styles.recordingDotContainer}>
+                  <Animated.View style={[styles.recordingPing, recordingPingStyle]} />
+                  <View style={styles.recordingDot} />
+                </View>
+                <Text style={styles.recordingLabel}>{isPaused ? 'PAUSED' : 'RECORDING'}</Text>
               </View>
-              <Text style={styles.recordingLabel}>{isPaused ? 'PAUSED' : 'RECORDING'}</Text>
-            </View>
-          )}
+            )}
+          </View>
 
           {/* Right: actions */}
-          <View style={styles.headerActions}>
-            {ctx.selectedRoute && !hasStarted && !isFinished && (
-              <>
-                <Pressable
-                  onPress={handleRegenerate}
-                  disabled={isRegenerating}
-                  style={[styles.headerIconBtn, isRegenerating && { opacity: 0.5 }]}
-                >
-                  {isRegenerating ? (
-                    <ActivityIndicator size="small" color={Colors.mutedForeground} />
-                  ) : (
-                    <Ionicons name="refresh" size={16} color={Colors.mutedForeground} />
-                  )}
-                </Pressable>
+          <View style={[styles.headerSide, { alignItems: 'flex-end' }]}>
+            <View style={styles.headerActions}>
+              {ctx.selectedRoute && !hasStarted && !isFinished && (
                 <Pressable onPress={handleOpenGoogleMaps} style={styles.headerIconBtn}>
                   <Ionicons name="open-outline" size={16} color={Colors.mutedForeground} />
                 </Pressable>
-              </>
-            )}
+              )}
+            </View>
           </View>
         </View>
 
@@ -327,6 +310,29 @@ export default function RunScreen() {
         <View style={styles.bottomSheet}>
           {/* Grab handle */}
           <View style={styles.grabHandle} />
+
+          {/* Route selector */}
+          {ctx.routes.length > 1 && !hasStarted && (
+            <View style={styles.routeSelector}>
+              <Pressable
+                onPress={handlePrevRoute}
+                disabled={routeIndex === 0}
+                style={[styles.routeNavBtn, routeIndex === 0 && { opacity: 0.3 }]}
+              >
+                <Ionicons name="chevron-back" size={14} color={Colors.mutedForeground} />
+              </Pressable>
+              <Text style={styles.routeCounter}>
+                Route {routeIndex + 1} of {ctx.routes.length}
+              </Text>
+              <Pressable
+                onPress={handleNextRoute}
+                disabled={routeIndex >= ctx.routes.length - 1}
+                style={[styles.routeNavBtn, routeIndex >= ctx.routes.length - 1 && { opacity: 0.3 }]}
+              >
+                <Ionicons name="chevron-forward" size={14} color={Colors.mutedForeground} />
+              </Pressable>
+            </View>
+          )}
 
           {/* Stats row */}
           <RunStats
@@ -377,9 +383,15 @@ const styles = StyleSheet.create({
     zIndex: 30,
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
     paddingHorizontal: 16,
     paddingBottom: 8,
+  },
+  headerSide: {
+    flex: 1,
+    alignItems: 'flex-start',
+  },
+  headerCenter: {
+    alignItems: 'center',
   },
   headerBtn: {
     flexDirection: 'row',
@@ -463,5 +475,25 @@ const styles = StyleSheet.create({
   startRow: {
     alignItems: 'center',
     marginTop: 4,
+  },
+  routeSelector: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 12,
+    paddingVertical: 4,
+  },
+  routeNavBtn: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: Colors.card,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  routeCounter: {
+    fontFamily: Fonts.sansMedium,
+    fontSize: 12,
+    color: Colors.mutedForeground,
   },
 });

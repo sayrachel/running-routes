@@ -132,18 +132,11 @@ export function StartButton({ runState, onStart, onPause, onResume, onFinish, di
 
   // Animated styles
   const mainButtonStyle = useAnimatedStyle(() => {
-    const bgColor = interpolateColor(
-      colorProgress.value,
-      [0, 1],
-      [Colors.primary, Colors.muted]
-    );
     return {
       width: mainWidth.value,
       height: mainHeight.value,
       borderRadius: mainHeight.value / 2,
-      backgroundColor: bgColor,
-      borderWidth: colorProgress.value > 0.5 ? 2 : 0,
-      borderColor: Colors.border,
+      backgroundColor: Colors.primary,
     };
   });
 
@@ -194,9 +187,9 @@ export function StartButton({ runState, onStart, onPause, onResume, onFinish, di
   // Icon and inline label based on displayState
   const mainIconName = displayState === 'running' ? 'pause' : 'play';
   const mainIconSize = displayState === 'idle' ? 32 : 18;
-  const mainIconColor = displayState === 'running' ? Colors.foreground : Colors.primaryForeground;
+  const mainIconColor = Colors.primaryForeground;
   const inlineLabel = displayState === 'running' ? 'PAUSE' : displayState === 'paused' ? 'RESUME' : null;
-  const inlineLabelColor = displayState === 'running' ? Colors.foreground : Colors.primaryForeground;
+  const inlineLabelColor = Colors.primaryForeground;
 
   return (
     <View style={styles.wrapper}>
