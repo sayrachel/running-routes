@@ -26,7 +26,7 @@ const enrichedGreenSpaceCache = new Map<string, GreenSpace[]>();
  * Compute bounding box from route points with a small buffer.
  * Returns [south, west, north, east] for Overpass bbox format.
  */
-function getBbox(points: RoutePoint[]): [number, number, number, number] {
+export function getBbox(points: RoutePoint[]): [number, number, number, number] {
   let minLat = Infinity;
   let maxLat = -Infinity;
   let minLng = Infinity;
@@ -48,7 +48,7 @@ function getBbox(points: RoutePoint[]): [number, number, number, number] {
 /**
  * Round bbox to 3 decimal places for cache key stability.
  */
-function bboxKey(bbox: [number, number, number, number]): string {
+export function bboxKey(bbox: [number, number, number, number]): string {
   return bbox.map((v) => v.toFixed(3)).join(',');
 }
 
@@ -57,7 +57,7 @@ function bboxKey(bbox: [number, number, number, number]): string {
  * The response format is:
  *   { "elements": [{ "type": "count", "tags": { "total": "42", ... } }] }
  */
-function parseOverpassCount(data: any): number {
+export function parseOverpassCount(data: any): number {
   if (!data.elements || data.elements.length === 0) return 0;
   const el = data.elements[0];
   if (el.type === 'count' && el.tags && el.tags.total) {

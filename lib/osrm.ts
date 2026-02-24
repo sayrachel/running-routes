@@ -20,7 +20,7 @@ const ROUTING_OVERHEAD = 1.35;
 // ---------------------------------------------------------------------------
 
 /** Haversine distance in km between two points */
-function haversineDistance(p1: RoutePoint, p2: RoutePoint): number {
+export function haversineDistance(p1: RoutePoint, p2: RoutePoint): number {
   const R = 6371;
   const toRad = (d: number) => (d * Math.PI) / 180;
   const dLat = toRad(p2.lat - p1.lat);
@@ -32,7 +32,7 @@ function haversineDistance(p1: RoutePoint, p2: RoutePoint): number {
 }
 
 /** Compute a destination point given origin, bearing (degrees), and distance (km) */
-function destinationPoint(origin: RoutePoint, bearingDeg: number, distanceKm: number): RoutePoint {
+export function destinationPoint(origin: RoutePoint, bearingDeg: number, distanceKm: number): RoutePoint {
   const R = 6371;
   const d = distanceKm / R;
   const brng = (bearingDeg * Math.PI) / 180;
@@ -53,7 +53,7 @@ function destinationPoint(origin: RoutePoint, bearingDeg: number, distanceKm: nu
 }
 
 /** Compass bearing (0–360°) from p1 to p2 */
-function bearingFrom(p1: RoutePoint, p2: RoutePoint): number {
+export function bearingFrom(p1: RoutePoint, p2: RoutePoint): number {
   const toRad = (d: number) => (d * Math.PI) / 180;
   const dLng = toRad(p2.lng - p1.lng);
   const lat1 = toRad(p1.lat);
@@ -65,7 +65,7 @@ function bearingFrom(p1: RoutePoint, p2: RoutePoint): number {
 }
 
 /** Smallest angle (0–180°) between two bearings */
-function angleDiff(a: number, b: number): number {
+export function angleDiff(a: number, b: number): number {
   let diff = Math.abs(a - b) % 360;
   if (diff > 180) diff = 360 - diff;
   return diff;
@@ -200,7 +200,7 @@ function isAccessibleFromCenter(
  * Build OSRM coordinate string from waypoints.
  * OSRM expects: lng,lat;lng,lat;...
  */
-function coordsString(points: RoutePoint[]): string {
+export function coordsString(points: RoutePoint[]): string {
   return points.map((p) => `${p.lng},${p.lat}`).join(';');
 }
 
@@ -208,7 +208,7 @@ function coordsString(points: RoutePoint[]): string {
  * Calculate the search radius for green space queries based on route type.
  * Clamped to [1.5, 10] km.
  */
-function calculateSearchRadius(
+export function calculateSearchRadius(
   routeType: 'loop' | 'out-and-back' | 'point-to-point',
   distanceKm: number,
   center: RoutePoint,
@@ -231,7 +231,7 @@ function calculateSearchRadius(
 // Green-space-first waypoint selection
 // ---------------------------------------------------------------------------
 
-type CandidateStrategy = 'large-parks' | 'named-paths' | 'balanced';
+export type CandidateStrategy = 'large-parks' | 'named-paths' | 'balanced';
 
 /**
  * Score a green space for waypoint selection.
@@ -240,7 +240,7 @@ type CandidateStrategy = 'large-parks' | 'named-paths' | 'balanced';
  * - 'named-paths': heavy bonus for named paths/routes
  * - 'balanced': even spread
  */
-function scoreGreenSpace(
+export function scoreGreenSpace(
   gs: GreenSpace,
   strategy: CandidateStrategy,
   strict: boolean
@@ -450,7 +450,7 @@ function selectGreenSpaceWaypoints(
 }
 
 /** Estimate routed circuit distance from waypoints using haversine sum × overhead */
-function estimateCircuitDistance(waypoints: RoutePoint[]): number {
+export function estimateCircuitDistance(waypoints: RoutePoint[]): number {
   let sum = 0;
   for (let i = 1; i < waypoints.length; i++) {
     sum += haversineDistance(waypoints[i - 1], waypoints[i]);
@@ -837,7 +837,7 @@ const ROUTE_NAMES: Record<string, string[]> = {
  * Pick a route name. If green-space anchors with names are available,
  * generate a descriptive name from them instead of using the generic pool.
  */
-function pickRouteName(
+export function pickRouteName(
   prefs: RoutePreferences,
   index: number,
   lat: number,
@@ -869,7 +869,7 @@ function pickRouteName(
 // ---------------------------------------------------------------------------
 
 /** Fabricated elevation gain when real data is unavailable */
-function fabricateElevationGain(distKm: number, variant: number): number {
+export function fabricateElevationGain(distKm: number, variant: number): number {
   return Math.round(5 + distKm * 3 + variant * 2);
 }
 

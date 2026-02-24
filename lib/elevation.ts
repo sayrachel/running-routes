@@ -24,7 +24,7 @@ export interface ElevationProfile {
  * Sample points evenly along a polyline of route points.
  * Returns ~SAMPLE_COUNT points spaced evenly by index.
  */
-function samplePoints(points: RoutePoint[], count: number): RoutePoint[] {
+export function samplePoints(points: RoutePoint[], count: number): RoutePoint[] {
   if (points.length <= count) return points;
   const step = (points.length - 1) / (count - 1);
   const sampled: RoutePoint[] = [];
@@ -38,7 +38,7 @@ function samplePoints(points: RoutePoint[], count: number): RoutePoint[] {
 /**
  * Calculate total elevation gain and loss from an array of elevations.
  */
-function computeGainLoss(elevations: number[]): { totalGain: number; totalLoss: number } {
+export function computeGainLoss(elevations: number[]): { totalGain: number; totalLoss: number } {
   let totalGain = 0;
   let totalLoss = 0;
   for (let i = 1; i < elevations.length; i++) {
