@@ -141,6 +141,37 @@ export function onFavoritesSnapshot(
   });
 }
 
+// ─── Account Deletion ────────────────────────────────────────
+
+export async function deleteUserData(userId: string): Promise<void> {
+  // Delete all runs
+  const runsSnap = await getDocs(collection(db, 'users', userId, 'runs'));
+  for (const d of runsSnap.docs) {
+    await deleteDoc(d.ref);
+  }
+
+  // Delete all favorites
+  const favsSnap = await getDocs(collection(db, 'users', userId, 'favorites'));
+  for (const d of favsSnap.docs) {
+    await deleteDoc(d.ref);
+  }
+
+  // Delete profile
+  try {
+    await deleteDoc(doc(db, 'users', userId, 'profile', 'data'));
+  } catch {}
+
+  // Clear local caches
+  await AsyncStorage.multiRemove([
+    CACHE_KEY_RUN_HISTORY,
+    CACHE_KEY_FAVORITES,
+    CACHE_KEY_PENDING_RUNS,
+    '@running_routes_last_distance_v3',
+    '@running_routes_save_count',
+    '@running_routes_review_prompted',
+  ]).catch(() => {});
+}
+
 // ─── Pending Run Queue (offline) ─────────────────────────────
 
 export async function addPendingRun(

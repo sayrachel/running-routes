@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { View, Text, Pressable, StyleSheet, Linking } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as StoreReview from 'expo-store-review';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
@@ -17,6 +18,7 @@ import { StartButton } from '@/components/StartButton';
 import { StatsView } from '@/components/StatsView';
 import { ProfileDrawer, type DrawerView } from '@/components/ProfileDrawer';
 import { useAppContext } from '@/lib/AppContext';
+import { formatElevation } from '@/lib/units';
 import { useLocationTracking, accuracyToStrength } from '@/lib/useLocationTracking';
 import { saveRunRecord, addPendingRun, getCachedRunHistory } from '@/lib/firestore';
 import { buildGoogleMapsUrl } from '@/lib/route-export';
@@ -186,6 +188,22 @@ export default function RunScreen() {
     // Open history view after saving
     setDrawerInitialView('history');
     setDrawerVisible(true);
+
+    // App Store review prompt after 3rd save
+    try {
+      const prompted = await AsyncStorage.getItem('@running_routes_review_prompted');
+      if (!prompted) {
+        const countStr = await AsyncStorage.getItem('@running_routes_save_count');
+        const count = (parseInt(countStr || '0', 10) || 0) + 1;
+        await AsyncStorage.setItem('@running_routes_save_count', String(count));
+        if (count === 3) {
+          await AsyncStorage.setItem('@running_routes_review_prompted', 'true');
+          if (await StoreReview.hasAction()) {
+            await StoreReview.requestReview();
+          }
+        }
+      }
+    } catch {}
   }, [ctx, tracking.stats]);
 
   const handleBack = useCallback(() => {
@@ -219,14 +237,19 @@ export default function RunScreen() {
 
   // Real GPS-derived stats
   const { totalDistanceKm, elapsedSeconds, currentPace, avgPace, splits, coordinates, currentPosition } = tracking.stats;
+  const isMetric = ctx.prefs.units === 'metric';
   const runDistance = hasStarted
-    ? Math.round(totalDistanceKm * 0.621371).toString()
+    ? isMetric
+      ? totalDistanceKm.toFixed(1)
+      : (totalDistanceKm * 0.621371).toFixed(1)
     : ctx.selectedRoute
       ? String(ctx.selectedRoute.distance)
       : '0';
   const timeStr = formatTime(elapsedSeconds);
   const calories = Math.round(elapsedSeconds * 0.18);
-  const elevation = ctx.selectedRoute ? ctx.selectedRoute.elevationGain : 0;
+  const elevation = ctx.selectedRoute
+    ? parseInt(formatElevation(ctx.selectedRoute.elevationGain, ctx.prefs.units), 10)
+    : 0;
 
   return (
     <View style={styles.outerContainer}>
@@ -253,6 +276,7 @@ export default function RunScreen() {
               onToggleFavorite={handleToggleFavorite}
               onDiscard={handleDiscard}
               onSave={handleSave}
+              units={ctx.prefs.units}
             />
           </Pressable>
         ) : (
@@ -311,6 +335,16 @@ export default function RunScreen() {
           {/* Grab handle */}
           <View style={styles.grabHandle} />
 
+          {ctx.routes.length === 0 && !ctx.selectedRoute && !hasStarted ? (
+            <View style={styles.emptyState}>
+              <Text style={styles.emptyStateText}>No route loaded</Text>
+              <Pressable onPress={handleBack} style={styles.emptyStateBtn}>
+                <Ionicons name="chevron-back" size={14} color={Colors.primary} />
+                <Text style={styles.emptyStateBtnLabel}>Go Back</Text>
+              </Pressable>
+            </View>
+          ) : (
+          <>
           {/* Route selector */}
           {ctx.routes.length > 1 && !hasStarted && (
             <View style={styles.routeSelector}>
@@ -340,6 +374,7 @@ export default function RunScreen() {
             distance={runDistance}
             time={timeStr}
             isRunning={isRunning}
+            units={ctx.prefs.units}
           />
 
           {/* Start button */}
@@ -352,6 +387,8 @@ export default function RunScreen() {
               onFinish={handleFinish}
             />
           </View>
+          </>
+          )}
         </View>
         )}
       </View>
@@ -495,5 +532,29 @@ const styles = StyleSheet.create({
     fontFamily: Fonts.sansMedium,
     fontSize: 12,
     color: Colors.mutedForeground,
+  },
+  emptyState: {
+    alignItems: 'center',
+    gap: 12,
+    paddingVertical: 16,
+  },
+  emptyStateText: {
+    fontFamily: Fonts.sansSemiBold,
+    fontSize: 14,
+    color: Colors.mutedForeground,
+  },
+  emptyStateBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: Colors.primary + '1A',
+    borderRadius: 20,
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+  },
+  emptyStateBtnLabel: {
+    fontFamily: Fonts.sansSemiBold,
+    fontSize: 13,
+    color: Colors.primary,
   },
 });

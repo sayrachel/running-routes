@@ -8,6 +8,8 @@
     "userInterfaceStyle": "dark",
     "scheme": "runroutes",
     "splash": {
+      "image": "./assets/icon.png",
+      "resizeMode": "contain",
       "backgroundColor": "#0b0f14"
     },
     "ios": {
@@ -17,7 +19,6 @@
         "NSLocationWhenInUseUsageDescription": "Running Routes needs your location to generate running routes near you.",
         "NSLocationAlwaysAndWhenInUseUsageDescription": "Running Routes needs background location access to track your run even when the app is in the background.",
         "UIBackgroundModes": [
-          "location",
           "location"
         ],
         "ITSAppUsesNonExemptEncryption": false

@@ -2,6 +2,8 @@ import React from 'react';
 import { View, Text, ScrollView, Pressable, StyleSheet } from 'react-native';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { Colors, Fonts } from '@/lib/theme';
+import type { UnitSystem } from '@/lib/units';
+import { elevationUnit } from '@/lib/units';
 
 interface StatsViewProps {
   pace: string;
@@ -18,6 +20,7 @@ interface StatsViewProps {
   onToggleFavorite?: () => void;
   onDiscard?: () => void;
   onSave?: () => void;
+  units?: UnitSystem;
 }
 
 function StatCard({
@@ -54,7 +57,12 @@ export function StatsView({
   onToggleFavorite,
   onDiscard,
   onSave,
+  units = 'imperial',
 }: StatsViewProps) {
+  const paceLabel = units === 'metric' ? 'min/km' : 'min/mi';
+  const distLabel = units === 'metric' ? 'km' : 'mi';
+  const splitLabel = units === 'metric' ? 'KM' : 'MILE';
+  const elevLabel = elevationUnit(units);
   // Finished state — match history run-detail layout
   if (isFinished) {
     return (
@@ -74,11 +82,11 @@ export function StatsView({
           </View>
           <View style={styles.statCell}>
             <Text style={styles.statCellValue}>{avgPace || pace}</Text>
-            <Text style={styles.statCellLabel}>min/mi</Text>
+            <Text style={styles.statCellLabel}>{paceLabel}</Text>
           </View>
           <View style={styles.statCell}>
             <Text style={styles.statCellValue}>{distance}</Text>
-            <Text style={styles.statCellLabel}>mi</Text>
+            <Text style={styles.statCellLabel}>{distLabel}</Text>
           </View>
         </View>
 
@@ -88,7 +96,7 @@ export function StatsView({
             <Text style={styles.finishedSplitsTitle}>Splits</Text>
             <View style={styles.splitsTable}>
               <View style={styles.splitsTableHeader}>
-                <Text style={styles.splitsHeaderText}>MILE</Text>
+                <Text style={styles.splitsHeaderText}>{splitLabel}</Text>
                 <Text style={styles.splitsHeaderText}>TIME</Text>
               </View>
               {splits.map((split) => (
@@ -156,7 +164,7 @@ export function StatsView({
         <StatCard
           icon={<Ionicons name="trending-up" size={20} color={Colors.primary} />}
           label="ELEVATION"
-          value={`${elevation}m`}
+          value={`${elevation}${elevLabel}`}
         />
       </View>
 
@@ -165,7 +173,7 @@ export function StatsView({
           <Text style={styles.inRunSplitsTitle}>SPLITS</Text>
           {splits.map((item) => (
             <View key={item.km} style={styles.inRunSplitRow}>
-              <Text style={styles.inRunSplitKm}>MILE {item.km}</Text>
+              <Text style={styles.inRunSplitKm}>{splitLabel} {item.km}</Text>
               <Text style={styles.inRunSplitPace}>{item.time}</Text>
             </View>
           ))}

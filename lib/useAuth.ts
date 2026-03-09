@@ -5,6 +5,7 @@ import {
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
   signOut as firebaseSignOut,
+  deleteUser,
   GoogleAuthProvider,
   OAuthProvider,
   type User,
@@ -174,6 +175,12 @@ export function useAuth() {
     }
   }, []);
 
+  const deleteAccount = useCallback(async () => {
+    if (auth.currentUser) {
+      await deleteUser(auth.currentUser);
+    }
+  }, []);
+
   return {
     user,
     loading,
@@ -182,5 +189,6 @@ export function useAuth() {
     signInWithApple,
     signInWithEmail,
     signOut,
+    deleteAccount,
   };
 }

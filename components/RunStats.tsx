@@ -1,15 +1,20 @@
 import React from 'react';
 import { View, Text, StyleSheet } from 'react-native';
 import { Colors, Fonts } from '@/lib/theme';
+import type { UnitSystem } from '@/lib/units';
 
 interface RunStatsProps {
   pace: string;
   distance: string;
   time: string;
   isRunning: boolean;
+  units?: UnitSystem;
 }
 
-export function RunStats({ pace, distance, time }: RunStatsProps) {
+export function RunStats({ pace, distance, time, units = 'imperial' }: RunStatsProps) {
+  const paceLabel = units === 'metric' ? 'AVG PACE (/KM)' : 'AVG PACE (/MI)';
+  const distLabel = units === 'metric' ? 'DISTANCE (KM)' : 'DISTANCE (MI)';
+
   return (
     <View style={styles.grid}>
       {/* Time */}
@@ -20,13 +25,13 @@ export function RunStats({ pace, distance, time }: RunStatsProps) {
 
       {/* Pace */}
       <View style={[styles.cell, styles.cellSide]}>
-        <Text style={styles.label} numberOfLines={1}>AVG PACE (/MI)</Text>
+        <Text style={styles.label} numberOfLines={1}>{paceLabel}</Text>
         <Text style={[styles.value, styles.valuePrimary]}>{pace}</Text>
       </View>
 
       {/* Distance */}
       <View style={[styles.cell, styles.cellSide]}>
-        <Text style={styles.label} numberOfLines={1}>DISTANCE (MI)</Text>
+        <Text style={styles.label} numberOfLines={1}>{distLabel}</Text>
         <Text style={[styles.value, styles.valuePrimary]}>{distance}</Text>
       </View>
     </View>

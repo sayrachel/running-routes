@@ -23,6 +23,7 @@ import { RouteMap } from '@/components/RouteMap';
 import { ProfileDrawer } from '@/components/ProfileDrawer';
 import { FavoritePreview } from '@/components/FavoritePreview';
 import { useAppContext, type RouteStyle, type RunPreferences, type FavoriteRoute } from '@/lib/AppContext';
+import { distanceUnit } from '@/lib/units';
 import { generateOSRMRoutes } from '@/lib/osrm';
 import { accuracyToStrength } from '@/lib/useLocationTracking';
 import { BottomTabBar } from '@/components/BottomTabBar';
@@ -40,30 +41,45 @@ function haversineDistanceMiles(lat1: number, lng1: number, lat2: number, lng2: 
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-/** Continuous slider for distance selection (1–30 mi, whole-mile output).
- *  Thumb follows finger smoothly; displayed value snaps to whole miles.
- *  First half of track: 1–5 mi. Second half: 5–30 mi. */
+/** Continuous slider for distance selection.
+ *  Thumb follows finger smoothly; displayed value snaps to whole numbers.
+ *  First half of track: 1–5. Second half: 5–max. */
 function DistanceSlider({
   value,
   onChange,
   disabled,
   onDragStart,
   onDragEnd,
+  maxValue = 30,
+  unit = 'mi',
 }: {
   value: number;
   onChange: (v: number) => void;
   disabled?: boolean;
   onDragStart?: () => void;
   onDragEnd?: () => void;
+  maxValue?: number;
+  unit?: string;
 }) {
   const sliderRef = useRef<View>(null);
   const trackLayout = useRef({ pageX: 0, width: 0 });
   const lastRounded = useRef(value);
   const [dragging, setDragging] = useState(false);
-  const [rawFraction, setRawFraction] = useState(() => valueToFractionFn(value));
 
-  // Piecewise linear: [0, 0.5] → [1, 5], [0.5, 1] → [5, 30]
-  const fraction = dragging ? rawFraction : valueToFractionFn(value);
+  const midpoint = Math.min(5, maxValue);
+  const valToFrac = (v: number) => {
+    if (v <= midpoint) return ((v - 1) / (midpoint - 1)) * 0.5;
+    return 0.5 + ((v - midpoint) / (maxValue - midpoint)) * 0.5;
+  };
+  const fracToVal = (f: number) => {
+    if (f <= 0.5) return 1 + (f / 0.5) * (midpoint - 1);
+    return midpoint + ((f - 0.5) / 0.5) * (maxValue - midpoint);
+  };
+
+  const [rawFraction, setRawFraction] = useState(() => valToFrac(value));
+
+  // Piecewise linear: [0, 0.5] → [1, midpoint], [0.5, 1] → [midpoint, maxValue]
+  const fraction = dragging ? rawFraction : valToFrac(value);
 
   const processTouch = useCallback((pageX: number) => {
     if (disabled) return;
@@ -71,14 +87,14 @@ function DistanceSlider({
     if (width === 0) return;
     const relative = Math.max(0, Math.min(1, (pageX - trackX) / width));
     setRawFraction(relative);
-    const raw = fractionToValueFn(relative);
-    const clamped = Math.max(1, Math.min(30, raw));
+    const raw = fracToVal(relative);
+    const clamped = Math.max(1, Math.min(maxValue, raw));
     const rounded = Math.round(clamped);
     if (rounded !== lastRounded.current) {
       lastRounded.current = rounded;
       onChange(rounded);
     }
-  }, [onChange, disabled]);
+  }, [onChange, disabled, maxValue]);
 
   const handleGrant = useCallback((e: any) => {
     if (disabled) return;
@@ -100,7 +116,7 @@ function DistanceSlider({
     <View style={disabled ? { opacity: 0.45 } : undefined}>
       <View style={styles.sliderValueRow}>
         <Text style={styles.sliderValue}>{value}</Text>
-        <Text style={styles.sliderUnit}>mi</Text>
+        <Text style={styles.sliderUnit}>{unit}</Text>
       </View>
       <View
         ref={sliderRef}
@@ -119,21 +135,11 @@ function DistanceSlider({
       </View>
       <View style={styles.sliderRangeLabels}>
         <Text style={styles.sliderLabelText}>1</Text>
-        <Text style={styles.sliderLabelText}>5</Text>
-        <Text style={styles.sliderLabelText}>30</Text>
+        <Text style={styles.sliderLabelText}>{midpoint}</Text>
+        <Text style={styles.sliderLabelText}>{maxValue}</Text>
       </View>
     </View>
   );
-}
-
-function valueToFractionFn(v: number) {
-  if (v <= 5) return ((v - 1) / 4) * 0.5;
-  return 0.5 + ((v - 5) / 25) * 0.5;
-}
-
-function fractionToValueFn(f: number) {
-  if (f <= 0.5) return 1 + (f / 0.5) * 4;
-  return 5 + ((f - 0.5) / 0.5) * 25;
 }
 
 const ROUTE_STYLES: { value: RouteStyle; label: string; desc: string }[] = [
@@ -186,6 +192,7 @@ export default function SetupScreen() {
   const [drawerVisible, setDrawerVisible] = useState(false);
   const [previewFavorite, setPreviewFavorite] = useState<FavoriteRoute | null>(null);
   const [sliderActive, setSliderActive] = useState(false);
+  const [generateError, setGenerateError] = useState<string | null>(null);
 
   // Bottom sheet collapse
   const [isSheetCollapsed, setIsSheetCollapsed] = useState(false);
@@ -228,13 +235,12 @@ export default function SetupScreen() {
   const endInputRef = useRef<TextInput>(null);
   const endDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Auth redirect — disabled for testing
-  // TODO: re-enable when done testing
-  // useEffect(() => {
-  //   if (!ctx.isLoggedIn) {
-  //     router.replace('/landing');
-  //   }
-  // }, [ctx.isLoggedIn]);
+  // Auth redirect
+  useEffect(() => {
+    if (!ctx.isLoggedIn) {
+      router.replace('/landing');
+    }
+  }, [ctx.isLoggedIn]);
 
   // Real GPS strength from location accuracy
   useEffect(() => {
@@ -477,19 +483,22 @@ export default function SetupScreen() {
     ctx.setRouteStyle(localRouteStyle);
     ctx.setPrefs(localPrefs);
     ctx.setIsGenerating(true);
+    setGenerateError(null);
 
     const end =
       localRouteStyle === 'point-to-point' && hasEndLocation
         ? ctx.endLocation
         : null;
 
-    // Convert miles to km for OSRM
+    // Convert to km for OSRM
     // For point-to-point, use the actual straight-line distance × road overhead
     // (the slider is disabled and shows the haversine distance)
     const distanceKm =
       localRouteStyle === 'point-to-point' && p2pDistance != null
         ? p2pDistance * 1.60934 * 1.3
-        : ctx.distance * 1.60934;
+        : localPrefs.units === 'metric'
+          ? ctx.distance
+          : ctx.distance * 1.60934;
 
     try {
       const newRoutes = await generateOSRMRoutes(
@@ -500,14 +509,19 @@ export default function SetupScreen() {
         localPrefs,
         end
       );
+      if (newRoutes.length === 0) {
+        setGenerateError('No routes found for this area. Try a different location or distance.');
+        ctx.setIsGenerating(false);
+        return;
+      }
       ctx.setRoutes(newRoutes);
       ctx.setSelectedRoute(newRoutes[0] || null);
-    } catch (err: any) {
-      console.warn('Route generation failed, starting without route:', err);
-      // Continue to run screen even without a generated route
-    } finally {
       ctx.setIsGenerating(false);
       router.replace('/run');
+    } catch (err: any) {
+      console.warn('Route generation failed:', err);
+      setGenerateError("Couldn't generate a route. Check your connection and try again.");
+      ctx.setIsGenerating(false);
     }
   }, [ctx, localRouteStyle, localPrefs, hasEndLocation, p2pDistance, router]);
 
@@ -762,15 +776,50 @@ export default function SetupScreen() {
 
           {/* Distance */}
           <View style={styles.section}>
-            <Text style={styles.sectionLabel}>DISTANCE</Text>
+            <View style={styles.sectionLabelRow}>
+              <Text style={styles.sectionLabel}>DISTANCE</Text>
+              <View style={styles.unitToggle}>
+                <Pressable
+                  onPress={() => {
+                    if (localPrefs.units !== 'imperial') {
+                      setLocalPrefs((prev) => ({ ...prev, units: 'imperial' }));
+                      ctx.setPrefs({ ...localPrefs, units: 'imperial' });
+                    }
+                  }}
+                  style={[styles.unitToggleBtn, localPrefs.units === 'imperial' && styles.unitToggleBtnActive]}
+                >
+                  <Text style={[styles.unitToggleText, localPrefs.units === 'imperial' && styles.unitToggleTextActive]}>mi</Text>
+                </Pressable>
+                <Pressable
+                  onPress={() => {
+                    if (localPrefs.units !== 'metric') {
+                      setLocalPrefs((prev) => ({ ...prev, units: 'metric' }));
+                      ctx.setPrefs({ ...localPrefs, units: 'metric' });
+                    }
+                  }}
+                  style={[styles.unitToggleBtn, localPrefs.units === 'metric' && styles.unitToggleBtnActive]}
+                >
+                  <Text style={[styles.unitToggleText, localPrefs.units === 'metric' && styles.unitToggleTextActive]}>km</Text>
+                </Pressable>
+              </View>
+            </View>
             {localRouteStyle === 'point-to-point' ? (
               <DistanceSlider
                 value={p2pDistance ?? ctx.distance}
                 onChange={() => {}}
                 disabled
+                unit={distanceUnit(localPrefs.units)}
+                maxValue={localPrefs.units === 'metric' ? 50 : 30}
               />
             ) : (
-              <DistanceSlider value={ctx.distance} onChange={ctx.setDistance} onDragStart={() => setSliderActive(true)} onDragEnd={() => setSliderActive(false)} />
+              <DistanceSlider
+                value={ctx.distance}
+                onChange={ctx.setDistance}
+                onDragStart={() => setSliderActive(true)}
+                onDragEnd={() => setSliderActive(false)}
+                unit={distanceUnit(localPrefs.units)}
+                maxValue={localPrefs.units === 'metric' ? 50 : 30}
+              />
             )}
           </View>
 
@@ -832,6 +881,12 @@ export default function SetupScreen() {
           </Pressable>
           {!ctx.hasLocation && (
             <Text style={styles.helpText}>Set your location above to continue</Text>
+          )}
+          {generateError && (
+            <View style={styles.errorBanner}>
+              <Ionicons name="alert-circle" size={16} color={Colors.destructive} />
+              <Text style={styles.errorText}>{generateError}</Text>
+            </View>
           )}
         </View>
       </View>
@@ -931,6 +986,34 @@ const styles = StyleSheet.create({
     letterSpacing: 2,
     color: Colors.mutedForeground,
     marginBottom: 6,
+  },
+  sectionLabelRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 6,
+  },
+  unitToggle: {
+    flexDirection: 'row',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    overflow: 'hidden',
+  },
+  unitToggleBtn: {
+    paddingVertical: 3,
+    paddingHorizontal: 10,
+  },
+  unitToggleBtnActive: {
+    backgroundColor: Colors.primary + '1A',
+  },
+  unitToggleText: {
+    fontFamily: Fonts.sansBold,
+    fontSize: 10,
+    color: Colors.mutedForeground,
+  },
+  unitToggleTextActive: {
+    color: Colors.primary,
   },
   locationGroup: {
     borderRadius: 14,
@@ -1236,5 +1319,21 @@ const styles = StyleSheet.create({
     color: Colors.mutedForeground,
     textAlign: 'center',
     marginTop: 8,
+  },
+  errorBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: Colors.destructive + '1A',
+    borderRadius: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    marginTop: 10,
+  },
+  errorText: {
+    flex: 1,
+    fontFamily: Fonts.sans,
+    fontSize: 12,
+    color: Colors.destructive,
   },
 });

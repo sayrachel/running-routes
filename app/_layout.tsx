@@ -1,6 +1,6 @@
 import { useEffect } from 'react';
 import { View, ActivityIndicator, Platform, StyleSheet } from 'react-native';
-import { Stack } from 'expo-router';
+import { Stack, useRouter, useSegments } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import * as SplashScreen from 'expo-splash-screen';
 import {
@@ -57,7 +57,28 @@ function useWebMobileFrame() {
 }
 
 function AuthGate({ children }: { children: React.ReactNode }) {
-  // TODO: remove bypass when done testing
+  const ctx = useAppContext();
+  const router = useRouter();
+  const segments = useSegments();
+
+  useEffect(() => {
+    if (ctx.authLoading) return;
+    const onLanding = segments[0] === 'landing';
+    if (!ctx.isLoggedIn && !onLanding) {
+      router.replace('/landing');
+    } else if (ctx.isLoggedIn && onLanding) {
+      router.replace('/');
+    }
+  }, [ctx.isLoggedIn, ctx.authLoading, segments]);
+
+  if (ctx.authLoading) {
+    return (
+      <View style={layoutStyles.loadingContainer}>
+        <ActivityIndicator size="large" color={Colors.primary} />
+      </View>
+    );
+  }
+
   return <>{children}</>;
 }
 

@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import type { GeneratedRoute, RoutePoint, RoutePreferences } from './route-generator';
+import type { UnitSystem } from './units';
 import { useAuth } from './useAuth';
 import {
   addFavoriteRoute,
@@ -9,10 +10,12 @@ import {
   updateUserProfile,
   getCachedFavorites,
   flushPendingRuns,
+  deleteUserData,
 } from './firestore';
 import type { FavoriteRouteRecord } from './types';
 
 const DISTANCE_STORAGE_KEY = '@running_routes_last_distance_v3';
+const UNITS_STORAGE_KEY = '@running_routes_units';
 
 export type RouteStyle = 'loop' | 'point-to-point' | 'out-and-back';
 
@@ -24,6 +27,7 @@ export interface User {
 
 export interface RunPreferences {
   lowTraffic: boolean;
+  units: UnitSystem;
 }
 
 export interface FavoriteRoute {
@@ -46,6 +50,7 @@ interface AppState {
   signInWithApple: () => Promise<any>;
   signInWithEmail: (email: string, password: string) => Promise<any>;
   signOutUser: () => Promise<void>;
+  deleteAccount: () => Promise<void>;
   center: RoutePoint;
   setCenter: (p: RoutePoint) => void;
   hasLocation: boolean;
@@ -76,10 +81,10 @@ const DEFAULT_CENTER: RoutePoint = { lat: 40.7128, lng: -74.006 };
 const AppContext = createContext<AppState | null>(null);
 
 export function AppProvider({ children }: { children: React.ReactNode }) {
-  const { user: firebaseUser, loading: authLoading, isAuthenticated, signInWithGoogle, signInWithApple, signInWithEmail, signOut } = useAuth();
+  const { user: firebaseUser, loading: authLoading, isAuthenticated, signInWithGoogle, signInWithApple, signInWithEmail, signOut, deleteAccount: deleteAuthAccount } = useAuth();
 
-  const [isLoggedIn, setIsLoggedIn] = useState(true); // TODO: revert to false when done testing
-  const [user, setUser] = useState<User | null>({ name: 'Test User', email: 'test@example.com', avatar: '' }); // TODO: revert to null
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [user, setUser] = useState<User | null>(null);
   const [center, setCenter] = useState<RoutePoint>(DEFAULT_CENTER);
   const [hasLocation, setHasLocation] = useState(false);
   const [gpsStrength, setGpsStrength] = useState<0 | 1 | 2 | 3>(0);
@@ -88,7 +93,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   // Persist distance and load last used distance on mount
   const setDistance = useCallback((v: number) => {
-    const clamped = Math.max(1, Math.min(30, v));
+    const clamped = Math.max(1, Math.min(50, v));
     setDistanceRaw(clamped);
     AsyncStorage.setItem(DISTANCE_STORAGE_KEY, String(clamped)).catch(() => {});
   }, []);
@@ -101,9 +106,25 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }
     }).catch(() => {});
   }, []);
-  const [prefs, setPrefs] = useState<RunPreferences>({
+  const [prefs, setPrefsRaw] = useState<RunPreferences>({
     lowTraffic: true,
+    units: 'imperial',
   });
+
+  // Persist units preference
+  const setPrefs = useCallback((v: RunPreferences) => {
+    setPrefsRaw(v);
+    AsyncStorage.setItem(UNITS_STORAGE_KEY, v.units).catch(() => {});
+  }, []);
+
+  // Load persisted units on mount
+  useEffect(() => {
+    AsyncStorage.getItem(UNITS_STORAGE_KEY).then((val) => {
+      if (val === 'imperial' || val === 'metric') {
+        setPrefsRaw((prev) => ({ ...prev, units: val }));
+      }
+    }).catch(() => {});
+  }, []);
   const [routes, setRoutes] = useState<GeneratedRoute[]>([]);
   const [selectedRoute, setSelectedRoute] = useState<GeneratedRoute | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
@@ -134,7 +155,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   // Sync Firebase Auth user → app user state
-  // TODO: remove bypass when done testing
   useEffect(() => {
     if (firebaseUser) {
       setUser({
@@ -151,8 +171,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         photoURL: firebaseUser.photoURL || null,
         createdAt: Date.now(),
       }).catch(() => {});
+    } else if (!authLoading) {
+      setIsLoggedIn(false);
+      setUser(null);
     }
-    // Bypass: don't reset to logged-out when no Firebase user
   }, [firebaseUser, authLoading]);
 
   // Real-time Firestore favorites listener
@@ -218,6 +240,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setFavorites([]);
   }, [signOut]);
 
+  const deleteAccountHandler = useCallback(async () => {
+    const uid = firebaseUser?.uid;
+    if (uid) {
+      await deleteUserData(uid);
+    }
+    await deleteAuthAccount();
+    setIsLoggedIn(false);
+    setUser(null);
+    setFavorites([]);
+  }, [firebaseUser, deleteAuthAccount]);
+
   return (
     <AppContext.Provider
       value={{
@@ -231,6 +264,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         signInWithApple,
         signInWithEmail,
         signOutUser,
+        deleteAccount: deleteAccountHandler,
         center,
         setCenter,
         hasLocation,
