@@ -60,6 +60,12 @@ export default function LandingScreen() {
     }
   };
 
+  const handleGuestContinue = () => {
+    ctx.setIsLoggedIn(true);
+    ctx.setUser({ name: 'Guest', email: '', avatar: '' });
+    router.replace('/');
+  };
+
   const isLoading = loading !== null;
 
   return (
@@ -67,7 +73,7 @@ export default function LandingScreen() {
       <View style={styles.content}>
         <Ionicons name="walk" size={80} color={Colors.primary} />
         <Text style={styles.appName}>Running Routes</Text>
-        <Text style={styles.tagline}>Plan the perfect running route, every time</Text>
+        <Text style={styles.tagline}>Generate new running routes</Text>
       </View>
 
       <View style={styles.buttonArea}>
@@ -113,6 +119,29 @@ export default function LandingScreen() {
             </Text>
           </Pressable>
         )}
+
+        {/* Divider */}
+        <View style={styles.divider}>
+          <View style={styles.dividerLine} />
+          <Text style={styles.dividerText}>or</Text>
+          <View style={styles.dividerLine} />
+        </View>
+
+        {/* Continue as Guest */}
+        <Pressable
+          onPress={handleGuestContinue}
+          disabled={isLoading}
+          style={({ pressed }) => [
+            styles.oauthButton,
+            styles.guestButton,
+            pressed && !isLoading && { transform: [{ scale: 0.98 }] },
+          ]}
+        >
+          <Ionicons name="person-outline" size={20} color={Colors.foreground} />
+          <Text style={[styles.oauthText, { color: Colors.foreground }]}>
+            Continue as Guest
+          </Text>
+        </Pressable>
 
         {error && <Text style={styles.errorText}>{error}</Text>}
       </View>
@@ -161,6 +190,26 @@ const styles = StyleSheet.create({
   },
   appleButton: {
     backgroundColor: '#000',
+  },
+  guestButton: {
+    backgroundColor: Colors.card,
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  divider: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  dividerLine: {
+    flex: 1,
+    height: 1,
+    backgroundColor: Colors.border,
+  },
+  dividerText: {
+    fontFamily: Fonts.sans,
+    fontSize: 13,
+    color: Colors.mutedForeground,
   },
   oauthText: {
     fontFamily: Fonts.sansBold,

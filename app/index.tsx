@@ -9,6 +9,8 @@ import {
   FlatList,
   ScrollView,
   Keyboard,
+  KeyboardAvoidingView,
+  Platform,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
@@ -188,6 +190,11 @@ export default function SetupScreen() {
 
   const [localRouteStyle, setLocalRouteStyle] = useState<RouteStyle>(ctx.routeStyle);
   const [localPrefs, setLocalPrefs] = useState<RunPreferences>(ctx.prefs);
+
+  // Sync localPrefs when units change in settings
+  useEffect(() => {
+    setLocalPrefs(ctx.prefs);
+  }, [ctx.prefs]);
   const [hasEndLocation, setHasEndLocation] = useState(false);
   const [drawerVisible, setDrawerVisible] = useState(false);
   const [previewFavorite, setPreviewFavorite] = useState<FavoriteRoute | null>(null);
@@ -233,6 +240,7 @@ export default function SetupScreen() {
   const [isEndGeocoding, setIsEndGeocoding] = useState(false);
   const [endSuggestions, setEndSuggestions] = useState<GeocodeSuggestion[]>([]);
   const endInputRef = useRef<TextInput>(null);
+  const sheetScrollRef = useRef<ScrollView>(null);
   const endDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Auth redirect
@@ -468,10 +476,6 @@ export default function SetupScreen() {
     setEndLocationName(null);
   }, [ctx]);
 
-  const toggleTraffic = () => {
-    setLocalPrefs((prev) => ({ ...prev, lowTraffic: !prev.lowTraffic }));
-  };
-
   const p2pDistance = useMemo(() => {
     if (localRouteStyle === 'point-to-point' && hasEndLocation && ctx.endLocation) {
       return Math.round(haversineDistanceMiles(ctx.center.lat, ctx.center.lng, ctx.endLocation.lat, ctx.endLocation.lng) * 10) / 10;
@@ -491,11 +495,11 @@ export default function SetupScreen() {
         : null;
 
     // Convert to km for OSRM
-    // For point-to-point, use the actual straight-line distance × road overhead
-    // (the slider is disabled and shows the haversine distance)
+    // For point-to-point, just convert the haversine distance to km —
+    // don't add road overhead since the user chose a destination, not a distance.
     const distanceKm =
       localRouteStyle === 'point-to-point' && p2pDistance != null
-        ? p2pDistance * 1.60934 * 1.3
+        ? p2pDistance * 1.60934
         : localPrefs.units === 'metric'
           ? ctx.distance
           : ctx.distance * 1.60934;
@@ -525,7 +529,8 @@ export default function SetupScreen() {
     }
   }, [ctx, localRouteStyle, localPrefs, hasEndLocation, p2pDistance, router]);
 
-  const canGenerate = ctx.hasLocation && !ctx.isGenerating && ctx.distance > 0;
+  const canGenerate = ctx.hasLocation && !ctx.isGenerating && ctx.distance > 0
+    && (localRouteStyle !== 'point-to-point' || hasEndLocation);
 
   const renderSuggestion = ({ item, onSelect }: { item: GeocodeSuggestion; onSelect: (s: GeocodeSuggestion) => void }) => (
     <Pressable
@@ -538,7 +543,10 @@ export default function SetupScreen() {
   );
 
   return (
-    <View style={styles.container}>
+    <KeyboardAvoidingView
+      style={styles.container}
+      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+    >
       {/* Map area */}
       <View style={styles.mapContainer}>
         <RouteMap
@@ -584,6 +592,7 @@ export default function SetupScreen() {
 
         <Animated.View style={sheetContentStyle}>
         <ScrollView
+          ref={sheetScrollRef}
           style={styles.bottomScrollView}
           contentContainerStyle={styles.bottomScrollContent}
           showsVerticalScrollIndicator={false}
@@ -603,9 +612,20 @@ export default function SetupScreen() {
                   key={style.value}
                   onPress={() => {
                     setLocalRouteStyle(style.value);
-                    if (style.value !== 'point-to-point') {
+                    // Dismiss any active end location search
+                    setShowEndSearch(false);
+                    setEndSuggestions([]);
+                    setEndAddressText('');
+                    Keyboard.dismiss();
+                    if (style.value === 'loop') {
+                      // Loop ends where it starts — set immediately
+                      ctx.setEndLocation(ctx.center);
+                      setHasEndLocation(true);
+                      setEndLocationName(startLocationName || currentLocationAddress || 'Current Location');
+                    } else if (style.value === 'out-and-back') {
                       handleClearEndLocation();
                     }
+                    // point-to-point: keep existing end location if set
                   }}
                   style={[
                     styles.routeTypePill,
@@ -728,6 +748,16 @@ export default function SetupScreen() {
                       value={endAddressText}
                       onChangeText={handleEndAddressChange}
                       onSubmitEditing={handleEndSearchSubmit}
+                      onFocus={() => {
+                        // Expand sheet fully and scroll to make input visible above keyboard
+                        if (isSheetCollapsed) {
+                          sheetContentHeight.value = withTiming(500, { duration: 300 });
+                          setIsSheetCollapsed(false);
+                        }
+                        setTimeout(() => {
+                          sheetScrollRef.current?.scrollTo({ y: 200, animated: true });
+                        }, 300);
+                      }}
                       onBlur={() => {
                         setTimeout(() => {
                           setShowEndSearch(false);
@@ -778,30 +808,6 @@ export default function SetupScreen() {
           <View style={styles.section}>
             <View style={styles.sectionLabelRow}>
               <Text style={styles.sectionLabel}>DISTANCE</Text>
-              <View style={styles.unitToggle}>
-                <Pressable
-                  onPress={() => {
-                    if (localPrefs.units !== 'imperial') {
-                      setLocalPrefs((prev) => ({ ...prev, units: 'imperial' }));
-                      ctx.setPrefs({ ...localPrefs, units: 'imperial' });
-                    }
-                  }}
-                  style={[styles.unitToggleBtn, localPrefs.units === 'imperial' && styles.unitToggleBtnActive]}
-                >
-                  <Text style={[styles.unitToggleText, localPrefs.units === 'imperial' && styles.unitToggleTextActive]}>mi</Text>
-                </Pressable>
-                <Pressable
-                  onPress={() => {
-                    if (localPrefs.units !== 'metric') {
-                      setLocalPrefs((prev) => ({ ...prev, units: 'metric' }));
-                      ctx.setPrefs({ ...localPrefs, units: 'metric' });
-                    }
-                  }}
-                  style={[styles.unitToggleBtn, localPrefs.units === 'metric' && styles.unitToggleBtnActive]}
-                >
-                  <Text style={[styles.unitToggleText, localPrefs.units === 'metric' && styles.unitToggleTextActive]}>km</Text>
-                </Pressable>
-              </View>
             </View>
             {localRouteStyle === 'point-to-point' ? (
               <DistanceSlider
@@ -823,31 +829,6 @@ export default function SetupScreen() {
             )}
           </View>
 
-          {/* Preferences */}
-          <View style={styles.section}>
-            <Text style={styles.sectionLabel}>ROUTE PREFERENCES</Text>
-            <Pressable
-              onPress={toggleTraffic}
-              style={[
-                styles.prefPill,
-                localPrefs.lowTraffic ? styles.prefPillActive : styles.prefPillInactive,
-              ]}
-            >
-              <Ionicons
-                name={localPrefs.lowTraffic ? 'checkmark-circle' : 'car-outline'}
-                size={16}
-                color={localPrefs.lowTraffic ? Colors.primary : Colors.mutedForeground}
-              />
-              <Text
-                style={[
-                  styles.prefPillLabel,
-                  { color: localPrefs.lowTraffic ? Colors.primary : Colors.mutedForeground },
-                ]}
-              >
-                Avoid Traffic
-              </Text>
-            </Pressable>
-          </View>
         </View>
 
         {/* Fixed button area at bottom */}
@@ -908,7 +889,7 @@ export default function SetupScreen() {
 
       {/* Bottom Tab Bar */}
       <BottomTabBar />
-    </View>
+    </KeyboardAvoidingView>
   );
 }
 
@@ -992,28 +973,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     marginBottom: 6,
-  },
-  unitToggle: {
-    flexDirection: 'row',
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    overflow: 'hidden',
-  },
-  unitToggleBtn: {
-    paddingVertical: 3,
-    paddingHorizontal: 10,
-  },
-  unitToggleBtnActive: {
-    backgroundColor: Colors.primary + '1A',
-  },
-  unitToggleText: {
-    fontFamily: Fonts.sansBold,
-    fontSize: 10,
-    color: Colors.mutedForeground,
-  },
-  unitToggleTextActive: {
-    color: Colors.primary,
   },
   locationGroup: {
     borderRadius: 14,
@@ -1172,28 +1131,6 @@ const styles = StyleSheet.create({
     fontFamily: Fonts.sansSemiBold,
     fontSize: 10,
     color: Colors.destructive,
-  },
-  prefPill: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    alignSelf: 'flex-start',
-    gap: 6,
-    borderRadius: 20,
-    borderWidth: 1,
-    paddingVertical: 10,
-    paddingHorizontal: 16,
-  },
-  prefPillActive: {
-    borderColor: Colors.primary + '66',
-    backgroundColor: Colors.primary + '1A',
-  },
-  prefPillInactive: {
-    borderColor: Colors.border,
-    backgroundColor: Colors.card,
-  },
-  prefPillLabel: {
-    fontFamily: Fonts.sansSemiBold,
-    fontSize: 13,
   },
   routeTypeRow: {
     flexDirection: 'row',

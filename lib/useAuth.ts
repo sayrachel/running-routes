@@ -119,7 +119,6 @@ export function useAuth() {
         responseType: AuthSession.ResponseType.IdToken,
         extraParams: {
           nonce: hashedNonce,
-          response_mode: 'form_post',
         },
       });
 

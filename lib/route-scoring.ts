@@ -55,20 +55,58 @@ export function computeGreenSpaceProximity(
 }
 
 /**
+ * Compute what fraction of route points are near bike lanes, cycleways,
+ * footways, or other car-free paths. These are ideal running surfaces.
+ *
+ * @param routePoints - The full route polyline
+ * @param greenSpaces - Enriched green spaces (includes cycleways/footways/paths)
+ * @param proximityKm - Distance threshold in km (default 0.15 = 150m)
+ * @returns Score between 0 and 1 (fraction of sampled points near a run-friendly path)
+ */
+export function computeRunPathProximity(
+  routePoints: RoutePoint[],
+  greenSpaces: GreenSpace[],
+  proximityKm: number = 0.15
+): number {
+  // Filter to only bike lanes, footways, paths, and designated routes
+  const runPaths = greenSpaces.filter(
+    (gs) => gs.kind === 'cycleway' || gs.kind === 'footway' || gs.kind === 'path' || gs.kind === 'route'
+  );
+  if (routePoints.length === 0 || runPaths.length === 0) return 0;
+
+  const step = Math.max(1, Math.floor(routePoints.length / Math.ceil(routePoints.length / 20)));
+  let nearCount = 0;
+  let sampleCount = 0;
+
+  for (let i = 0; i < routePoints.length; i += step) {
+    sampleCount++;
+    const rp = routePoints[i];
+    for (const rp2 of runPaths) {
+      if (haversineDistance(rp, rp2.point) <= proximityKm) {
+        nearCount++;
+        break;
+      }
+    }
+  }
+
+  return sampleCount > 0 ? nearCount / sampleCount : 0;
+}
+
+/**
  * Score a route candidate (0–1) based on user preferences and real API data.
  *
  * Scoring weights:
- * - Avoid Traffic OFF (relaxed): 85% distance accuracy, 15% green proximity
- * - Avoid Traffic ON (strict): 40% distance accuracy, 25% quiet score, 35% green proximity
+ * - Avoid Traffic OFF (relaxed): 60% distance, 15% green proximity, 25% run-path proximity
+ * - Avoid Traffic ON (strict): 30% distance, 20% quiet, 25% green proximity, 25% run-path proximity
  *
- * @param greenSpaceProximity - Fraction of route near green spaces (0–1), default 0.5
  * @returns score between 0 and 1 (higher is better)
  */
 export function scoreRoute(
   candidate: ScoringCandidate,
   prefs: RoutePreferences,
   quietScore: number,
-  greenSpaceProximity: number = 0.5
+  greenSpaceProximity: number = 0.5,
+  runPathProximity: number = 0.5
 ): number {
   // Distance accuracy score (same for both modes)
   const distRatio = candidate.targetDistanceKm > 0
@@ -77,10 +115,10 @@ export function scoreRoute(
   const distScore = Math.max(1.0 - Math.abs(1.0 - distRatio) * 4, 0);
 
   if (prefs.lowTraffic) {
-    // Strict mode: 40% distance, 25% quiet, 35% green proximity
-    return 0.40 * distScore + 0.25 * quietScore + 0.35 * greenSpaceProximity;
+    // Strict mode: 30% distance, 20% quiet, 25% green, 25% run-path
+    return 0.30 * distScore + 0.20 * quietScore + 0.25 * greenSpaceProximity + 0.25 * runPathProximity;
   } else {
-    // Relaxed mode: 85% distance, 15% green proximity
-    return 0.85 * distScore + 0.15 * greenSpaceProximity;
+    // Relaxed mode: 60% distance, 15% green, 25% run-path
+    return 0.60 * distScore + 0.15 * greenSpaceProximity + 0.25 * runPathProximity;
   }
 }

@@ -1,7 +1,7 @@
 import type { RoutePoint, GeneratedRoute, RoutePreferences } from './route-generator';
 import { fetchQuietScore, fetchGreenSpacesEnriched } from './overpass';
 import type { GreenSpace } from './overpass';
-import { scoreRoute, computeGreenSpaceProximity } from './route-scoring';
+import { scoreRoute, computeGreenSpaceProximity, computeRunPathProximity } from './route-scoring';
 
 const OSRM_BASE = 'https://router.project-osrm.org/route/v1/foot';
 const CANDIDATE_COUNT = 3;
@@ -216,9 +216,9 @@ export function calculateSearchRadius(
 ): number {
   let radius: number;
   if (routeType === 'loop') {
-    radius = distanceKm * 0.8;
+    radius = distanceKm * 1.0;
   } else if (routeType === 'out-and-back') {
-    radius = distanceKm * 0.6;
+    radius = distanceKm * 0.8;
   } else if (end) {
     radius = haversineDistance(center, end) * 0.6;
   } else {
@@ -263,6 +263,9 @@ export function scoreGreenSpace(
   // Kind bonuses
   if (gs.kind === 'park' || gs.kind === 'nature') score += 3;
   if (gs.kind === 'route') score += strategy === 'named-paths' ? 5 : 2;
+  // Bike lanes and footways are ideal running surfaces — boost them
+  if (gs.kind === 'cycleway') score += 4;
+  if (gs.kind === 'footway' || gs.kind === 'path') score += 3;
 
   return score;
 }
@@ -289,13 +292,20 @@ function selectGreenSpaceWaypoints(
   variant: number,
   strategy: CandidateStrategy
 ): { waypoints: RoutePoint[]; anchors: GreenSpace[] } | null {
-  // Max distance from center: use loop geometry (circumference-based radius × 2)
-  // This prevents waypoints from reaching into disparate regions
+  // Max distance from center: a runner doing an N km loop can reasonably
+  // reach N*0.55 km from start. Use whichever is larger between the geometric
+  // radius and the distance-based limit so major parks (whose Overpass center
+  // may be far from their nearest edge) are reachable.
   const loopRadius = targetDistanceKm / (2 * Math.PI * ROUTING_OVERHEAD);
-  const maxRadius = loopRadius * 3.0;
+  const maxRadius = Math.max(loopRadius * 4.0, targetDistanceKm * 0.55);
 
   // Annotate each green space with bearing and distance from center
-  const annotated = greenSpaces.map((gs) => {
+  // Only use parks, gardens, and nature reserves as loop waypoints —
+  // bike lanes and footways should influence scoring, not force OSRM detours
+  const parkKinds = new Set(['park', 'garden', 'nature']);
+  const annotated = greenSpaces
+    .filter((gs) => parkKinds.has(gs.kind) || (gs.kind === 'route' && gs.name))
+    .map((gs) => {
     // Variant-dependent perturbation for refresh diversity
     const perturbation = Math.sin(variant * 1000 + gs.point.lat * 10000 + gs.point.lng * 10000) * 2;
     return {
@@ -308,9 +318,10 @@ function selectGreenSpaceWaypoints(
   .filter((a) => a.dist <= maxRadius)
   .filter((a) => isAccessibleFromCenter(center, a.gs.point, greenSpaces));
 
-  if (annotated.length < 3) return null;
+  if (annotated.length < 2) return null;
 
-  const numSectors = 5 + (variant % 2);
+  // Use fewer sectors for shorter routes to avoid clustering
+  const numSectors = targetDistanceKm < 15 ? 3 : 4 + (variant % 2);
   const sectorSize = 360 / numSectors;
   const sectorOffset = (variant * 60) % 360;
 
@@ -362,8 +373,8 @@ function selectGreenSpaceWaypoints(
 
   if (picks.length < (strict ? 3 : 2)) return null;
 
-  // In relaxed mode, cap at 4 green-space waypoints max
-  const maxGreenWaypoints = strict ? picks.length : Math.min(picks.length, 4);
+  // Cap at 3 waypoints max — more than 3 creates zigzag block-looping
+  const maxGreenWaypoints = Math.min(picks.length, 3);
   const selectedPicks = picks
     .sort((a, b) => b.dist - a.dist) // drop farthest first if over cap
     .slice(picks.length - maxGreenWaypoints);
@@ -371,18 +382,44 @@ function selectGreenSpaceWaypoints(
   // Order by bearing to form a loop
   selectedPicks.sort((a, b) => a.bearing - b.bearing);
 
-  // Remove waypoints too close to center (< 300m) — prevents tiny blocks near start/end
+  // Remove waypoints too close to center — prevents backtracking near start/end
+  const minCenterDist = Math.max(0.8, targetDistanceKm * 0.12);
   for (let i = selectedPicks.length - 1; i >= 0; i--) {
-    if (selectedPicks[i].dist < 0.3) {
+    if (selectedPicks[i].dist < minCenterDist) {
       selectedPicks.splice(i, 1);
     }
   }
 
-  // Remove consecutive waypoints that are too close (< 400m) — prevents square-block routing
+  // Remove ANY pair of waypoints that are too close (not just consecutive) —
+  // in a city grid, two waypoints 500m apart on parallel streets cause
+  // OSRM to zigzag between them creating rectangular block loops
+  const minWaypointSpacing = Math.max(1.0, targetDistanceKm * 0.12);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (let i = 0; i < selectedPicks.length; i++) {
+      for (let j = i + 1; j < selectedPicks.length; j++) {
+        if (haversineDistance(selectedPicks[i].gs.point, selectedPicks[j].gs.point) < minWaypointSpacing) {
+          // Keep the one with larger area
+          if (selectedPicks[j].gs.areaSize >= selectedPicks[i].gs.areaSize) {
+            selectedPicks.splice(i, 1);
+          } else {
+            selectedPicks.splice(j, 1);
+          }
+          changed = true;
+          break;
+        }
+      }
+      if (changed) break;
+    }
+  }
+
+  // Remove consecutive waypoints with too-similar bearings — prevents
+  // the half-circle lollipop pattern where the route goes out and back on the same side
   for (let i = selectedPicks.length - 1; i > 0; i--) {
-    if (haversineDistance(selectedPicks[i].gs.point, selectedPicks[i - 1].gs.point) < 0.4) {
-      // Keep the one with larger area (more likely a significant park)
-      if (selectedPicks[i].gs.areaSize >= selectedPicks[i - 1].gs.areaSize) {
+    if (angleDiff(selectedPicks[i].bearing, selectedPicks[i - 1].bearing) < 45) {
+      // Keep the one farther from center for a wider loop
+      if (selectedPicks[i].dist >= selectedPicks[i - 1].dist) {
         selectedPicks.splice(i - 1, 1);
       } else {
         selectedPicks.splice(i, 1);
@@ -399,13 +436,10 @@ function selectGreenSpaceWaypoints(
   ];
   const anchors = selectedPicks.map((p) => p.gs);
 
-  // Estimate circuit distance and adjust (up to 3 iterations)
-  for (let iter = 0; iter < 3; iter++) {
+  // If the loop is way too long, drop the farthest waypoint
+  if (waypoints.length > 4) {
     const loopDist = estimateCircuitDistance(waypoints);
-    const ratio = loopDist / targetDistanceKm;
-
-    if (ratio > 1.3 && waypoints.length > 4) {
-      // Too long — drop the farthest waypoint from center (not start/end)
+    if (loopDist / targetDistanceKm > 1.5) {
       let farthestIdx = 1;
       let farthestDist = 0;
       for (let i = 1; i < waypoints.length - 1; i++) {
@@ -417,32 +451,6 @@ function selectGreenSpaceWaypoints(
       }
       waypoints.splice(farthestIdx, 1);
       anchors.splice(farthestIdx - 1, 1);
-    } else if (ratio < 0.7) {
-      // Too short — add a geometric fill point in an underserved direction
-      // Only use directions that don't cross barriers
-      const usedBearings = waypoints.slice(1, -1).map((wp) => bearingFrom(center, wp));
-      let bestGap = 0;
-      let bestBearing = 0;
-      for (let b = 0; b < 360; b += 30) {
-        const minDiff = usedBearings.reduce((min, ub) => Math.min(min, angleDiff(b, ub)), 360);
-        if (minDiff > bestGap) {
-          bestGap = minDiff;
-          bestBearing = b;
-        }
-      }
-      const fillRadius = (targetDistanceKm / (2 * Math.PI * ROUTING_OVERHEAD)) * 0.9;
-      const fillPoint = destinationPoint(center, bestBearing, fillRadius);
-      // Only add if the fill point is accessible (no barrier crossing)
-      if (!isAccessibleFromCenter(center, fillPoint, greenSpaces)) continue;
-      // Insert in bearing order
-      const insertBearing = bestBearing;
-      let insertIdx = 1;
-      for (let i = 1; i < waypoints.length - 1; i++) {
-        if (bearingFrom(center, waypoints[i]) < insertBearing) insertIdx = i + 1;
-      }
-      waypoints.splice(insertIdx, 0, fillPoint);
-    } else {
-      break; // Distance is acceptable
     }
   }
 
@@ -571,10 +579,12 @@ function generateGreenSpacePointToPoint(
   strategy: CandidateStrategy
 ): { waypoints: RoutePoint[]; anchors: GreenSpace[] } {
   const totalDist = haversineDistance(start, end);
-  const corridorWidth = totalDist * 0.3; // km either side of the line
+  // Narrow corridor — only detour for green spaces very close to the direct path
+  const corridorWidth = Math.min(totalDist * 0.12, 0.5); // km, capped at 500m
 
-  // Filter green spaces near the start→end line
+  // Only consider named parks or large green spaces worth detouring for
   const nearLine = greenSpaces
+    .filter((gs) => gs.name || gs.areaSize > 0.01)
     .map((gs) => {
       // Project onto the start→end line and measure perpendicular distance
       const t = Math.max(0, Math.min(1,
@@ -587,35 +597,18 @@ function generateGreenSpacePointToPoint(
       const perpDist = haversineDistance(gs.point, { lat: projLat, lng: projLng });
       return { gs, t, perpDist, score: scoreGreenSpace(gs, strategy, prefs.lowTraffic) };
     })
-    .filter((a) => a.perpDist <= corridorWidth && a.t > 0.1 && a.t < 0.9)
-    .sort((a, b) => a.t - b.t);
+    .filter((a) => a.perpDist <= corridorWidth && a.t > 0.15 && a.t < 0.85)
+    .sort((a, b) => b.score - a.score);
 
-  if (nearLine.length < 2) {
-    // Fallback to geometric
-    const fallbackWaypoints = generatePointToPointWaypoints(
-      start, end, prefs, variant, greenSpaces.map((gs) => gs.point)
-    );
-    return { waypoints: fallbackWaypoints, anchors: [] };
+  if (nearLine.length === 0) {
+    // No significant green spaces along the path — use direct route
+    return { waypoints: [start, end], anchors: [] };
   }
 
-  // Pick 2–3 intermediate waypoints evenly spaced along the line
-  const numIntermediate = Math.min(3, nearLine.length);
-  const selected: typeof nearLine = [];
-  for (let i = 0; i < numIntermediate; i++) {
-    const targetT = (i + 1) / (numIntermediate + 1);
-    let best = nearLine[0];
-    let bestDelta = Infinity;
-    for (const nl of nearLine) {
-      if (selected.some((s) => s.gs === nl.gs)) continue;
-      const delta = Math.abs(nl.t - targetT);
-      if (delta < bestDelta) {
-        bestDelta = delta;
-        best = nl;
-      }
-    }
-    selected.push(best);
-  }
-
+  // Pick at most 1–2 high-scoring waypoints to keep the route direct
+  const maxWaypoints = totalDist > 5 ? 2 : 1;
+  const selected = nearLine.slice(0, maxWaypoints);
+  // Re-sort by position along the line
   selected.sort((a, b) => a.t - b.t);
 
   return {
@@ -720,37 +713,24 @@ async function fetchOSRMRoute(waypoints: RoutePoint[]): Promise<OSRMRoute | null
 }
 
 /**
- * Generate waypoints for a loop route (legacy geometric fallback).
+ * Generate waypoints for a loop route (geometric fallback).
+ * Uses only 2 waypoints on opposite sides to create a clean oval —
+ * more waypoints in a city grid cause rectangular block-looping zigzags.
  */
 function generateLoopWaypoints(
   center: RoutePoint,
   distanceKm: number,
-  prefs: RoutePreferences,
+  _prefs: RoutePreferences,
   variant: number,
-  greenSpaces: RoutePoint[] = []
+  _greenSpaces: RoutePoint[] = []
 ): RoutePoint[] {
-  const baseRadius = distanceKm / (2 * Math.PI * ROUTING_OVERHEAD);
-  const numWaypoints = 5 + (variant % 2);
-  const startBearing = variant * 73 + (prefs.lowTraffic ? 45 : 0);
-  const waypoints: RoutePoint[] = [center];
-  const maxSnapDistance = distanceKm * 0.25;
+  const radius = distanceKm / (2 * Math.PI * ROUTING_OVERHEAD);
+  const bearing = (variant * 73) % 360;
 
-  for (let i = 0; i < numWaypoints; i++) {
-    const angle = startBearing + (360 / numWaypoints) * i;
-    let radiusFactor: number;
-    radiusFactor = 0.9 + Math.sin(variant * 1000 + i * 2.4) * 0.15;
-    const scenicMultiplier = 0.95;
-    const bearingOffset = prefs.lowTraffic
-      ? Math.sin(variant * 2000 + i * 3.7) * 20
-      : Math.sin(variant * 2000 + i * 3.7) * 8;
-    const radius = baseRadius * radiusFactor * scenicMultiplier;
-    let point = destinationPoint(center, angle + bearingOffset, radius);
-    point = selectWaypoint(point, greenSpaces, maxSnapDistance);
-    waypoints.push(point);
-  }
+  const wp1 = destinationPoint(center, bearing, radius * 1.2);
+  const wp2 = destinationPoint(center, (bearing + 180) % 360, radius * 1.2);
 
-  waypoints.push(center);
-  return waypoints;
+  return [center, wp1, wp2, center];
 }
 
 /**
@@ -791,37 +771,19 @@ function generateOutAndBackWaypoints(
 /**
  * Generate waypoints for a point-to-point route (legacy geometric fallback).
  */
+/**
+ * Generate waypoints for a point-to-point route (legacy geometric fallback).
+ * Returns a direct route — intermediate geometric points cause unnecessary
+ * block-looping since they aren't parks or green spaces.
+ */
 function generatePointToPointWaypoints(
   start: RoutePoint,
   end: RoutePoint,
-  prefs: RoutePreferences,
-  variant: number,
-  greenSpaces: RoutePoint[] = []
+  _prefs: RoutePreferences,
+  _variant: number,
+  _greenSpaces: RoutePoint[] = []
 ): RoutePoint[] {
-  const numWaypoints = 2;
-  const waypoints: RoutePoint[] = [start];
-  const maxSnapDistance = haversineDistance(start, end) * 0.2;
-
-  for (let i = 1; i <= numWaypoints; i++) {
-    const t = i / (numWaypoints + 1);
-    const baseLat = start.lat + (end.lat - start.lat) * t;
-    const baseLng = start.lng + (end.lng - start.lng) * t;
-    const dLat = end.lat - start.lat;
-    const dLng = end.lng - start.lng;
-    const perpLat = -dLng;
-    const perpLng = dLat;
-    const offsetScale = 0.05;
-    const offset = Math.sin(variant * 7000 + i * 123.7) * offsetScale;
-    let point: RoutePoint = {
-      lat: baseLat + perpLat * offset,
-      lng: baseLng + perpLng * offset,
-    };
-    point = selectWaypoint(point, greenSpaces, maxSnapDistance);
-    waypoints.push(point);
-  }
-
-  waypoints.push(end);
-  return waypoints;
+  return [start, end];
 }
 
 // ---------------------------------------------------------------------------
@@ -898,9 +860,13 @@ export async function generateOSRMRoutes(
   const radiusKm = calculateSearchRadius(routeType, distanceKm, center, end);
   const greenSpaces = await fetchGreenSpacesEnriched(center, radiusKm);
 
-  // Step 2: Generate candidate waypoint sets using green-space-first approach
+  // Step 2: Generate candidate waypoint sets with diversity
+  // Each candidate excludes parks used by previous candidates so routes
+  // go through genuinely different areas (e.g., route 1 via Central Park,
+  // route 2 via a different park, route 3 via yet another).
   const timeSeed = Date.now() % 100000;
   const candidates: { variant: number; waypoints: RoutePoint[]; anchors: GreenSpace[] }[] = [];
+  const usedParkPoints: RoutePoint[] = []; // Parks already used by earlier candidates
 
   for (let i = 0; i < CANDIDATE_COUNT; i++) {
     const variant = timeSeed + i + 1;
@@ -908,18 +874,36 @@ export async function generateOSRMRoutes(
     let waypoints: RoutePoint[];
     let anchors: GreenSpace[] = [];
 
+    // Filter out parks already used by previous candidates
+    const availableGreenSpaces = i === 0
+      ? greenSpaces
+      : greenSpaces.filter((gs) =>
+          !usedParkPoints.some((used) => haversineDistance(used, gs.point) < 0.5)
+        );
+
     if (routeType === 'point-to-point' && end) {
-      const result = generateGreenSpacePointToPoint(center, end, prefs, variant, greenSpaces, strategy);
-      waypoints = result.waypoints;
-      anchors = result.anchors;
+      if (i === 0) {
+        // First candidate: direct route — let OSRM find the shortest path
+        waypoints = [center, end];
+      } else {
+        // Other candidates: route via green spaces for scenic variety
+        const result = generateGreenSpacePointToPoint(center, end, prefs, variant, availableGreenSpaces, strategy);
+        waypoints = result.waypoints;
+        anchors = result.anchors;
+      }
     } else if (routeType === 'out-and-back') {
-      const result = generateGreenSpaceOutAndBack(center, distanceKm, prefs, variant, greenSpaces, strategy);
+      const result = generateGreenSpaceOutAndBack(center, distanceKm, prefs, variant, availableGreenSpaces, strategy);
       waypoints = result.waypoints;
       anchors = result.anchors;
     } else {
-      const result = generateGreenSpaceLoop(center, distanceKm, prefs, variant, greenSpaces, strategy);
+      const result = generateGreenSpaceLoop(center, distanceKm, prefs, variant, availableGreenSpaces, strategy);
       waypoints = result.waypoints;
       anchors = result.anchors;
+    }
+
+    // Track which parks this candidate used so later candidates avoid them
+    for (const a of anchors) {
+      usedParkPoints.push(a.point);
     }
 
     // Apply water crossing removal before OSRM
@@ -942,7 +926,11 @@ export async function generateOSRMRoutes(
       const distKm = osrmRoute.distance / 1000;
       const estimatedTime = Math.round(osrmRoute.duration / 60);
       const distRatio = distanceKm > 0 ? distKm / distanceKm : 1;
-      if (distRatio > 1.5 || distRatio < 0.4) {
+      // Point-to-point routes go to a user-chosen destination, so be very
+      // lenient on distance — the route must exist even if roads are indirect.
+      const maxRatio = routeType === 'point-to-point' ? 3.0 : 1.5;
+      const minRatio = routeType === 'point-to-point' ? 0.2 : 0.4;
+      if (distRatio > maxRatio || distRatio < minRatio) {
         console.log(`[RouteScoring] Rejecting candidate ${i}: dist=${distKm.toFixed(2)}km (ratio=${distRatio.toFixed(2)}, target=${distanceKm.toFixed(2)}km)`);
         continue;
       }
@@ -954,7 +942,9 @@ export async function generateOSRMRoutes(
         return sum + haversineDistance(wp[j - 1], p);
       }, 0);
       const fallbackRatio = distanceKm > 0 ? totalDist / distanceKm : 1;
-      if (fallbackRatio > 1.5 || fallbackRatio < 0.4) {
+      const maxFallbackRatio = routeType === 'point-to-point' ? 3.0 : 1.5;
+      const minFallbackRatio = routeType === 'point-to-point' ? 0.2 : 0.4;
+      if (fallbackRatio > maxFallbackRatio || fallbackRatio < minFallbackRatio) {
         console.log(`[RouteScoring] Rejecting fallback ${i}: dist=${totalDist.toFixed(2)}km (ratio=${fallbackRatio.toFixed(2)})`);
         continue;
       }
@@ -970,37 +960,89 @@ export async function generateOSRMRoutes(
     }
   }
 
-  // Step 4: Fetch preference data and green proximity in parallel
+  // Step 3.5: If all candidates were rejected, fall back to a direct route
+  if (resolved.length === 0) {
+    console.log('[RouteScoring] All candidates rejected — generating direct fallback');
+    let fallbackWaypoints: RoutePoint[];
+    if (routeType === 'point-to-point' && end) {
+      // Simple direct route from start to end
+      fallbackWaypoints = [center, end];
+    } else if (routeType === 'out-and-back') {
+      const bearing = (Date.now() % 360);
+      const halfDist = distanceKm / (2 * ROUTING_OVERHEAD);
+      const turnaround = destinationPoint(center, bearing, halfDist);
+      fallbackWaypoints = [center, turnaround, center];
+    } else {
+      // Loop fallback
+      fallbackWaypoints = generateLoopWaypoints(center, distanceKm, prefs, Date.now() % 100000, []);
+    }
+
+    const fallbackOSRM = await fetchOSRMRoute(fallbackWaypoints);
+    if (fallbackOSRM) {
+      const points = fallbackOSRM.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }));
+      resolved.push({
+        index: 0,
+        variant: 0,
+        points,
+        distKm: fallbackOSRM.distance / 1000,
+        estimatedTime: Math.round(fallbackOSRM.duration / 60),
+        fromOSRM: true,
+        anchors: [],
+      });
+    } else {
+      // Use raw waypoints as last resort
+      let totalDist = 0;
+      for (let j = 1; j < fallbackWaypoints.length; j++) {
+        totalDist += haversineDistance(fallbackWaypoints[j - 1], fallbackWaypoints[j]);
+      }
+      resolved.push({
+        index: 0,
+        variant: 0,
+        points: fallbackWaypoints,
+        distKm: totalDist,
+        estimatedTime: Math.round(totalDist * 6),
+        fromOSRM: false,
+        anchors: [],
+      });
+    }
+  }
+
+  // Step 4: Fetch preference data, green proximity, and run-path proximity in parallel
   const preferenceData = await Promise.all(
     resolved.map(async (candidate) => {
-      const [quietScore, greenProximity] = await Promise.all([
-        prefs.lowTraffic ? fetchQuietScore(candidate.points) : Promise.resolve(0.5),
+      const [quietScore, greenProximity, runPathProximity] = await Promise.all([
+        fetchQuietScore(candidate.points),
         Promise.resolve(computeGreenSpaceProximity(candidate.points, greenSpaces)),
+        Promise.resolve(computeRunPathProximity(candidate.points, greenSpaces)),
       ]);
-      return { quietScore, greenProximity };
+      return { quietScore, greenProximity, runPathProximity };
     })
   );
 
   // Step 5: Score each candidate
   const scored = resolved.map((candidate, i) => {
-    const { quietScore, greenProximity } = preferenceData[i];
+    const { quietScore, greenProximity, runPathProximity } = preferenceData[i];
     const score = scoreRoute(
       { distanceKm: candidate.distKm, targetDistanceKm: distanceKm },
       prefs,
       quietScore,
-      greenProximity
+      greenProximity,
+      runPathProximity
     );
 
     console.log(
       `[RouteScoring] Candidate ${i}: dist=${candidate.distKm.toFixed(2)}km, ` +
-      `quiet=${quietScore.toFixed(2)}, green=${greenProximity.toFixed(2)}, score=${score.toFixed(3)}`
+      `quiet=${quietScore.toFixed(2)}, green=${greenProximity.toFixed(2)}, ` +
+      `runPath=${runPathProximity.toFixed(2)}, score=${score.toFixed(3)}`
     );
 
     return { candidate, score, quietScore };
   });
 
-  // Step 6: Sort by score (highest first) and take the top `count`
-  scored.sort((a, b) => b.score - a.score);
+  // Step 6: Return candidates in generation order (not sorted by score).
+  // Candidate 0 uses the best parks, candidate 1 excludes those parks
+  // and finds alternatives, candidate 2 excludes both. This gives the user
+  // genuinely different route options rather than minor variations.
   const topCandidates = scored.slice(0, count);
 
   // Build final GeneratedRoute objects

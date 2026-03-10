@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, Pressable, ScrollView, StyleSheet, Image, Dimensions, Share, Linking, ActivityIndicator } from 'react-native';
-import * as Clipboard from 'expo-clipboard';
+import { View, Text, Pressable, ScrollView, StyleSheet, Dimensions, Share, ActivityIndicator, Linking } from 'react-native';
+
 import { useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
@@ -17,7 +17,7 @@ import type { RunRecord } from '@/lib/types';
 import { Colors, Fonts } from '@/lib/theme';
 import { distanceUnit, paceUnit } from '@/lib/units';
 
-export type DrawerView = 'profile' | 'history' | 'favorites' | 'run-detail' | 'contact' | 'terms' | 'privacy';
+export type DrawerView = 'profile' | 'history' | 'favorites' | 'run-detail' | 'contact' | 'terms' | 'privacy' | 'units';
 
 const SCREEN_WIDTH = Dimensions.get('window').width;
 
@@ -116,7 +116,7 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
     if (view === 'run-detail') {
       setView('history');
       setSelectedRun(null);
-    } else if (view === 'terms' || view === 'privacy') {
+    } else if (view === 'terms' || view === 'privacy' || view === 'units' || view === 'contact') {
       setView('profile');
     } else if (view !== 'profile' && initialView && initialView !== 'profile') {
       // Opened directly to history/favorites — back closes the drawer
@@ -126,21 +126,6 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
     } else {
       onClose();
     }
-  };
-
-  const SUPPORT_EMAIL = 'support@runroutes.app';
-
-  const [emailCopied, setEmailCopied] = useState(false);
-
-  const handleCopyEmail = async () => {
-    await Clipboard.setStringAsync(SUPPORT_EMAIL);
-    setEmailCopied(true);
-    setTimeout(() => setEmailCopied(false), 2000);
-  };
-
-  const handleOpenGmail = () => {
-    const gmailUrl = `https://mail.google.com/mail/?view=cm&to=${SUPPORT_EMAIL}&su=Running%20Routes%20Support`;
-    Linking.openURL(gmailUrl);
   };
 
   const handleLogout = async () => {
@@ -177,7 +162,7 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
 
   if (!mounted) return null;
 
-  const viewTitle = view === 'history' ? 'History' : view === 'favorites' ? 'Favorites' : view === 'contact' ? 'Contact Us' : view === 'terms' ? 'Terms of Service' : view === 'privacy' ? 'Privacy Policy' : view === 'run-detail' && selectedRun ? selectedRun.routeName : 'Settings';
+  const viewTitle = view === 'history' ? 'History' : view === 'favorites' ? 'Favorites' : view === 'contact' ? 'Contact Us' : view === 'terms' ? 'Terms of Service' : view === 'privacy' ? 'Privacy Policy' : view === 'units' ? 'Units' : view === 'run-detail' && selectedRun ? selectedRun.routeName : 'Settings';
 
   const formatRunDate = (timestamp: number) => {
     const d = new Date(timestamp);
@@ -259,17 +244,8 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
           >
             {/* Profile */}
             <View style={styles.profileSection}>
-              <View style={styles.avatar}>
-                {ctx.user?.avatar ? (
-                  <Image source={{ uri: ctx.user.avatar }} style={styles.avatarImage} />
-                ) : (
-                  <Ionicons name="person" size={40} color={Colors.primary} />
-                )}
-              </View>
               <Text style={styles.userEmail}>{ctx.user?.email ?? ''}</Text>
             </View>
-
-            <View style={styles.divider} />
 
             {/* Runs */}
             <Text style={styles.sectionLabel}>RUNS</Text>
@@ -283,6 +259,16 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
               <Pressable style={styles.menuRow} onPress={() => setView('favorites')}>
                 <Ionicons name="heart-outline" size={20} color={Colors.mutedForeground} />
                 <Text style={styles.menuLabel}>Favorites</Text>
+                <Ionicons name="chevron-forward" size={16} color={Colors.mutedForeground} />
+              </Pressable>
+            </View>
+
+            {/* Preferences */}
+            <Text style={styles.sectionLabel}>PREFERENCES</Text>
+            <View style={styles.menuSection}>
+              <Pressable style={styles.menuRow} onPress={() => setView('units')}>
+                <Ionicons name="speedometer-outline" size={20} color={Colors.mutedForeground} />
+                <Text style={styles.menuLabel}>Units</Text>
                 <Ionicons name="chevron-forward" size={16} color={Colors.mutedForeground} />
               </Pressable>
             </View>
@@ -354,6 +340,35 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
           </ScrollView>
         ) : view === 'run-detail' ? (
           renderRunDetail()
+        ) : view === 'units' ? (
+          <ScrollView
+            style={styles.scrollContent}
+            contentContainerStyle={styles.scrollContentInner}
+            showsVerticalScrollIndicator={false}
+          >
+            <Text style={styles.sectionLabel}>UNITS</Text>
+            <View style={styles.menuSection}>
+              <Pressable
+                style={[styles.menuRow, ctx.prefs.units === 'imperial' && styles.menuRowSelected]}
+                onPress={() => ctx.setPrefs({ ...ctx.prefs, units: 'imperial' })}
+              >
+                <Text style={styles.menuLabel}>Miles</Text>
+                {ctx.prefs.units === 'imperial' && (
+                  <Ionicons name="checkmark" size={20} color={Colors.primary} />
+                )}
+              </Pressable>
+
+              <Pressable
+                style={[styles.menuRow, ctx.prefs.units === 'metric' && styles.menuRowSelected]}
+                onPress={() => ctx.setPrefs({ ...ctx.prefs, units: 'metric' })}
+              >
+                <Text style={styles.menuLabel}>Kilometers</Text>
+                {ctx.prefs.units === 'metric' && (
+                  <Ionicons name="checkmark" size={20} color={Colors.primary} />
+                )}
+              </Pressable>
+            </View>
+          </ScrollView>
         ) : view === 'contact' ? (
           <ScrollView
             style={styles.scrollContent}
@@ -361,17 +376,19 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
             showsVerticalScrollIndicator={false}
           >
             <Text style={styles.contactDescription}>
-              Our customer service team is here to help you with any questions or issues you might have with Running Routes.
+              Have questions, feedback, or need help? Reach out and we'll get back to you as soon as possible.
             </Text>
 
-            <Text style={styles.sectionLabel}>EMAIL SUPPORT</Text>
+            <Text style={styles.sectionLabel}>EMAIL</Text>
             <View style={styles.contactEmailCard}>
               <Ionicons name="mail-outline" size={20} color={Colors.primary} />
-              <Text style={styles.contactEmail}>{SUPPORT_EMAIL}</Text>
-              <Pressable onPress={handleCopyEmail} hitSlop={8}>
-                <Ionicons name={emailCopied ? "checkmark-circle" : "copy-outline"} size={20} color={emailCopied ? Colors.primary : Colors.mutedForeground} />
-              </Pressable>
-              <Pressable onPress={handleOpenGmail} hitSlop={8}>
+              <Text style={styles.contactEmail} selectable>support@runroutes.app</Text>
+              <Pressable
+                hitSlop={8}
+                onPress={() => {
+                  Linking.openURL('mailto:support@runroutes.app?subject=Running%20Routes%20Support');
+                }}
+              >
                 <Ionicons name="open-outline" size={20} color={Colors.mutedForeground} />
               </Pressable>
             </View>
@@ -451,7 +468,7 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
 
             <Text style={styles.legalHeading}>14. Contact</Text>
             <Text style={styles.legalBody}>
-              If you have any questions, concerns, or requests regarding these Terms of Service, please contact us at {SUPPORT_EMAIL}.
+              If you have any questions, concerns, or requests regarding these Terms of Service, please reach out through the App's feedback channels.
             </Text>
           </ScrollView>
         ) : view === 'privacy' ? (
@@ -537,12 +554,12 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
               {'\u2022'} The right to request deletion of your data{'\n'}
               {'\u2022'} The right to withdraw consent for data processing{'\n'}
               {'\u2022'} The right to data portability{'\n\n'}
-              To exercise any of these rights, please contact us at {SUPPORT_EMAIL}. We will respond to your request within 30 days.
+              To exercise any of these rights, you can delete your account directly within the App. We will respond to your request within 30 days.
             </Text>
 
             <Text style={styles.legalHeading}>9. Children's Privacy</Text>
             <Text style={styles.legalBody}>
-              The App is not directed to children under the age of 13. We do not knowingly collect personal information from children under 13. If we learn that we have collected personal information from a child under 13 without parental consent, we will take steps to delete that information as quickly as possible. If you believe we may have collected information from a child under 13, please contact us at {SUPPORT_EMAIL}.
+              The App is not directed to children under the age of 13. We do not knowingly collect personal information from children under 13. If we learn that we have collected personal information from a child under 13 without parental consent, we will take steps to delete that information as quickly as possible.
             </Text>
 
             <Text style={styles.legalHeading}>10. International Data Transfers</Text>
@@ -557,7 +574,7 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
 
             <Text style={styles.legalHeading}>12. Contact Us</Text>
             <Text style={styles.legalBody}>
-              If you have any questions, concerns, or requests regarding this Privacy Policy or our data practices, please contact us at {SUPPORT_EMAIL}.
+              If you have any questions, concerns, or requests regarding this Privacy Policy or our data practices, please reach out through the App's feedback channels.
             </Text>
           </ScrollView>
         ) : (
@@ -693,27 +710,13 @@ const styles = StyleSheet.create({
   },
   scrollContentInner: {
     paddingHorizontal: 20,
-    paddingTop: 20,
+    paddingTop: 8,
     paddingBottom: 40,
     gap: 10,
   },
   profileSection: {
     alignItems: 'center',
     gap: 8,
-  },
-  avatar: {
-    width: 80,
-    height: 80,
-    borderRadius: 40,
-    backgroundColor: Colors.secondary,
-    alignItems: 'center',
-    justifyContent: 'center',
-    overflow: 'hidden',
-  },
-  avatarImage: {
-    width: 80,
-    height: 80,
-    borderRadius: 40,
   },
   userName: {
     fontFamily: Fonts.sansBold,
@@ -751,11 +754,20 @@ const styles = StyleSheet.create({
     backgroundColor: Colors.card,
     padding: 16,
   },
+  menuRowSelected: {
+    borderColor: Colors.primary + '66',
+    backgroundColor: Colors.primary + '0D',
+  },
   menuLabel: {
     flex: 1,
     fontFamily: Fonts.sansSemiBold,
     fontSize: 14,
     color: Colors.foreground,
+  },
+  menuValue: {
+    fontFamily: Fonts.sans,
+    fontSize: 13,
+    color: Colors.mutedForeground,
   },
   actionsSpacer: {
     height: 40,
@@ -859,21 +871,6 @@ const styles = StyleSheet.create({
     fontFamily: Fonts.sansSemiBold,
     fontSize: 14,
     color: Colors.foreground,
-  },
-  contactButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 8,
-    backgroundColor: Colors.primary,
-    borderRadius: 16,
-    paddingVertical: 16,
-    marginTop: 12,
-  },
-  contactButtonText: {
-    fontFamily: Fonts.sansBold,
-    fontSize: 14,
-    color: Colors.primaryForeground,
   },
   runDetailDate: {
     fontFamily: Fonts.sans,

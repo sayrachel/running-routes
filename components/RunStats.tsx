@@ -13,7 +13,7 @@ interface RunStatsProps {
 
 export function RunStats({ pace, distance, time, units = 'imperial' }: RunStatsProps) {
   const paceLabel = units === 'metric' ? 'AVG PACE (/KM)' : 'AVG PACE (/MI)';
-  const distLabel = units === 'metric' ? 'DISTANCE (KM)' : 'DISTANCE (MI)';
+  const distLabel = 'DISTANCE';
 
   return (
     <View style={styles.grid}>
