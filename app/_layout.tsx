@@ -126,6 +126,7 @@ export default function RootLayout() {
           <Stack.Screen name="landing" />
           <Stack.Screen name="index" />
           <Stack.Screen name="run" />
+          <Stack.Screen name="saved" />
         </Stack>
       </AuthGate>
     </AppProvider>

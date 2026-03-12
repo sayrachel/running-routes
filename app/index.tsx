@@ -23,8 +23,7 @@ import Animated, {
 } from 'react-native-reanimated';
 import { RouteMap } from '@/components/RouteMap';
 import { ProfileDrawer } from '@/components/ProfileDrawer';
-import { FavoritePreview } from '@/components/FavoritePreview';
-import { useAppContext, type RouteStyle, type RunPreferences, type FavoriteRoute } from '@/lib/AppContext';
+import { useAppContext, type RouteStyle, type RunPreferences } from '@/lib/AppContext';
 import { distanceUnit } from '@/lib/units';
 import { generateOSRMRoutes } from '@/lib/osrm';
 import { accuracyToStrength } from '@/lib/useLocationTracking';
@@ -197,7 +196,6 @@ export default function SetupScreen() {
   }, [ctx.prefs]);
   const [hasEndLocation, setHasEndLocation] = useState(false);
   const [drawerVisible, setDrawerVisible] = useState(false);
-  const [previewFavorite, setPreviewFavorite] = useState<FavoriteRoute | null>(null);
   const [sliderActive, setSliderActive] = useState(false);
   const [generateError, setGenerateError] = useState<string | null>(null);
 
@@ -876,16 +874,7 @@ export default function SetupScreen() {
       <ProfileDrawer
         visible={drawerVisible}
         onClose={() => setDrawerVisible(false)}
-        onPreviewFavorite={setPreviewFavorite}
       />
-
-      {/* Favorite Route Preview */}
-      {previewFavorite && (
-        <FavoritePreview
-          favorite={previewFavorite}
-          onClose={() => setPreviewFavorite(null)}
-        />
-      )}
 
       {/* Bottom Tab Bar */}
       <BottomTabBar />

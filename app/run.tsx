@@ -66,6 +66,7 @@ export default function RunScreen() {
         terrain: (ctx.selectedRoute?.terrain as 'Loop' | 'Out & Back' | 'Point to Point') || 'Loop',
         lat: ctx.center.lat,
         lng: ctx.center.lng,
+        points: ctx.selectedRoute?.points,
       });
     }
   }, [ctx, isFavorited, favId, tracking.stats.totalDistanceKm]);
@@ -378,6 +379,28 @@ export default function RunScreen() {
               >
                 <Ionicons name="chevron-forward" size={14} color={Colors.mutedForeground} />
               </Pressable>
+              <Pressable onPress={handleToggleFavorite} hitSlop={8} style={styles.routeFavBtn}>
+                <Ionicons
+                  name={isFavorited ? 'heart' : 'heart-outline'}
+                  size={18}
+                  color={isFavorited ? Colors.destructive : Colors.mutedForeground}
+                />
+              </Pressable>
+            </View>
+          )}
+          {/* Favorite button when only 1 route */}
+          {ctx.routes.length === 1 && !hasStarted && (
+            <View style={styles.routeSelector}>
+              <Text style={styles.routeCounter}>
+                Route 1 of 1
+              </Text>
+              <Pressable onPress={handleToggleFavorite} hitSlop={8} style={styles.routeFavBtn}>
+                <Ionicons
+                  name={isFavorited ? 'heart' : 'heart-outline'}
+                  size={18}
+                  color={isFavorited ? Colors.destructive : Colors.mutedForeground}
+                />
+              </Pressable>
             </View>
           )}
 
@@ -545,6 +568,15 @@ const styles = StyleSheet.create({
     fontFamily: Fonts.sansMedium,
     fontSize: 12,
     color: Colors.mutedForeground,
+  },
+  routeFavBtn: {
+    position: 'absolute',
+    right: 0,
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   emptyState: {
     alignItems: 'center',

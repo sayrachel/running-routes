@@ -277,11 +277,10 @@ const styles = StyleSheet.create({
   },
   statsGrid: {
     flexDirection: 'row',
-    flexWrap: 'wrap',
     gap: 8,
   },
   statCell: {
-    width: '30%',
+    flex: 1,
     borderRadius: 12,
     borderWidth: 1,
     borderColor: Colors.border,

@@ -5,11 +5,12 @@ import { useRouter, usePathname } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { Colors, Fonts } from '@/lib/theme';
 
-type TabKey = 'plan' | 'run';
+type TabKey = 'plan' | 'run' | 'saved';
 
 const TABS: { key: TabKey; label: string; icon: keyof typeof Ionicons.glyphMap; activeIcon: keyof typeof Ionicons.glyphMap; route: string }[] = [
   { key: 'plan', label: 'Plan', icon: 'map-outline', activeIcon: 'map', route: '/' },
   { key: 'run', label: 'Run', icon: 'stats-chart-outline', activeIcon: 'stats-chart', route: '/run' },
+  { key: 'saved', label: 'Saved', icon: 'bookmark-outline', activeIcon: 'bookmark', route: '/saved' },
 ];
 
 export function BottomTabBar() {
@@ -17,15 +18,11 @@ export function BottomTabBar() {
   const router = useRouter();
   const pathname = usePathname();
 
-  const activeTab: TabKey = pathname === '/run' ? 'run' : 'plan';
+  const activeTab: TabKey = pathname === '/run' ? 'run' : pathname === '/saved' ? 'saved' : 'plan';
 
   const handleTabPress = (tab: typeof TABS[0]) => {
     if (tab.key === activeTab) return;
-    if (tab.key === 'plan') {
-      router.replace('/');
-    } else {
-      router.replace('/run');
-    }
+    router.replace(tab.route as any);
   };
 
   return (

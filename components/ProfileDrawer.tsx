@@ -247,22 +247,6 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
               <Text style={styles.userEmail}>{ctx.user?.email ?? ''}</Text>
             </View>
 
-            {/* Runs */}
-            <Text style={styles.sectionLabel}>RUNS</Text>
-            <View style={styles.menuSection}>
-              <Pressable style={styles.menuRow} onPress={() => setView('history')}>
-                <Ionicons name="time-outline" size={20} color={Colors.mutedForeground} />
-                <Text style={styles.menuLabel}>History</Text>
-                <Ionicons name="chevron-forward" size={16} color={Colors.mutedForeground} />
-              </Pressable>
-
-              <Pressable style={styles.menuRow} onPress={() => setView('favorites')}>
-                <Ionicons name="heart-outline" size={20} color={Colors.mutedForeground} />
-                <Text style={styles.menuLabel}>Favorites</Text>
-                <Ionicons name="chevron-forward" size={16} color={Colors.mutedForeground} />
-              </Pressable>
-            </View>
-
             {/* Preferences */}
             <Text style={styles.sectionLabel}>PREFERENCES</Text>
             <View style={styles.menuSection}>

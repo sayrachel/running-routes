@@ -30,15 +30,25 @@ export function FavoritePreview({ favorite, onClose }: FavoritePreviewProps) {
   const center = { lat: favorite.lat, lng: favorite.lng };
   const routeType = mapTerrain(favorite.terrain);
 
-  // Use mock generator for quick preview (synchronous, no API call)
-  const previewRoutes = generateRoutes(
-    center,
-    favorite.distance,
-    routeType === 'point-to-point' ? 'out-and-back' : routeType,
-    1,
-    ctx.prefs,
-  );
-  const previewRoute = previewRoutes[0] ?? null;
+  // Use stored points if available, otherwise fall back to mock generator
+  const previewRoute = favorite.points && favorite.points.length > 0
+    ? {
+        id: favorite.id,
+        name: favorite.routeName,
+        points: favorite.points,
+        distance: favorite.distance,
+        estimatedTime: 0,
+        elevationGain: 0,
+        terrain: favorite.terrain,
+        difficulty: 'moderate' as const,
+      }
+    : (generateRoutes(
+        center,
+        favorite.distance,
+        routeType === 'point-to-point' ? 'out-and-back' : routeType,
+        1,
+        ctx.prefs,
+      )[0] ?? null);
 
   const handleNavigateToStart = () => {
     Linking.openURL(

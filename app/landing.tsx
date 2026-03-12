@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import {
   View,
   Text,
+  Image,
   Pressable,
   StyleSheet,
   ActivityIndicator,
@@ -17,29 +18,11 @@ export default function LandingScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const ctx = useAppContext();
-  const [loading, setLoading] = useState<'google' | 'apple' | null>(null);
+  const [loading, setLoading] = useState<'apple' | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const handleSuccess = () => {
     router.replace('/');
-  };
-
-  const handleGoogleSignIn = async () => {
-    setLoading('google');
-    setError(null);
-    try {
-      const user = await ctx.signInWithGoogle();
-      if (user) {
-        handleSuccess();
-      } else {
-        setError('Sign-in was cancelled. Please try again.');
-      }
-    } catch (err) {
-      setError('Google sign-in failed. Please try again.');
-      console.error('Google sign-in error:', err);
-    } finally {
-      setLoading(null);
-    }
   };
 
   const handleAppleSignIn = async () => {
@@ -71,32 +54,12 @@ export default function LandingScreen() {
   return (
     <View style={[styles.container, { paddingTop: insets.top, paddingBottom: insets.bottom }]}>
       <View style={styles.content}>
-        <Ionicons name="walk" size={80} color={Colors.primary} />
+        <Image source={require('@/assets/icon.png')} style={styles.appIcon} />
         <Text style={styles.appName}>Running Routes</Text>
         <Text style={styles.tagline}>Generate new running routes</Text>
       </View>
 
       <View style={styles.buttonArea}>
-        {/* Google Sign-In */}
-        <Pressable
-          onPress={handleGoogleSignIn}
-          disabled={isLoading}
-          style={({ pressed }) => [
-            styles.oauthButton,
-            pressed && !isLoading && { transform: [{ scale: 0.98 }] },
-            isLoading && { opacity: 0.7 },
-          ]}
-        >
-          {loading === 'google' ? (
-            <ActivityIndicator size="small" color={Colors.primaryForeground} />
-          ) : (
-            <Ionicons name="logo-google" size={20} color={Colors.primaryForeground} />
-          )}
-          <Text style={styles.oauthText}>
-            {loading === 'google' ? 'Signing in...' : 'Continue with Google'}
-          </Text>
-        </Pressable>
-
         {/* Apple Sign-In */}
         {Platform.OS !== 'android' && (
           <Pressable
@@ -159,6 +122,11 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     gap: 12,
+  },
+  appIcon: {
+    width: 100,
+    height: 100,
+    borderRadius: 22,
   },
   appName: {
     fontFamily: Fonts.sansBold,

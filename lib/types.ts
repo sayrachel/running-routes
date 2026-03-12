@@ -32,6 +32,7 @@ export interface FavoriteRouteRecord {
   terrain: 'Loop' | 'Out & Back' | 'Point to Point';
   lat: number;
   lng: number;
+  points?: { lat: number; lng: number }[];
   createdAt: number; // timestamp ms
 }
 

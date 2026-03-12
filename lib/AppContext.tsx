@@ -37,6 +37,8 @@ export interface FavoriteRoute {
   terrain: 'Loop' | 'Out & Back' | 'Point to Point';
   lat: number;
   lng: number;
+  points?: { lat: number; lng: number }[];
+  createdAt?: number;
 }
 
 interface AppState {
@@ -46,7 +48,6 @@ interface AppState {
   setUser: (v: User | null) => void;
   firebaseUid: string | null;
   authLoading: boolean;
-  signInWithGoogle: () => Promise<any>;
   signInWithApple: () => Promise<any>;
   signInWithEmail: (email: string, password: string) => Promise<any>;
   signOutUser: () => Promise<void>;
@@ -81,7 +82,7 @@ const DEFAULT_CENTER: RoutePoint = { lat: 40.7128, lng: -74.006 };
 const AppContext = createContext<AppState | null>(null);
 
 export function AppProvider({ children }: { children: React.ReactNode }) {
-  const { user: firebaseUser, loading: authLoading, isAuthenticated, signInWithGoogle, signInWithApple, signInWithEmail, signOut, deleteAccount: deleteAuthAccount } = useAuth();
+  const { user: firebaseUser, loading: authLoading, isAuthenticated, signInWithApple, signInWithEmail, signOut, deleteAccount: deleteAuthAccount } = useAuth();
 
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [user, setUser] = useState<User | null>(null);
@@ -143,6 +144,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             terrain: f.terrain,
             lat: f.lat,
             lng: f.lng,
+            points: f.points,
+            createdAt: f.createdAt,
           }))
         );
       }
@@ -190,6 +193,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           terrain: f.terrain,
           lat: f.lat,
           lng: f.lng,
+          points: f.points,
+          createdAt: f.createdAt,
         }))
       );
     });
@@ -199,21 +204,24 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const addFavorite = useCallback(
     (fav: FavoriteRoute) => {
+      const now = Date.now();
+      const favWithDate = { ...fav, createdAt: fav.createdAt ?? now };
       // Optimistic update
       setFavorites((prev) => {
-        if (prev.some((f) => f.id === fav.id)) return prev;
-        return [...prev, fav];
+        if (prev.some((f) => f.id === favWithDate.id)) return prev;
+        return [favWithDate, ...prev];
       });
 
       // Persist to Firestore
       if (firebaseUser) {
         addFavoriteRoute(firebaseUser.uid, {
-          routeName: fav.routeName,
-          distance: fav.distance,
-          terrain: fav.terrain,
-          lat: fav.lat,
-          lng: fav.lng,
-          createdAt: Date.now(),
+          routeName: favWithDate.routeName,
+          distance: favWithDate.distance,
+          terrain: favWithDate.terrain,
+          lat: favWithDate.lat,
+          lng: favWithDate.lng,
+          points: favWithDate.points,
+          createdAt: now,
         }).catch(console.warn);
       }
     },
@@ -260,7 +268,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setUser,
         firebaseUid: firebaseUser?.uid ?? null,
         authLoading,
-        signInWithGoogle,
         signInWithApple,
         signInWithEmail,
         signOutUser,
