@@ -304,10 +304,10 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
                 <Ionicons name="chevron-forward" size={16} color={Colors.mutedForeground} />
               </Pressable>
 
-              <Pressable style={styles.menuRow} onPress={() => setView('privacy')}>
+              <Pressable style={styles.menuRow} onPress={() => Linking.openURL('https://docs.google.com/document/d/e/2PACX-1vRCYKfkq6s1kWEMNCX_NOYRV8i-egoughcvQn3XLR1XZjrj3qzEHMVAvCnYKAFZz2-pzqgzQIS-RKmx/pub')}>
                 <Ionicons name="shield-checkmark-outline" size={20} color={Colors.mutedForeground} />
                 <Text style={styles.menuLabel}>Privacy Policy</Text>
-                <Ionicons name="chevron-forward" size={16} color={Colors.mutedForeground} />
+                <Ionicons name="open-outline" size={16} color={Colors.mutedForeground} />
               </Pressable>
             </View>
 
@@ -574,7 +574,7 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
 
             <Text style={styles.legalHeading}>12. Contact Us</Text>
             <Text style={styles.legalBody}>
-              If you have any questions, concerns, or requests regarding this Privacy Policy or our data practices, please reach out through the App's feedback channels.
+              If you have any questions, concerns, or requests regarding this Privacy Policy or our data practices, please contact us at irachelma@gmail.com.
             </Text>
           </ScrollView>
         ) : (

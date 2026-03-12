@@ -329,6 +329,19 @@ export default function RunScreen() {
           </View>
         </View>
 
+        {/* Return-to-summary pill — shown when finished but viewing the map */}
+        {isFinished && !showStats && (
+          <View style={styles.returnPillContainer}>
+            <Pressable
+              onPress={() => setShowStats(true)}
+              style={({ pressed }) => [styles.returnPill, pressed && { transform: [{ scale: 0.96 }] }]}
+            >
+              <Ionicons name="chevron-up" size={14} color={Colors.primaryForeground} />
+              <Text style={styles.returnPillLabel}>Run Summary</Text>
+            </Pressable>
+          </View>
+        )}
+
         {/* Bottom sheet — hidden when finished */}
         {!isFinished && (
         <View style={styles.bottomSheet}>
@@ -556,5 +569,28 @@ const styles = StyleSheet.create({
     fontFamily: Fonts.sansSemiBold,
     fontSize: 13,
     color: Colors.primary,
+  },
+  returnPillContainer: {
+    position: 'absolute',
+    bottom: 40,
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+    zIndex: 20,
+  },
+  returnPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: Colors.primary,
+    borderRadius: 9999,
+    paddingHorizontal: 20,
+    paddingVertical: 12,
+  },
+  returnPillLabel: {
+    fontFamily: Fonts.sansBold,
+    fontSize: 13,
+    color: Colors.primaryForeground,
+    letterSpacing: 0.5,
   },
 });
