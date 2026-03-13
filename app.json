@@ -15,7 +15,7 @@
     "ios": {
       "supportsTablet": false,
       "bundleIdentifier": "com.runroutes.app",
-      "buildNumber": "4",
+      "buildNumber": "5",
       "infoPlist": {
         "NSLocationWhenInUseUsageDescription": "Running Routes needs your location to generate running routes near you.",
         "NSLocationAlwaysAndWhenInUseUsageDescription": "Running Routes needs background location access to track your run even when the app is in the background.",
