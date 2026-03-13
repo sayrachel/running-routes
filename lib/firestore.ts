@@ -64,6 +64,24 @@ export async function getRunHistory(userId: string): Promise<RunRecord[]> {
   return runs;
 }
 
+export async function deleteRunRecord(userId: string | null, runId: string): Promise<void> {
+  // Delete from Firestore if authenticated
+  if (userId) {
+    try {
+      await deleteDoc(doc(db, 'users', userId, 'runs', runId));
+    } catch {}
+  }
+  // Delete from local cache
+  try {
+    const json = await AsyncStorage.getItem(CACHE_KEY_RUN_HISTORY);
+    if (json) {
+      const runs: RunRecord[] = JSON.parse(json);
+      const filtered = runs.filter((r) => r.id !== runId);
+      await AsyncStorage.setItem(CACHE_KEY_RUN_HISTORY, JSON.stringify(filtered));
+    }
+  } catch {}
+}
+
 export async function getCachedRunHistory(): Promise<RunRecord[]> {
   try {
     const json = await AsyncStorage.getItem(CACHE_KEY_RUN_HISTORY);

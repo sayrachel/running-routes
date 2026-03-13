@@ -6,7 +6,7 @@ import { useAppContext, type FavoriteRoute } from '@/lib/AppContext';
 import { FavoritePreview } from '@/components/FavoritePreview';
 import { ProfileDrawer, type DrawerView } from '@/components/ProfileDrawer';
 import { BottomTabBar } from '@/components/BottomTabBar';
-import { getRunHistory, getCachedRunHistory } from '@/lib/firestore';
+import { getRunHistory, getCachedRunHistory, deleteRunRecord } from '@/lib/firestore';
 import type { RunRecord } from '@/lib/types';
 import { Colors, Fonts } from '@/lib/theme';
 import { distanceUnit, paceUnit } from '@/lib/units';
@@ -67,9 +67,9 @@ export default function SavedScreen() {
     setPreviewFavorite(route);
   };
 
-  const handleRunDetailPress = (run: RunRecord) => {
-    setDrawerInitialView('run-detail' as DrawerView);
-    setDrawerVisible(true);
+  const handleDeleteRun = async (runId: string) => {
+    setRunHistory((prev) => prev.filter((r) => r.id !== runId));
+    await deleteRunRecord(ctx.firebaseUid, runId);
   };
 
   return (
@@ -123,7 +123,7 @@ export default function SavedScreen() {
             <View style={styles.emptyState}>
               <Ionicons name="heart-outline" size={32} color={Colors.mutedForeground} />
               <Text style={styles.emptyText}>No favorites yet</Text>
-              <Text style={styles.emptySubtext}>Tap the heart on any generated route to save it here</Text>
+              <Text style={styles.emptySubtext}>Tap the heart on any route to save it here</Text>
             </View>
           ) : (
             [...ctx.favorites]
@@ -180,31 +180,34 @@ export default function SavedScreen() {
                 const durationMin = formatDuration(run.duration);
                 const pace = run.avgPace || (durationMin / run.distance).toFixed(1);
                 return (
-                  <Pressable
-                    key={run.id}
-                    style={styles.card}
-                    onPress={() => {
-                      setDrawerInitialView('history');
-                      setDrawerVisible(true);
-                    }}
-                  >
-                    <Text style={styles.cardTitle}>{run.routeName}</Text>
-                    <Text style={styles.cardSubtitle}>{formatRunDate(run.date)}</Text>
-                    <View style={styles.statsRow}>
-                      <View style={styles.stat}>
-                        <Ionicons name="time-outline" size={12} color={Colors.mutedForeground} />
-                        <Text style={styles.statText}>{durationMin} min</Text>
+                  <View key={run.id} style={styles.card}>
+                    <View style={styles.favRow}>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.cardTitle}>{run.routeName}</Text>
+                        <Text style={styles.cardSubtitle}>{formatRunDate(run.date)}</Text>
+                        <View style={styles.statsRow}>
+                          <View style={styles.stat}>
+                            <Ionicons name="time-outline" size={12} color={Colors.mutedForeground} />
+                            <Text style={styles.statText}>{durationMin} min</Text>
+                          </View>
+                          <View style={styles.stat}>
+                            <Ionicons name="speedometer-outline" size={12} color={Colors.mutedForeground} />
+                            <Text style={styles.statText}>{pace} min{paceUnit(ctx.prefs.units)}</Text>
+                          </View>
+                          <View style={styles.stat}>
+                            <Ionicons name="navigate-outline" size={12} color={Colors.mutedForeground} />
+                            <Text style={styles.statText}>{run.distance} {distanceUnit(ctx.prefs.units)}</Text>
+                          </View>
+                        </View>
                       </View>
-                      <View style={styles.stat}>
-                        <Ionicons name="speedometer-outline" size={12} color={Colors.mutedForeground} />
-                        <Text style={styles.statText}>{pace} min{paceUnit(ctx.prefs.units)}</Text>
-                      </View>
-                      <View style={styles.stat}>
-                        <Ionicons name="navigate-outline" size={12} color={Colors.mutedForeground} />
-                        <Text style={styles.statText}>{run.distance} {distanceUnit(ctx.prefs.units)}</Text>
-                      </View>
+                      <Pressable
+                        onPress={() => handleDeleteRun(run.id)}
+                        hitSlop={8}
+                      >
+                        <Ionicons name="trash-outline" size={16} color={Colors.mutedForeground} />
+                      </Pressable>
                     </View>
-                  </Pressable>
+                  </View>
                 );
               })}
             </>
