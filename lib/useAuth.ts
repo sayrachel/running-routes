@@ -9,13 +9,9 @@ import {
   OAuthProvider,
   type User,
 } from 'firebase/auth';
-import * as AuthSession from 'expo-auth-session';
-import * as WebBrowser from 'expo-web-browser';
+import * as AppleAuthentication from 'expo-apple-authentication';
 import * as Crypto from 'expo-crypto';
 import { auth } from './firebase';
-
-// Required for web redirect to close the popup
-WebBrowser.maybeCompleteAuthSession();
 
 export function useAuth() {
   const [user, setUser] = useState<User | null>(null);
@@ -38,40 +34,29 @@ export function useAuth() {
         nonce
       );
 
-      const redirectUri = AuthSession.makeRedirectUri({
-        scheme: 'runroutes',
-        path: 'auth',
+      const appleCredential = await AppleAuthentication.signInAsync({
+        requestedScopes: [
+          AppleAuthentication.AppleAuthenticationScope.FULL_NAME,
+          AppleAuthentication.AppleAuthenticationScope.EMAIL,
+        ],
+        nonce: hashedNonce,
       });
 
-      const request = new AuthSession.AuthRequest({
-        clientId: 'com.runroutes.app',
-        scopes: ['name', 'email'],
-        redirectUri,
-        responseType: AuthSession.ResponseType.IdToken,
-        extraParams: {
-          nonce: hashedNonce,
-        },
-      });
-
-      const appleDiscovery: AuthSession.DiscoveryDocument = {
-        authorizationEndpoint: 'https://appleid.apple.com/auth/authorize',
-        tokenEndpoint: 'https://appleid.apple.com/auth/token',
-      };
-
-      const result = await request.promptAsync(appleDiscovery);
-
-      if (result.type === 'success' && result.params.id_token) {
-        const provider = new OAuthProvider('apple.com');
-        const credential = provider.credential({
-          idToken: result.params.id_token,
-          rawNonce: nonce,
-        });
-        const userCredential = await signInWithCredential(auth, credential);
-        return userCredential.user;
+      if (!appleCredential.identityToken) {
+        return null;
       }
 
-      return null;
-    } catch (error) {
+      const provider = new OAuthProvider('apple.com');
+      const credential = provider.credential({
+        idToken: appleCredential.identityToken,
+        rawNonce: nonce,
+      });
+      const userCredential = await signInWithCredential(auth, credential);
+      return userCredential.user;
+    } catch (error: any) {
+      if (error.code === 'ERR_REQUEST_CANCELED') {
+        return null;
+      }
       console.error('Apple Sign-In error:', error);
       return null;
     }
