@@ -272,8 +272,9 @@ export default function SetupScreen() {
     };
   }, []);
 
-  // Auto-locate on mount
+  // Auto-locate on mount — only if location hasn't been set yet
   useEffect(() => {
+    if (ctx.hasLocation) return;
     (async () => {
       const { status } = await Location.requestForegroundPermissionsAsync();
       if (status === 'granted') {
@@ -476,10 +477,12 @@ export default function SetupScreen() {
 
   const p2pDistance = useMemo(() => {
     if (localRouteStyle === 'point-to-point' && hasEndLocation && ctx.endLocation) {
-      return Math.round(haversineDistanceMiles(ctx.center.lat, ctx.center.lng, ctx.endLocation.lat, ctx.endLocation.lng) * 10) / 10;
+      const miles = haversineDistanceMiles(ctx.center.lat, ctx.center.lng, ctx.endLocation.lat, ctx.endLocation.lng);
+      const value = localPrefs.units === 'metric' ? miles * 1.60934 : miles;
+      return Math.round(value * 10) / 10;
     }
     return null;
-  }, [localRouteStyle, hasEndLocation, ctx.center, ctx.endLocation]);
+  }, [localRouteStyle, hasEndLocation, ctx.center, ctx.endLocation, localPrefs.units]);
 
   const handleGenerate = useCallback(async () => {
     ctx.setRouteStyle(localRouteStyle);
@@ -493,11 +496,10 @@ export default function SetupScreen() {
         : null;
 
     // Convert to km for OSRM
-    // For point-to-point, just convert the haversine distance to km —
-    // don't add road overhead since the user chose a destination, not a distance.
+    // p2pDistance is already in the user's selected unit
     const distanceKm =
       localRouteStyle === 'point-to-point' && p2pDistance != null
-        ? p2pDistance * 1.60934
+        ? (localPrefs.units === 'metric' ? p2pDistance : p2pDistance * 1.60934)
         : localPrefs.units === 'metric'
           ? ctx.distance
           : ctx.distance * 1.60934;

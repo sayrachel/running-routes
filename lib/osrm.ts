@@ -19,6 +19,59 @@ const ROUTING_OVERHEAD = 1.35;
 // Geometry helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Remove self-intersecting loops ("lollipops") from a route.
+ * Detects where the route crosses itself and cuts out the loop,
+ * keeping the shorter path. This prevents routes where runners
+ * would have to double back on the same streets.
+ */
+function removeSelfintersections(points: RoutePoint[]): RoutePoint[] {
+  if (points.length < 20) return points;
+
+  // Sample every N points for performance (checking all pairs is O(n^2))
+  const step = Math.max(1, Math.floor(points.length / 200));
+
+  for (let i = 0; i < points.length - 3; i += step) {
+    for (let j = i + 10; j < points.length - 1; j += step) {
+      // Check if segment i→i+1 crosses segment j→j+1
+      if (segmentsCross(points[i], points[i + 1], points[j], points[j + 1])) {
+        // Found a crossing — the loop is points[i+1..j]
+        const loopLen = j - i;
+        const totalLen = points.length;
+
+        // If the loop is between 5% and 40% of the route, cut it out
+        if (loopLen > totalLen * 0.05 && loopLen < totalLen * 0.4) {
+          // Remove the loop: keep points[0..i] then points[j+1..end]
+          const cleaned = [...points.slice(0, i + 1), ...points.slice(j + 1)];
+          return cleaned;
+        }
+      }
+    }
+  }
+
+  return points;
+}
+
+/** Check if two line segments cross each other */
+function segmentsCross(
+  a1: RoutePoint, a2: RoutePoint,
+  b1: RoutePoint, b2: RoutePoint
+): boolean {
+  const d1 = cross(b1, b2, a1);
+  const d2 = cross(b1, b2, a2);
+  const d3 = cross(a1, a2, b1);
+  const d4 = cross(a1, a2, b2);
+  if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
+      ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) {
+    return true;
+  }
+  return false;
+}
+
+function cross(o: RoutePoint, a: RoutePoint, b: RoutePoint): number {
+  return (a.lat - o.lat) * (b.lng - o.lng) - (a.lng - o.lng) * (b.lat - o.lat);
+}
+
 /** Haversine distance in km between two points */
 export function haversineDistance(p1: RoutePoint, p2: RoutePoint): number {
   const R = 6371;
@@ -888,8 +941,23 @@ export async function generateOSRMRoutes(
       } else {
         // Other candidates: route via green spaces for scenic variety
         const result = generateGreenSpacePointToPoint(center, end, prefs, variant, availableGreenSpaces, strategy);
-        waypoints = result.waypoints;
-        anchors = result.anchors;
+        if (result.anchors.length > 0) {
+          waypoints = result.waypoints;
+          anchors = result.anchors;
+        } else {
+          // No green spaces — create diversity by adding an offset waypoint
+          // perpendicular to the direct path
+          const midLat = (center.lat + end.lat) / 2;
+          const midLng = (center.lng + end.lng) / 2;
+          const dLat = end.lat - center.lat;
+          const dLng = end.lng - center.lng;
+          // Alternate sides: candidate 1 goes left, candidate 2 goes right
+          const side = i % 2 === 1 ? 1 : -1;
+          const offsetScale = 0.15 + (i * 0.05); // increasing offset per candidate
+          const offsetLat = midLat + side * dLng * offsetScale;
+          const offsetLng = midLng - side * dLat * offsetScale;
+          waypoints = [center, { lat: offsetLat, lng: offsetLng }, end];
+        }
       }
     } else if (routeType === 'out-and-back') {
       const result = generateGreenSpaceOutAndBack(center, distanceKm, prefs, variant, availableGreenSpaces, strategy);
@@ -922,7 +990,8 @@ export async function generateOSRMRoutes(
   for (let i = 0; i < candidates.length; i++) {
     const osrmRoute = osrmResults[i];
     if (osrmRoute) {
-      const points = osrmRoute.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }));
+      const rawPoints = osrmRoute.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }));
+      const points = removeSelfintersections(rawPoints);
       const distKm = osrmRoute.distance / 1000;
       const estimatedTime = Math.round(osrmRoute.duration / 60);
       const distRatio = distanceKm > 0 ? distKm / distanceKm : 1;

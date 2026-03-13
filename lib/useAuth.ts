@@ -58,7 +58,7 @@ export function useAuth() {
         return null;
       }
       console.error('Apple Sign-In error:', error);
-      return null;
+      throw error;
     }
   }, []);
 

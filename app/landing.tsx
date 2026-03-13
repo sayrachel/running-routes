@@ -35,8 +35,9 @@ export default function LandingScreen() {
       } else {
         setError('Sign-in was cancelled. Please try again.');
       }
-    } catch (err) {
-      setError('Apple sign-in failed. Please try again.');
+    } catch (err: any) {
+      const msg = err?.message || 'Apple sign-in failed. Please try again.';
+      setError(msg);
       console.error('Apple sign-in error:', err);
     } finally {
       setLoading(null);
