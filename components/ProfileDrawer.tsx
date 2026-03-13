@@ -243,9 +243,9 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
             showsVerticalScrollIndicator={false}
           >
             {/* Profile */}
-            <View style={styles.profileSection}>
-              <Text style={styles.userEmail}>{ctx.user?.email ?? ''}</Text>
-            </View>
+            {ctx.user?.email ? (
+              <Text style={styles.userEmail}>{ctx.user.email}</Text>
+            ) : null}
 
             {/* Preferences */}
             <Text style={styles.sectionLabel}>PREFERENCES</Text>

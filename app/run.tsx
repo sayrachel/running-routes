@@ -22,6 +22,7 @@ import { formatElevation } from '@/lib/units';
 import { useLocationTracking, accuracyToStrength } from '@/lib/useLocationTracking';
 import { saveRunRecord, addPendingRun, getCachedRunHistory } from '@/lib/firestore';
 import { buildGoogleMapsUrl } from '@/lib/route-export';
+import { BottomTabBar } from '@/components/BottomTabBar';
 import { Colors, Fonts } from '@/lib/theme';
 
 function formatTime(seconds: number): string {
@@ -186,9 +187,7 @@ export default function RunScreen() {
     setShowStats(false);
     ctx.setRoutes([]);
     ctx.setSelectedRoute(null);
-    // Open history view after saving
-    setDrawerInitialView('history');
-    setDrawerVisible(true);
+    router.replace('/');
 
     // App Store review prompt after 3rd save
     try {
@@ -352,10 +351,7 @@ export default function RunScreen() {
           {ctx.routes.length === 0 && !ctx.selectedRoute && !hasStarted ? (
             <View style={styles.emptyState}>
               <Text style={styles.emptyStateText}>No route loaded</Text>
-              <Pressable onPress={handleBack} style={styles.emptyStateBtn}>
-                <Ionicons name="chevron-back" size={14} color={Colors.primary} />
-                <Text style={styles.emptyStateBtnLabel}>Go Back</Text>
-              </Pressable>
+              <Text style={styles.emptyStateSubtext}>Generate a route from the Plan tab</Text>
             </View>
           ) : (
           <>
@@ -435,6 +431,9 @@ export default function RunScreen() {
         onClose={() => setDrawerVisible(false)}
         initialView={drawerInitialView}
       />
+
+      {/* Bottom Tab Bar — show when no run is active */}
+      {!hasStarted && !isFinished && <BottomTabBar />}
     </View>
   );
 }
@@ -586,6 +585,11 @@ const styles = StyleSheet.create({
   emptyStateText: {
     fontFamily: Fonts.sansSemiBold,
     fontSize: 14,
+    color: Colors.mutedForeground,
+  },
+  emptyStateSubtext: {
+    fontFamily: Fonts.sans,
+    fontSize: 12,
     color: Colors.mutedForeground,
   },
   emptyStateBtn: {
