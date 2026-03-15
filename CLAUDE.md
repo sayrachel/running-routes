@@ -4,8 +4,8 @@
 
 - **ALWAYS bump the iOS build number** in `app.json` (`expo.ios.buildNumber`) before building for TestFlight. Each TestFlight submission requires a unique build number.
 - After bumping, commit and push before running the build.
-- Build command: `npx eas-cli build --platform ios --profile production --non-interactive`
-- Submit command: `npx eas-cli submit --platform ios --latest` (requires interactive mode or `ascAppId` in `eas.json`)
+- Build command: `eas build --platform ios --profile production --non-interactive` (uses global `eas` at `/opt/homebrew/bin/eas`)
+- Submit command: `eas submit --platform ios --latest` — **must be run by the user in a separate terminal** (requires interactive Apple authentication, cannot run non-interactively)
 
 ## Key Files
 
