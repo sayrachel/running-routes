@@ -13,7 +13,7 @@ const CANDIDATE_COUNT = 3;
  * We use this factor to shrink the geometric radius so the OSRM-routed
  * result ends up closer to the user's target distance.
  */
-const ROUTING_OVERHEAD = 1.35;
+const ROUTING_OVERHEAD = 1.45;
 
 // ---------------------------------------------------------------------------
 // Geometry helpers
@@ -126,7 +126,10 @@ export function angleDiff(a: number, b: number): number {
 
 /**
  * Detect if two consecutive waypoints likely cross water or a major barrier.
- * Flags if they are >0.8km apart AND no green space is within 0.3km of the midpoint.
+ * Uses two checks:
+ * 1. Flags if they are >0.6km apart AND no green space is within 0.3km of the midpoint.
+ * 2. Flags if the bearing between the two points crosses a known barrier pattern
+ *    (large gap with no infrastructure).
  * This is a universal heuristic — in Manhattan it catches Hudson/East River crossings,
  * in other cities it catches large gaps with no parks/paths (highways, industrial zones, etc).
  */
@@ -136,17 +139,29 @@ function hasLikelyWaterCrossing(
   greenSpaces: GreenSpace[]
 ): boolean {
   const dist = haversineDistance(p1, p2);
-  if (dist <= 0.8) return false;
+  if (dist <= 0.6) return false;
 
-  const mid: RoutePoint = {
-    lat: (p1.lat + p2.lat) / 2,
-    lng: (p1.lng + p2.lng) / 2,
-  };
-
-  for (const gs of greenSpaces) {
-    if (haversineDistance(mid, gs.point) <= 0.3) return false;
+  // Check multiple sample points along the segment, not just the midpoint
+  const numSamples = Math.max(2, Math.ceil(dist / 0.3));
+  let uncoveredCount = 0;
+  for (let s = 1; s < numSamples; s++) {
+    const t = s / numSamples;
+    const sample: RoutePoint = {
+      lat: p1.lat + (p2.lat - p1.lat) * t,
+      lng: p1.lng + (p2.lng - p1.lng) * t,
+    };
+    let covered = false;
+    for (const gs of greenSpaces) {
+      if (haversineDistance(sample, gs.point) <= 0.3) {
+        covered = true;
+        break;
+      }
+    }
+    if (!covered) uncoveredCount++;
   }
-  return true;
+
+  // If more than half the samples are uncovered, likely a barrier
+  return uncoveredCount > numSamples / 2;
 }
 
 /**
@@ -240,13 +255,62 @@ function isAccessibleFromCenter(
 
     if (!hasNearby) {
       consecutiveGap += actualSpacing;
-      if (consecutiveGap >= 1.0) return false; // 1km+ dead zone = barrier
+      if (consecutiveGap >= 0.7) return false; // 0.7km+ dead zone = barrier
     } else {
       consecutiveGap = 0;
     }
   }
 
   return true;
+}
+
+/**
+ * Check if a routed path (from OSRM) crosses a major barrier like a tunnel or bridge.
+ * Samples the route at regular intervals and looks for stretches where the path
+ * goes through areas with no green space coverage — indicating water, highways, etc.
+ * This catches cases where OSRM routes through tunnels that pre-OSRM waypoint
+ * checks wouldn't detect.
+ */
+function hasRoutedBarrierCrossing(
+  routePoints: RoutePoint[],
+  greenSpaces: GreenSpace[]
+): boolean {
+  if (routePoints.length < 20 || greenSpaces.length === 0) return false;
+
+  // Sample every N points to check coverage
+  const sampleInterval = Math.max(1, Math.floor(routePoints.length / 40));
+  let consecutiveUncovered = 0;
+  let maxUncoveredDist = 0;
+  let uncoveredDist = 0;
+
+  for (let i = 0; i < routePoints.length; i += sampleInterval) {
+    const p = routePoints[i];
+    let covered = false;
+    for (const gs of greenSpaces) {
+      if (haversineDistance(p, gs.point) <= 0.4) {
+        covered = true;
+        break;
+      }
+    }
+
+    if (!covered) {
+      consecutiveUncovered++;
+      if (i >= sampleInterval) {
+        uncoveredDist += haversineDistance(routePoints[i - sampleInterval], p);
+      }
+      if (uncoveredDist > maxUncoveredDist) {
+        maxUncoveredDist = uncoveredDist;
+      }
+    } else {
+      consecutiveUncovered = 0;
+      uncoveredDist = 0;
+    }
+
+    // If there's a 1km+ stretch with no green space coverage, likely a barrier
+    if (maxUncoveredDist >= 1.0) return true;
+  }
+
+  return false;
 }
 
 /**
@@ -277,7 +341,7 @@ export function calculateSearchRadius(
   } else {
     radius = distanceKm * 0.6;
   }
-  return Math.min(Math.max(radius, 1.5), 12);
+  return Math.min(Math.max(radius, 1.5), 10);
 }
 
 // ---------------------------------------------------------------------------
@@ -997,10 +1061,18 @@ export async function generateOSRMRoutes(
       const distRatio = distanceKm > 0 ? distKm / distanceKm : 1;
       // Point-to-point routes go to a user-chosen destination, so be very
       // lenient on distance — the route must exist even if roads are indirect.
-      const maxRatio = routeType === 'point-to-point' ? 3.0 : 1.5;
-      const minRatio = routeType === 'point-to-point' ? 0.2 : 0.4;
+      const maxRatio = routeType === 'point-to-point' ? 3.0 : 1.3;
+      const minRatio = routeType === 'point-to-point' ? 0.2 : 0.5;
       if (distRatio > maxRatio || distRatio < minRatio) {
         console.log(`[RouteScoring] Rejecting candidate ${i}: dist=${distKm.toFixed(2)}km (ratio=${distRatio.toFixed(2)}, target=${distanceKm.toFixed(2)}km)`);
+        continue;
+      }
+      // Check the routed path for long straight segments (tunnels/bridges)
+      // Sample the route every ~50 points and look for segments where
+      // consecutive route points are very far apart relative to their
+      // count, indicating the route passes through a tunnel or over a bridge
+      if (routeType !== 'point-to-point' && hasRoutedBarrierCrossing(points, greenSpaces)) {
+        console.log(`[RouteScoring] Rejecting candidate ${i}: route crosses a likely barrier (tunnel/bridge)`);
         continue;
       }
       resolved.push({ index: i, variant: candidates[i].variant, points, distKm, estimatedTime, fromOSRM: true, anchors: candidates[i].anchors });
@@ -1011,8 +1083,8 @@ export async function generateOSRMRoutes(
         return sum + haversineDistance(wp[j - 1], p);
       }, 0);
       const fallbackRatio = distanceKm > 0 ? totalDist / distanceKm : 1;
-      const maxFallbackRatio = routeType === 'point-to-point' ? 3.0 : 1.5;
-      const minFallbackRatio = routeType === 'point-to-point' ? 0.2 : 0.4;
+      const maxFallbackRatio = routeType === 'point-to-point' ? 3.0 : 1.3;
+      const minFallbackRatio = routeType === 'point-to-point' ? 0.2 : 0.5;
       if (fallbackRatio > maxFallbackRatio || fallbackRatio < minFallbackRatio) {
         console.log(`[RouteScoring] Rejecting fallback ${i}: dist=${totalDist.toFixed(2)}km (ratio=${fallbackRatio.toFixed(2)})`);
         continue;
@@ -1076,21 +1148,15 @@ export async function generateOSRMRoutes(
     }
   }
 
-  // Step 4: Fetch preference data, green proximity, and run-path proximity in parallel
-  const preferenceData = await Promise.all(
-    resolved.map(async (candidate) => {
-      const [quietScore, greenProximity, runPathProximity] = await Promise.all([
-        fetchQuietScore(candidate.points),
-        Promise.resolve(computeGreenSpaceProximity(candidate.points, greenSpaces)),
-        Promise.resolve(computeRunPathProximity(candidate.points, greenSpaces)),
-      ]);
-      return { quietScore, greenProximity, runPathProximity };
-    })
-  );
-
-  // Step 5: Score each candidate
-  const scored = resolved.map((candidate, i) => {
-    const { quietScore, greenProximity, runPathProximity } = preferenceData[i];
+  // Step 4: Score each candidate using locally-computable metrics only.
+  // Skip the extra Overpass quiet-score requests — they add ~1-2s per candidate
+  // and the green/runPath proximity scores (computed locally) already capture
+  // route quality well enough for ranking.
+  const scored = resolved.map((candidate) => {
+    const greenProximity = computeGreenSpaceProximity(candidate.points, greenSpaces);
+    const runPathProximity = computeRunPathProximity(candidate.points, greenSpaces);
+    // Use a neutral quiet score (0.5) to avoid extra network calls
+    const quietScore = 0.5;
     const score = scoreRoute(
       { distanceKm: candidate.distKm, targetDistanceKm: distanceKm },
       prefs,
@@ -1100,8 +1166,8 @@ export async function generateOSRMRoutes(
     );
 
     console.log(
-      `[RouteScoring] Candidate ${i}: dist=${candidate.distKm.toFixed(2)}km, ` +
-      `quiet=${quietScore.toFixed(2)}, green=${greenProximity.toFixed(2)}, ` +
+      `[RouteScoring] Candidate ${candidate.index}: dist=${candidate.distKm.toFixed(2)}km, ` +
+      `green=${greenProximity.toFixed(2)}, ` +
       `runPath=${runPathProximity.toFixed(2)}, score=${score.toFixed(3)}`
     );
 

@@ -230,6 +230,7 @@ export default function SetupScreen() {
   const [startSuggestions, setStartSuggestions] = useState<GeocodeSuggestion[]>([]);
   const startInputRef = useRef<TextInput>(null);
   const startDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const startRequestIdRef = useRef(0);
   const suppressStartBlurRef = useRef(false);
 
   // End location search
@@ -240,6 +241,7 @@ export default function SetupScreen() {
   const endInputRef = useRef<TextInput>(null);
   const sheetScrollRef = useRef<ScrollView>(null);
   const endDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const endRequestIdRef = useRef(0);
 
   // Auth redirect
   useEffect(() => {
@@ -315,9 +317,13 @@ export default function SetupScreen() {
       setStartSuggestions([]);
       return;
     }
+    const requestId = ++startRequestIdRef.current;
     startDebounceRef.current = setTimeout(async () => {
       const results = await searchAddresses(text, ctx.center);
-      setStartSuggestions(results);
+      // Only update if this is still the latest request
+      if (requestId === startRequestIdRef.current) {
+        setStartSuggestions(results);
+      }
     }, 400);
   }, [ctx.center]);
 
@@ -329,9 +335,13 @@ export default function SetupScreen() {
       setEndSuggestions([]);
       return;
     }
+    const requestId = ++endRequestIdRef.current;
     endDebounceRef.current = setTimeout(async () => {
       const results = await searchAddresses(text, ctx.center);
-      setEndSuggestions(results);
+      // Only update if this is still the latest request
+      if (requestId === endRequestIdRef.current) {
+        setEndSuggestions(results);
+      }
     }, 400);
   }, [ctx.center]);
 
@@ -504,6 +514,9 @@ export default function SetupScreen() {
           ? ctx.distance
           : ctx.distance * 1.60934;
 
+    // Navigate to run page immediately so the user sees the loading spinner
+    router.replace('/run');
+
     try {
       const newRoutes = await generateOSRMRoutes(
         ctx.center,
@@ -514,18 +527,20 @@ export default function SetupScreen() {
         end
       );
       if (newRoutes.length === 0) {
-        setGenerateError('No routes found for this area. Try a different location or distance.');
         ctx.setIsGenerating(false);
+        // Navigate back so user can retry
+        router.replace('/');
+        setTimeout(() => setGenerateError('No routes found for this area. Try a different location or distance.'), 100);
         return;
       }
       ctx.setRoutes(newRoutes);
       ctx.setSelectedRoute(newRoutes[0] || null);
       ctx.setIsGenerating(false);
-      router.replace('/run');
     } catch (err: any) {
       console.warn('Route generation failed:', err);
-      setGenerateError("Couldn't generate a route. Check your connection and try again.");
       ctx.setIsGenerating(false);
+      router.replace('/');
+      setTimeout(() => setGenerateError("Couldn't generate a route. Check your connection and try again."), 100);
     }
   }, [ctx, localRouteStyle, localPrefs, hasEndLocation, p2pDistance, router]);
 

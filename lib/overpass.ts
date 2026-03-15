@@ -1,7 +1,10 @@
 import type { RoutePoint } from './route-generator';
 
-const OVERPASS_URL = 'https://overpass-api.de/api/interpreter';
-const TIMEOUT_MS = 5000;
+const OVERPASS_URLS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+];
+const TIMEOUT_MS = 4000;
 const BBOX_BUFFER_DEG = 0.002; // ~200m buffer in degrees
 
 /** Enriched green space with metadata for waypoint selection */
@@ -68,32 +71,48 @@ export function parseOverpassCount(data: any): number {
 }
 
 /**
+ * Race a request against multiple Overpass servers.
+ * Returns the first successful response, aborting the rest.
+ */
+async function fetchOverpassRace(
+  query: string,
+  timeoutMs: number = TIMEOUT_MS
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const body = `data=${encodeURIComponent(query)}`;
+
+  try {
+    const response = await Promise.any(
+      OVERPASS_URLS.map((url) =>
+        fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body,
+          signal: controller.signal,
+        }).then((res) => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return res;
+        })
+      )
+    );
+    return response;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
  * Query Overpass API and return the count of elements matched.
  */
 async function queryOverpass(query: string): Promise<number> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
-
   try {
-    const res = await fetch(OVERPASS_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: `data=${encodeURIComponent(query)}`,
-      signal: controller.signal,
-    });
-
-    if (!res.ok) {
-      console.warn(`Overpass API returned ${res.status}`);
-      return -1;
-    }
-
+    const res = await fetchOverpassRace(query);
     const data = await res.json();
     return parseOverpassCount(data);
   } catch (err) {
     console.warn('Overpass query failed:', err);
     return -1;
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
@@ -177,24 +196,10 @@ export async function fetchQuietScore(points: RoutePoint[]): Promise<number> {
     way["highway"="pedestrian"](${bboxStr});
   );out tags;`;
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
-
   try {
-    const res = await fetch(OVERPASS_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: `data=${encodeURIComponent(allRoadsQuery)}`,
-      signal: controller.signal,
-    });
-
-    if (!res.ok) {
-      console.warn(`Overpass API returned ${res.status}`);
-      quietCache.set(key, 0.5);
-      return 0.5;
-    }
-
+    const res = await fetchOverpassRace(allRoadsQuery);
     const data = await res.json();
+
     if (!data.elements || data.elements.length === 0) {
       quietCache.set(key, 0.5);
       return 0.5;
@@ -223,8 +228,6 @@ export async function fetchQuietScore(points: RoutePoint[]): Promise<number> {
     console.warn('Overpass quiet query failed:', err);
     quietCache.set(key, 0.5);
     return 0.5;
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
@@ -261,42 +264,25 @@ export async function fetchGreenSpacesEnriched(
   const lat = center.lat;
   const lng = center.lng;
 
-  const query = `[out:json][timeout:5];(
+  // Streamlined query: focus on parks/gardens/reserves (waypoint selection)
+  // and named cycleways/routes (scoring). Skip unnamed footways/paths/tracks
+  // which return huge result sets and slow the query considerably.
+  const query = `[out:json][timeout:4];(
     way["leisure"="park"](around:${radiusMeters},${lat},${lng});
     way["leisure"="nature_reserve"](around:${radiusMeters},${lat},${lng});
     way["leisure"="garden"](around:${radiusMeters},${lat},${lng});
     node["leisure"="park"](around:${radiusMeters},${lat},${lng});
     node["leisure"="nature_reserve"](around:${radiusMeters},${lat},${lng});
-    node["leisure"="garden"](around:${radiusMeters},${lat},${lng});
-    way["highway"="cycleway"](around:${radiusMeters},${lat},${lng});
-    way["highway"="footway"](around:${radiusMeters},${lat},${lng});
-    way["highway"="path"](around:${radiusMeters},${lat},${lng});
+    way["highway"="cycleway"]["name"](around:${radiusMeters},${lat},${lng});
     way["highway"="pedestrian"](around:${radiusMeters},${lat},${lng});
-    way["highway"="track"](around:${radiusMeters},${lat},${lng});
     relation["route"="foot"](around:${radiusMeters},${lat},${lng});
     relation["route"="bicycle"](around:${radiusMeters},${lat},${lng});
     relation["route"="running"](around:${radiusMeters},${lat},${lng});
-    way["foot"="designated"](around:${radiusMeters},${lat},${lng});
-    way["bicycle"="designated"]["highway"](around:${radiusMeters},${lat},${lng});
+    way["foot"="designated"]["name"](around:${radiusMeters},${lat},${lng});
   );out center bb tags;`;
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
-
   try {
-    const res = await fetch(OVERPASS_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: `data=${encodeURIComponent(query)}`,
-      signal: controller.signal,
-    });
-
-    if (!res.ok) {
-      console.warn(`Overpass enriched green space API returned ${res.status}`);
-      enrichedGreenSpaceCache.set(cacheKey, []);
-      return [];
-    }
-
+    const res = await fetchOverpassRace(query);
     const data = await res.json();
     if (!data.elements || data.elements.length === 0) {
       enrichedGreenSpaceCache.set(cacheKey, []);
@@ -387,8 +373,6 @@ export async function fetchGreenSpacesEnriched(
     console.warn('Overpass enriched green space query failed:', err);
     enrichedGreenSpaceCache.set(cacheKey, []);
     return [];
-  } finally {
-    clearTimeout(timeout);
   }
 }
 

@@ -137,20 +137,19 @@ describe('calculateSearchRadius', () => {
     expect(radius).toBe(1.5);
   });
 
-  // BUG: doc says clamped to [1.5, 10] but code clamps to [1.5, 12]
-  it('clamps maximum to 12 km (code) despite doc saying 10', () => {
+  it('clamps maximum to 10 km', () => {
     const radius = calculateSearchRadius('loop', 100, { lat: 0, lng: 0 });
-    expect(radius).toBe(12);
+    expect(radius).toBe(10);
   });
 
-  it('uses 0.8 factor for loop', () => {
+  it('uses 1.0 factor for loop', () => {
     const radius = calculateSearchRadius('loop', 10, { lat: 0, lng: 0 });
-    expect(radius).toBe(8);
+    expect(radius).toBe(10);
   });
 
-  it('uses 0.6 factor for out-and-back', () => {
+  it('uses 0.8 factor for out-and-back', () => {
     const radius = calculateSearchRadius('out-and-back', 10, { lat: 0, lng: 0 });
-    expect(radius).toBe(6);
+    expect(radius).toBe(8);
   });
 
   it('uses haversine distance for point-to-point with end', () => {
@@ -266,7 +265,7 @@ describe('scoreGreenSpace', () => {
 });
 
 describe('estimateCircuitDistance', () => {
-  it('sums haversine distances between waypoints times ROUTING_OVERHEAD (1.35)', () => {
+  it('sums haversine distances between waypoints times ROUTING_OVERHEAD (1.45)', () => {
     const center = { lat: 40.0, lng: -74.0 };
     const north = { lat: 40.01, lng: -74.0 };
     const east = { lat: 40.0, lng: -73.99 };
@@ -274,11 +273,11 @@ describe('estimateCircuitDistance', () => {
     const waypoints = [center, north, east, center];
     const dist = estimateCircuitDistance(waypoints);
 
-    // Manually compute expected: sum of haversine segments × 1.35
+    // Manually compute expected: sum of haversine segments × 1.45
     const seg1 = haversineDistance(center, north);
     const seg2 = haversineDistance(north, east);
     const seg3 = haversineDistance(east, center);
-    const expected = (seg1 + seg2 + seg3) * 1.35;
+    const expected = (seg1 + seg2 + seg3) * 1.45;
 
     expect(dist).toBeCloseTo(expected, 5);
   });

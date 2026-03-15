@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { View, Text, Pressable, StyleSheet, Linking } from 'react-native';
+import { View, Text, Pressable, StyleSheet, Linking, ActivityIndicator } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as StoreReview from 'expo-store-review';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -288,6 +288,10 @@ export default function RunScreen() {
               gpsTrack={hasStarted ? coordinates : undefined}
               currentPosition={hasStarted ? currentPosition : undefined}
             />
+            {/* Dark overlay to dim the map behind the bottom sheet */}
+            {!hasStarted && (
+              <View style={styles.mapOverlay} pointerEvents="none" />
+            )}
           </View>
         )}
 
@@ -348,7 +352,12 @@ export default function RunScreen() {
           {/* Grab handle */}
           <View style={styles.grabHandle} />
 
-          {ctx.routes.length === 0 && !ctx.selectedRoute && !hasStarted ? (
+          {ctx.isGenerating ? (
+            <View style={styles.loadingState}>
+              <ActivityIndicator size="large" color={Colors.primary} />
+              <Text style={styles.loadingText}>Generating Route...</Text>
+            </View>
+          ) : ctx.routes.length === 0 && !ctx.selectedRoute && !hasStarted ? (
             <View style={styles.emptyState}>
               <Text style={styles.emptyStateText}>No route loaded</Text>
               <Text style={styles.emptyStateSubtext}>Generate a route from the Plan tab</Text>
@@ -400,14 +409,16 @@ export default function RunScreen() {
             </View>
           )}
 
-          {/* Stats row */}
-          <RunStats
-            pace={currentPace}
-            distance={runDistance}
-            time={timeStr}
-            isRunning={isRunning}
-            units={ctx.prefs.units}
-          />
+          {/* Stats card */}
+          <View style={styles.statsCard}>
+            <RunStats
+              pace={currentPace}
+              distance={runDistance}
+              time={timeStr}
+              isRunning={isRunning}
+              units={ctx.prefs.units}
+            />
+          </View>
 
           {/* Start button */}
           <View style={styles.startRow}>
@@ -521,6 +532,10 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  mapOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+  },
   bottomSheet: {
     position: 'absolute',
     left: 0,
@@ -531,10 +546,27 @@ const styles = StyleSheet.create({
     borderTopRightRadius: 24,
     borderTopWidth: 1,
     borderTopColor: Colors.border + '4D',
-    backgroundColor: Colors.card + '99',
+    backgroundColor: Colors.card + 'E6',
     paddingHorizontal: 20,
     paddingTop: 4,
     paddingBottom: 4,
+  },
+  statsCard: {
+    backgroundColor: Colors.secondary + '99',
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: Colors.border + '80',
+    overflow: 'hidden',
+  },
+  loadingState: {
+    alignItems: 'center',
+    gap: 16,
+    paddingVertical: 32,
+  },
+  loadingText: {
+    fontFamily: Fonts.sansMedium,
+    fontSize: 14,
+    color: Colors.mutedForeground,
   },
   grabHandle: {
     alignSelf: 'center',

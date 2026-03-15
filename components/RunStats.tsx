@@ -18,19 +18,23 @@ export function RunStats({ pace, distance, time, units = 'imperial' }: RunStatsP
   return (
     <View style={styles.grid}>
       {/* Time */}
-      <View style={[styles.cell, styles.cellSide]}>
+      <View style={styles.cell}>
         <Text style={styles.label}>TIME</Text>
         <Text style={[styles.value, styles.valuePrimary]}>{time}</Text>
       </View>
 
+      <View style={styles.divider} />
+
       {/* Pace */}
-      <View style={[styles.cell, styles.cellSide]}>
+      <View style={styles.cell}>
         <Text style={styles.label} numberOfLines={1}>{paceLabel}</Text>
         <Text style={[styles.value, styles.valuePrimary]}>{pace}</Text>
       </View>
 
+      <View style={styles.divider} />
+
       {/* Distance */}
-      <View style={[styles.cell, styles.cellSide]}>
+      <View style={styles.cell}>
         <Text style={styles.label} numberOfLines={1}>{distLabel}</Text>
         <Text style={[styles.value, styles.valuePrimary]}>{distance}</Text>
       </View>
@@ -41,20 +45,19 @@ export function RunStats({ pace, distance, time, units = 'imperial' }: RunStatsP
 const styles = StyleSheet.create({
   grid: {
     flexDirection: 'row',
-    gap: 10,
+    alignItems: 'center',
   },
   cell: {
     flex: 1,
     alignItems: 'center',
     gap: 4,
-    borderRadius: 16,
-    borderWidth: 1,
     paddingHorizontal: 6,
     paddingVertical: 10,
   },
-  cellSide: {
-    borderColor: Colors.border + '80',
-    backgroundColor: Colors.card + '66',
+  divider: {
+    width: 1,
+    height: 28,
+    backgroundColor: Colors.border + '80',
   },
   label: {
     fontFamily: Fonts.sansBold,
