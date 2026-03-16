@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { View, Text, Pressable, StyleSheet, Linking, ActivityIndicator } from 'react-native';
+import { BlurView } from 'expo-blur';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as StoreReview from 'expo-store-review';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -348,7 +349,7 @@ export default function RunScreen() {
 
         {/* Bottom sheet — hidden when finished */}
         {!isFinished && (
-        <View style={styles.bottomSheet}>
+        <BlurView intensity={80} tint="dark" style={styles.bottomSheet}>
           {/* Grab handle */}
           <View style={styles.grabHandle} />
 
@@ -409,16 +410,14 @@ export default function RunScreen() {
             </View>
           )}
 
-          {/* Stats card */}
-          <View style={styles.statsCard}>
-            <RunStats
-              pace={currentPace}
-              distance={runDistance}
-              time={timeStr}
-              isRunning={isRunning}
-              units={ctx.prefs.units}
-            />
-          </View>
+          {/* Stats */}
+          <RunStats
+            pace={currentPace}
+            distance={runDistance}
+            time={timeStr}
+            isRunning={isRunning}
+            units={ctx.prefs.units}
+          />
 
           {/* Start button */}
           <View style={styles.startRow}>
@@ -432,7 +431,7 @@ export default function RunScreen() {
           </View>
           </>
           )}
-        </View>
+        </BlurView>
         )}
       </View>
 
@@ -546,17 +545,10 @@ const styles = StyleSheet.create({
     borderTopRightRadius: 24,
     borderTopWidth: 1,
     borderTopColor: Colors.border + '4D',
-    backgroundColor: Colors.card + 'E6',
+    overflow: 'hidden',
     paddingHorizontal: 20,
     paddingTop: 4,
     paddingBottom: 4,
-  },
-  statsCard: {
-    backgroundColor: Colors.secondary + '99',
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: Colors.border + '80',
-    overflow: 'hidden',
   },
   loadingState: {
     alignItems: 'center',

@@ -13,7 +13,7 @@ import {
   Platform,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { useRouter } from 'expo-router';
+import { useRouter, useFocusEffect } from 'expo-router';
 import * as Location from 'expo-location';
 import { Ionicons } from '@expo/vector-icons';
 import Animated, {
@@ -274,40 +274,44 @@ export default function SetupScreen() {
     };
   }, []);
 
-  // Auto-locate on mount — only if location hasn't been set yet
-  useEffect(() => {
-    if (ctx.hasLocation) return;
-    (async () => {
-      const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status === 'granted') {
-        try {
-          const loc = await Location.getCurrentPositionAsync({});
-          ctx.setCenter({ lat: loc.coords.latitude, lng: loc.coords.longitude });
-          ctx.setHasLocation(true);
-          ctx.setGpsStrength(accuracyToStrength(loc.coords.accuracy));
-          // Reverse geocode to get a readable address
+  // Re-fetch GPS every time the screen is focused, unless the user has manually
+  // set a start location. This ensures returning from a run resets center to the
+  // user's actual position instead of keeping the previously searched location.
+  useFocusEffect(
+    useCallback(() => {
+      // Reset manual location override when returning to this screen
+      setStartLocationName(null);
+      (async () => {
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (status === 'granted') {
           try {
-            const [geo] = await Location.reverseGeocodeAsync({
-              latitude: loc.coords.latitude,
-              longitude: loc.coords.longitude,
-            });
-            if (geo) {
-              const parts: string[] = [];
-              if (geo.streetNumber && geo.street) parts.push(`${geo.streetNumber} ${geo.street}`);
-              else if (geo.street) parts.push(geo.street);
-              else if (geo.name) parts.push(geo.name);
-              if (geo.city) parts.push(geo.city);
-              if (parts.length > 0) setCurrentLocationAddress(parts.join(', '));
-            }
-          } catch {}
-        } catch {
+            const loc = await Location.getCurrentPositionAsync({});
+            ctx.setCenter({ lat: loc.coords.latitude, lng: loc.coords.longitude });
+            ctx.setHasLocation(true);
+            ctx.setGpsStrength(accuracyToStrength(loc.coords.accuracy));
+            try {
+              const [geo] = await Location.reverseGeocodeAsync({
+                latitude: loc.coords.latitude,
+                longitude: loc.coords.longitude,
+              });
+              if (geo) {
+                const parts: string[] = [];
+                if (geo.streetNumber && geo.street) parts.push(`${geo.streetNumber} ${geo.street}`);
+                else if (geo.street) parts.push(geo.street);
+                else if (geo.name) parts.push(geo.name);
+                if (geo.city) parts.push(geo.city);
+                if (parts.length > 0) setCurrentLocationAddress(parts.join(', '));
+              }
+            } catch {}
+          } catch {
+            ctx.setHasLocation(true);
+          }
+        } else {
           ctx.setHasLocation(true);
         }
-      } else {
-        ctx.setHasLocation(true);
-      }
-    })();
-  }, []);
+      })();
+    }, [])
+  );
 
   // Debounced start address autocomplete
   const handleStartAddressChange = useCallback((text: string) => {
@@ -500,9 +504,47 @@ export default function SetupScreen() {
     ctx.setIsGenerating(true);
     setGenerateError(null);
 
+    // Use local copies so geocoded values are available in the same tick
+    let resolvedCenter = ctx.center;
+    let resolvedEnd = ctx.endLocation;
+    let resolvedHasEnd = hasEndLocation;
+
+    // Resolve any unsubmitted start address text before generating
+    if (startAddressText.trim().length >= 3) {
+      try {
+        const results = await searchAddresses(startAddressText, ctx.center);
+        if (results.length > 0) {
+          resolvedCenter = { lat: results[0].lat, lng: results[0].lng };
+          ctx.setCenter(resolvedCenter);
+          ctx.setHasLocation(true);
+          setStartLocationName(results[0].displayName);
+          setStartAddressText('');
+          setStartSuggestions([]);
+          setShowStartSearch(false);
+        }
+      } catch {}
+    }
+
+    // Resolve any unsubmitted end address text before generating
+    if (endAddressText.trim().length >= 3 && localRouteStyle === 'point-to-point') {
+      try {
+        const results = await searchAddresses(endAddressText, resolvedCenter);
+        if (results.length > 0) {
+          resolvedEnd = { lat: results[0].lat, lng: results[0].lng };
+          ctx.setEndLocation(resolvedEnd);
+          resolvedHasEnd = true;
+          setHasEndLocation(true);
+          setEndLocationName(results[0].displayName);
+          setEndAddressText('');
+          setEndSuggestions([]);
+          setShowEndSearch(false);
+        }
+      } catch {}
+    }
+
     const end =
-      localRouteStyle === 'point-to-point' && hasEndLocation
-        ? ctx.endLocation
+      localRouteStyle === 'point-to-point' && resolvedHasEnd
+        ? resolvedEnd
         : null;
 
     // Convert to km for OSRM
@@ -519,7 +561,7 @@ export default function SetupScreen() {
 
     try {
       const newRoutes = await generateOSRMRoutes(
-        ctx.center,
+        resolvedCenter,
         distanceKm,
         localRouteStyle === 'point-to-point' ? 'point-to-point' : localRouteStyle === 'out-and-back' ? 'out-and-back' : 'loop',
         3,
@@ -542,7 +584,7 @@ export default function SetupScreen() {
       router.replace('/');
       setTimeout(() => setGenerateError("Couldn't generate a route. Check your connection and try again."), 100);
     }
-  }, [ctx, localRouteStyle, localPrefs, hasEndLocation, p2pDistance, router]);
+  }, [ctx, localRouteStyle, localPrefs, hasEndLocation, p2pDistance, router, startAddressText, endAddressText]);
 
   const canGenerate = ctx.hasLocation && !ctx.isGenerating && ctx.distance > 0
     && (localRouteStyle !== 'point-to-point' || hasEndLocation);
@@ -683,10 +725,23 @@ export default function SetupScreen() {
                       onChangeText={handleStartAddressChange}
                       onSubmitEditing={handleStartSearchSubmit}
                       onBlur={() => {
-                        setTimeout(() => {
+                        setTimeout(async () => {
                           if (suppressStartBlurRef.current) {
                             suppressStartBlurRef.current = false;
                             return;
+                          }
+                          // Auto-geocode typed text that wasn't resolved via suggestion
+                          if (startAddressText.trim().length >= 3) {
+                            setIsStartGeocoding(true);
+                            try {
+                              const results = await searchAddresses(startAddressText, ctx.center);
+                              if (results.length > 0) {
+                                selectStartSuggestion(results[0]);
+                                return;
+                              }
+                            } finally {
+                              setIsStartGeocoding(false);
+                            }
                           }
                           setShowStartSearch(false);
                           setStartSuggestions([]);
@@ -774,7 +829,20 @@ export default function SetupScreen() {
                         }, 300);
                       }}
                       onBlur={() => {
-                        setTimeout(() => {
+                        setTimeout(async () => {
+                          // Auto-geocode typed text that wasn't resolved via suggestion
+                          if (endAddressText.trim().length >= 3) {
+                            setIsEndGeocoding(true);
+                            try {
+                              const results = await searchAddresses(endAddressText, ctx.center);
+                              if (results.length > 0) {
+                                selectEndSuggestion(results[0]);
+                                return;
+                              }
+                            } finally {
+                              setIsEndGeocoding(false);
+                            }
+                          }
                           setShowEndSearch(false);
                           setEndSuggestions([]);
                         }, 200);
