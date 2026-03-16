@@ -681,8 +681,11 @@ export default function SetupScreen() {
                       setEndLocationName(startLocationName || currentLocationAddress || 'Current Location');
                     } else if (style.value === 'out-and-back') {
                       handleClearEndLocation();
+                    } else if (style.value === 'point-to-point') {
+                      // Clear end location — loop pre-fills it with the start,
+                      // and that should not carry over to point-to-point
+                      handleClearEndLocation();
                     }
-                    // point-to-point: keep existing end location if set
                   }}
                   style={[
                     styles.routeTypePill,

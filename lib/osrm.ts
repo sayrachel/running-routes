@@ -807,6 +807,66 @@ interface ResolvedCandidate {
 }
 
 /**
+ * Scale intermediate waypoints toward/away from center to adjust route distance.
+ * scaleFactor < 1 shrinks (closer to center), > 1 expands (farther from center).
+ */
+function scaleWaypoints(
+  waypoints: RoutePoint[],
+  center: RoutePoint,
+  scaleFactor: number
+): RoutePoint[] {
+  return waypoints.map((p, idx) => {
+    // Don't move start/end (first and last, which are typically center)
+    if (idx === 0 || idx === waypoints.length - 1) return p;
+    return {
+      lat: center.lat + (p.lat - center.lat) * scaleFactor,
+      lng: center.lng + (p.lng - center.lng) * scaleFactor,
+    };
+  });
+}
+
+/**
+ * Fetch an OSRM route and iteratively adjust waypoint distances so the
+ * routed distance lands within ±30% of the target. This handles cases
+ * where road routing is much longer than the geometric estimate (e.g.
+ * routes near water/barriers where OSRM must detour around obstacles).
+ */
+async function fetchOSRMRouteAdjusted(
+  waypoints: RoutePoint[],
+  center: RoutePoint,
+  targetDistanceKm: number,
+  maxRetries: number = 2
+): Promise<{ route: OSRMRoute | null; waypoints: RoutePoint[] }> {
+  let currentWaypoints = waypoints;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const route = await fetchOSRMRoute(currentWaypoints);
+    if (!route) return { route: null, waypoints: currentWaypoints };
+
+    const routeDistKm = route.distance / 1000;
+    const ratio = routeDistKm / targetDistanceKm;
+
+    // Accept if within 30%
+    if (ratio >= 0.7 && ratio <= 1.3) {
+      return { route, waypoints: currentWaypoints };
+    }
+
+    // On last attempt, return whatever we got
+    if (attempt === maxRetries) {
+      return { route, waypoints: currentWaypoints };
+    }
+
+    // Scale waypoints: if route is too long, shrink toward center
+    // Dampen the correction to avoid oscillation
+    const scaleFactor = 1 / ratio;
+    const dampedScale = 1 + (scaleFactor - 1) * 0.7;
+    currentWaypoints = scaleWaypoints(currentWaypoints, center, dampedScale);
+  }
+
+  return { route: null, waypoints: currentWaypoints };
+}
+
+/**
  * Call OSRM to get a walking route through the given waypoints.
  */
 async function fetchOSRMRoute(waypoints: RoutePoint[]): Promise<OSRMRoute | null> {
@@ -1044,15 +1104,24 @@ export async function generateOSRMRoutes(
     candidates.push({ variant, waypoints, anchors });
   }
 
-  // Step 3: Fetch OSRM routes for all candidates
+  // Step 3: Fetch OSRM routes for all candidates, with iterative distance
+  // adjustment. If a candidate's OSRM distance is too far from the target,
+  // shrink/expand waypoints toward center and re-query (up to 2 retries).
+  // Point-to-point routes skip adjustment since they must reach the destination.
+  const useAdjustment = routeType !== 'point-to-point';
   const osrmResults = await Promise.all(
-    candidates.map((c) => fetchOSRMRoute(c.waypoints))
+    candidates.map((c) =>
+      useAdjustment
+        ? fetchOSRMRouteAdjusted(c.waypoints, center, distanceKm)
+        : fetchOSRMRoute(c.waypoints).then((route) => ({ route, waypoints: c.waypoints }))
+    )
   );
 
   // Build resolved candidates
   const resolved: ResolvedCandidate[] = [];
   for (let i = 0; i < candidates.length; i++) {
-    const osrmRoute = osrmResults[i];
+    const osrmResult = osrmResults[i];
+    const osrmRoute = osrmResult.route;
     if (osrmRoute) {
       const rawPoints = osrmRoute.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }));
       const points = removeSelfintersections(rawPoints);
@@ -1077,7 +1146,7 @@ export async function generateOSRMRoutes(
       }
       resolved.push({ index: i, variant: candidates[i].variant, points, distKm, estimatedTime, fromOSRM: true, anchors: candidates[i].anchors });
     } else {
-      const wp = candidates[i].waypoints;
+      const wp = osrmResult.waypoints;
       const totalDist = wp.reduce((sum, p, j) => {
         if (j === 0) return 0;
         return sum + haversineDistance(wp[j - 1], p);
@@ -1102,6 +1171,7 @@ export async function generateOSRMRoutes(
   }
 
   // Step 3.5: If all candidates were rejected, fall back to a direct route
+  // Use iterative distance adjustment to ensure fallback also hits target distance
   if (resolved.length === 0) {
     console.log('[RouteScoring] All candidates rejected — generating direct fallback');
     let fallbackWaypoints: RoutePoint[];
@@ -1118,28 +1188,28 @@ export async function generateOSRMRoutes(
       fallbackWaypoints = generateLoopWaypoints(center, distanceKm, prefs, Date.now() % 100000, []);
     }
 
-    const fallbackOSRM = await fetchOSRMRoute(fallbackWaypoints);
-    if (fallbackOSRM) {
-      const points = fallbackOSRM.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }));
+    const adjusted = await fetchOSRMRouteAdjusted(fallbackWaypoints, center, distanceKm, 3);
+    if (adjusted.route) {
+      const points = adjusted.route.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }));
       resolved.push({
         index: 0,
         variant: 0,
         points,
-        distKm: fallbackOSRM.distance / 1000,
-        estimatedTime: Math.round(fallbackOSRM.duration / 60),
+        distKm: adjusted.route.distance / 1000,
+        estimatedTime: Math.round(adjusted.route.duration / 60),
         fromOSRM: true,
         anchors: [],
       });
     } else {
       // Use raw waypoints as last resort
       let totalDist = 0;
-      for (let j = 1; j < fallbackWaypoints.length; j++) {
-        totalDist += haversineDistance(fallbackWaypoints[j - 1], fallbackWaypoints[j]);
+      for (let j = 1; j < adjusted.waypoints.length; j++) {
+        totalDist += haversineDistance(adjusted.waypoints[j - 1], adjusted.waypoints[j]);
       }
       resolved.push({
         index: 0,
         variant: 0,
-        points: fallbackWaypoints,
+        points: adjusted.waypoints,
         distKm: totalDist,
         estimatedTime: Math.round(totalDist * 6),
         fromOSRM: false,
