@@ -274,7 +274,7 @@ export function useLocationTracking() {
             distanceInterval: 5,
             showsBackgroundLocationIndicator: true,
             foregroundService: {
-              notificationTitle: 'Running Routes',
+              notificationTitle: 'Run Routes',
               notificationBody: 'Tracking your run...',
             },
           });

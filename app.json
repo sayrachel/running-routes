@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "Running Routes",
+    "name": "Run Routes",
     "slug": "run-routes",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -17,8 +17,8 @@
       "bundleIdentifier": "com.runroutes.app",
       "buildNumber": "10",
       "infoPlist": {
-        "NSLocationWhenInUseUsageDescription": "Running Routes needs your location to generate running routes near you.",
-        "NSLocationAlwaysAndWhenInUseUsageDescription": "Running Routes needs background location access to track your run even when the app is in the background.",
+        "NSLocationWhenInUseUsageDescription": "Run Routes needs your location to generate running routes near you.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "Run Routes needs background location access to track your run even when the app is in the background.",
         "UIBackgroundModes": [
           "location"
         ],
@@ -45,8 +45,8 @@
       [
         "expo-location",
         {
-          "locationWhenInUsePermission": "Running Routes needs your location to generate running routes near you.",
-          "locationAlwaysAndWhenInUsePermission": "Running Routes needs background location access to track your run even when the app is in the background.",
+          "locationWhenInUsePermission": "Run Routes needs your location to generate running routes near you.",
+          "locationAlwaysAndWhenInUsePermission": "Run Routes needs background location access to track your run even when the app is in the background.",
           "isIosBackgroundLocationEnabled": true,
           "isAndroidBackgroundLocationEnabled": true,
           "isAndroidForegroundServiceEnabled": true
@@ -59,7 +59,7 @@
       "typedRoutes": true
     },
     "web": {
-      "name": "Running Routes",
+      "name": "Run Routes",
       "bundler": "metro"
     },
     "extra": {
