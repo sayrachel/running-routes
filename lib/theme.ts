@@ -1,5 +1,5 @@
 /**
- * Running Routes Design Tokens
+ * Run Routes Design Tokens
  * Extracted from running-routes-UI/app/globals.css HSL values.
  */
 

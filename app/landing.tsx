@@ -56,7 +56,7 @@ export default function LandingScreen() {
     <View style={[styles.container, { paddingTop: insets.top, paddingBottom: insets.bottom }]}>
       <View style={styles.content}>
         <Image source={require('@/assets/icon.png')} style={styles.appIcon} />
-        <Text style={styles.appName}>Running Routes</Text>
+        <Text style={styles.appName}>Run Routes</Text>
         <Text style={styles.tagline}>Generate new running routes</Text>
       </View>
 
