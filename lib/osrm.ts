@@ -197,17 +197,17 @@ function removeWaterCrossings(
 
 /**
  * Check if a green space is reachable from center without crossing a major barrier.
- * The maxRadius filter in selectGreenSpaceWaypoints already constrains distance,
- * and hasRoutedBarrierCrossing catches tunnels/bridges post-OSRM. This function
- * now just ensures the waypoint isn't suspiciously far (would require a bridge/tunnel).
+ * The maxRadius filter in selectGreenSpaceWaypoints constrains distance, and
+ * hasRoutedBarrierCrossing catches tunnels/bridges post-OSRM. This pre-filter
+ * only rejects waypoints that are extremely far (>3km), which almost certainly
+ * require a bridge or tunnel in dense urban areas.
  */
 function isAccessibleFromCenter(
   center: RoutePoint,
   target: RoutePoint,
   _greenSpaces: GreenSpace[]
 ): boolean {
-  // hasLikelyWaterCrossing handles the actual barrier check
-  return !hasLikelyWaterCrossing(center, target, []);
+  return haversineDistance(center, target) <= 3.0;
 }
 
 /**
@@ -380,10 +380,11 @@ function selectGreenSpaceWaypoints(
   strategy: CandidateStrategy
 ): { waypoints: RoutePoint[]; anchors: GreenSpace[] } | null {
   // Max distance from center: for a loop, the farthest point is roughly
-  // distance / (2π × overhead). Cap at a reasonable multiple to keep routes
-  // from crossing rivers/boroughs. For a 5km run this is ~1.1km, for 10km ~2.2km.
+  // distance / (2π × overhead). Allow up to 3× that so green spaces near
+  // the route perimeter are included, but cap so routes don't cross boroughs.
+  // Post-OSRM barrier detection (hasRoutedBarrierCrossing) catches tunnels/bridges.
   const loopRadius = targetDistanceKm / (2 * Math.PI * ROUTING_OVERHEAD);
-  const maxRadius = Math.min(loopRadius * 3.0, targetDistanceKm * 0.4);
+  const maxRadius = Math.max(loopRadius * 3.0, 2.0);
 
   // Annotate each green space with bearing and distance from center
   // Only use parks, gardens, and nature reserves as loop waypoints —

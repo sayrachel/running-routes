@@ -365,40 +365,11 @@ export default function RunScreen() {
             </View>
           ) : (
           <>
-          {/* Route selector */}
-          {ctx.routes.length > 1 && !hasStarted && (
-            <View style={styles.routeSelector}>
-              <Pressable
-                onPress={handlePrevRoute}
-                disabled={routeIndex === 0}
-                style={[styles.routeNavBtn, routeIndex === 0 && { opacity: 0.3 }]}
-              >
-                <Ionicons name="chevron-back" size={14} color={Colors.mutedForeground} />
-              </Pressable>
-              <Text style={styles.routeCounter}>
-                Route {routeIndex + 1} of {ctx.routes.length}
-              </Text>
-              <Pressable
-                onPress={handleNextRoute}
-                disabled={routeIndex >= ctx.routes.length - 1}
-                style={[styles.routeNavBtn, routeIndex >= ctx.routes.length - 1 && { opacity: 0.3 }]}
-              >
-                <Ionicons name="chevron-forward" size={14} color={Colors.mutedForeground} />
-              </Pressable>
-              <Pressable onPress={handleToggleFavorite} hitSlop={8} style={styles.routeFavBtn}>
-                <Ionicons
-                  name={isFavorited ? 'heart' : 'heart-outline'}
-                  size={18}
-                  color={isFavorited ? Colors.destructive : Colors.mutedForeground}
-                />
-              </Pressable>
-            </View>
-          )}
-          {/* Favorite button when only 1 route */}
-          {ctx.routes.length === 1 && !hasStarted && (
+          {/* Favorite button */}
+          {ctx.routes.length >= 1 && !hasStarted && (
             <View style={styles.routeSelector}>
               <Text style={styles.routeCounter}>
-                Route 1 of 1
+                {ctx.selectedRoute?.name || 'Route'}
               </Text>
               <Pressable onPress={handleToggleFavorite} hitSlop={8} style={styles.routeFavBtn}>
                 <Ionicons

@@ -574,7 +574,7 @@ export default function SetupScreen() {
         resolvedCenter,
         distanceKm,
         localRouteStyle === 'point-to-point' ? 'point-to-point' : localRouteStyle === 'out-and-back' ? 'out-and-back' : 'loop',
-        3,
+        1,
         localPrefs,
         end
       );
