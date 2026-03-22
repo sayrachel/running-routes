@@ -562,6 +562,10 @@ export default function SetupScreen() {
           ? ctx.distance
           : ctx.distance * 1.60934;
 
+    // Clear previous routes so the run page starts fresh with the loading spinner
+    ctx.setRoutes([]);
+    ctx.setSelectedRoute(null);
+
     // Navigate to run page immediately so the user sees the loading spinner
     router.replace('/run');
 
