@@ -125,43 +125,19 @@ export function angleDiff(a: number, b: number): number {
 }
 
 /**
- * Detect if two consecutive waypoints likely cross water or a major barrier.
- * Uses two checks:
- * 1. Flags if they are >0.6km apart AND no green space is within 0.3km of the midpoint.
- * 2. Flags if the bearing between the two points crosses a known barrier pattern
- *    (large gap with no infrastructure).
- * This is a universal heuristic — in Manhattan it catches Hudson/East River crossings,
- * in other cities it catches large gaps with no parks/paths (highways, industrial zones, etc).
+ * Detect if two consecutive waypoints are suspiciously far apart,
+ * suggesting a water crossing, tunnel, or major barrier between them.
+ *
+ * Simple distance threshold — if two waypoints in a running route are
+ * more than 1.5km apart in a straight line, OSRM will likely route
+ * through a tunnel or over a bridge to connect them.
  */
 function hasLikelyWaterCrossing(
   p1: RoutePoint,
   p2: RoutePoint,
-  greenSpaces: GreenSpace[]
+  _greenSpaces: GreenSpace[]
 ): boolean {
-  const dist = haversineDistance(p1, p2);
-  if (dist <= 0.6) return false;
-
-  // Check multiple sample points along the segment, not just the midpoint
-  const numSamples = Math.max(2, Math.ceil(dist / 0.3));
-  let uncoveredCount = 0;
-  for (let s = 1; s < numSamples; s++) {
-    const t = s / numSamples;
-    const sample: RoutePoint = {
-      lat: p1.lat + (p2.lat - p1.lat) * t,
-      lng: p1.lng + (p2.lng - p1.lng) * t,
-    };
-    let covered = false;
-    for (const gs of greenSpaces) {
-      if (haversineDistance(sample, gs.point) <= 0.3) {
-        covered = true;
-        break;
-      }
-    }
-    if (!covered) uncoveredCount++;
-  }
-
-  // If more than half the samples are uncovered, likely a barrier
-  return uncoveredCount > numSamples / 2;
+  return haversineDistance(p1, p2) > 1.5;
 }
 
 /**
@@ -221,93 +197,87 @@ function removeWaterCrossings(
 
 /**
  * Check if a green space is reachable from center without crossing a major barrier.
- * Samples points every ~300m along the direct path and checks for green space
- * coverage. If there's a consecutive stretch of >600m with no nearby green space,
- * it's likely crossing water, a highway, or an industrial zone.
+ * The maxRadius filter in selectGreenSpaceWaypoints already constrains distance,
+ * and hasRoutedBarrierCrossing catches tunnels/bridges post-OSRM. This function
+ * now just ensures the waypoint isn't suspiciously far (would require a bridge/tunnel).
  */
 function isAccessibleFromCenter(
   center: RoutePoint,
   target: RoutePoint,
-  greenSpaces: GreenSpace[]
+  _greenSpaces: GreenSpace[]
 ): boolean {
-  const dist = haversineDistance(center, target);
-  if (dist <= 0.5) return true; // Very close, always accessible
-
-  const sampleSpacing = 0.3; // km between samples
-  const numSamples = Math.max(3, Math.ceil(dist / sampleSpacing));
-  const actualSpacing = dist / numSamples;
-  let consecutiveGap = 0;
-
-  for (let i = 1; i < numSamples; i++) {
-    const t = i / numSamples;
-    const sample: RoutePoint = {
-      lat: center.lat + (target.lat - center.lat) * t,
-      lng: center.lng + (target.lng - center.lng) * t,
-    };
-
-    let hasNearby = false;
-    for (const gs of greenSpaces) {
-      if (haversineDistance(sample, gs.point) <= 0.5) {
-        hasNearby = true;
-        break;
-      }
-    }
-
-    if (!hasNearby) {
-      consecutiveGap += actualSpacing;
-      if (consecutiveGap >= 0.7) return false; // 0.7km+ dead zone = barrier
-    } else {
-      consecutiveGap = 0;
-    }
-  }
-
-  return true;
+  // hasLikelyWaterCrossing handles the actual barrier check
+  return !hasLikelyWaterCrossing(center, target, []);
 }
 
 /**
  * Check if a routed path (from OSRM) crosses a major barrier like a tunnel or bridge.
- * Samples the route at regular intervals and looks for stretches where the path
- * goes through areas with no green space coverage — indicating water, highways, etc.
- * This catches cases where OSRM routes through tunnels that pre-OSRM waypoint
- * checks wouldn't detect.
+ *
+ * Uses two complementary heuristics:
+ *
+ * 1. **Straight-line detection**: tunnels and bridges produce unnaturally straight
+ *    segments (low tortuosity) over long distances. We scan the route for any
+ *    stretch where the direct distance between two sampled points is >80% of the
+ *    walked distance over 400m+. Real streets in a city grid are never that straight
+ *    for that long — only tunnels and bridges are.
+ *
+ * 2. **Geographic drift**: if any point on the route strays more than a reasonable
+ *    radius from the center, the route has likely left the starting area (e.g.
+ *    Manhattan → NJ via Lincoln Tunnel). The max allowed drift scales with the
+ *    route's target distance so short runs stay local.
  */
 function hasRoutedBarrierCrossing(
   routePoints: RoutePoint[],
-  greenSpaces: GreenSpace[]
+  _greenSpaces: GreenSpace[],
+  center?: RoutePoint,
+  targetDistanceKm?: number
 ): boolean {
-  if (routePoints.length < 20 || greenSpaces.length === 0) return false;
+  if (routePoints.length < 20) return false;
 
-  // Sample every N points to check coverage
-  const sampleInterval = Math.max(1, Math.floor(routePoints.length / 40));
-  let consecutiveUncovered = 0;
-  let maxUncoveredDist = 0;
-  let uncoveredDist = 0;
+  // --- Heuristic 1: Straight-line (tunnel/bridge) detection ---
+  // Sample every N points and look for segments with very high tortuosity ratio
+  // (direct distance ÷ walked distance close to 1.0 over a long stretch)
+  const sampleInterval = Math.max(1, Math.floor(routePoints.length / 60));
+  const minStraightKm = 0.4; // 400m minimum to flag
 
-  for (let i = 0; i < routePoints.length; i += sampleInterval) {
-    const p = routePoints[i];
-    let covered = false;
-    for (const gs of greenSpaces) {
-      if (haversineDistance(p, gs.point) <= 0.4) {
-        covered = true;
-        break;
+  for (let i = 0; i < routePoints.length - sampleInterval * 3; i += sampleInterval) {
+    // Look ahead by multiple sample intervals to catch longer straight segments
+    for (let lookAhead = 3; lookAhead <= 8; lookAhead++) {
+      const j = i + sampleInterval * lookAhead;
+      if (j >= routePoints.length) break;
+
+      const directDist = haversineDistance(routePoints[i], routePoints[j]);
+      if (directDist < minStraightKm) continue;
+
+      // Compute walked distance along the route between i and j
+      let walkedDist = 0;
+      for (let k = i; k < j; k++) {
+        walkedDist += haversineDistance(routePoints[k], routePoints[k + 1]);
+      }
+
+      // Tortuosity ratio: 1.0 = perfectly straight, lower = more winding
+      // City streets are typically 0.5-0.7. Tunnels/bridges are 0.85+
+      const ratio = walkedDist > 0 ? directDist / walkedDist : 0;
+      if (ratio >= 0.85 && directDist >= minStraightKm) {
+        console.log(`[BarrierCheck] Straight segment detected: ${directDist.toFixed(3)}km, ratio=${ratio.toFixed(3)}`);
+        return true;
       }
     }
+  }
 
-    if (!covered) {
-      consecutiveUncovered++;
-      if (i >= sampleInterval) {
-        uncoveredDist += haversineDistance(routePoints[i - sampleInterval], p);
+  // --- Heuristic 2: Geographic drift from center ---
+  if (center && targetDistanceKm) {
+    // Max allowed distance from center: proportional to route distance,
+    // but capped conservatively. A 5km loop should stay within ~2km of start.
+    const maxDriftKm = Math.min(targetDistanceKm * 0.45, 8);
+
+    for (let i = 0; i < routePoints.length; i += sampleInterval) {
+      const drift = haversineDistance(center, routePoints[i]);
+      if (drift > maxDriftKm) {
+        console.log(`[BarrierCheck] Geographic drift: ${drift.toFixed(2)}km from center (max ${maxDriftKm.toFixed(2)}km)`);
+        return true;
       }
-      if (uncoveredDist > maxUncoveredDist) {
-        maxUncoveredDist = uncoveredDist;
-      }
-    } else {
-      consecutiveUncovered = 0;
-      uncoveredDist = 0;
     }
-
-    // If there's a 1km+ stretch with no green space coverage, likely a barrier
-    if (maxUncoveredDist >= 1.0) return true;
   }
 
   return false;
@@ -409,12 +379,11 @@ function selectGreenSpaceWaypoints(
   variant: number,
   strategy: CandidateStrategy
 ): { waypoints: RoutePoint[]; anchors: GreenSpace[] } | null {
-  // Max distance from center: a runner doing an N km loop can reasonably
-  // reach N*0.55 km from start. Use whichever is larger between the geometric
-  // radius and the distance-based limit so major parks (whose Overpass center
-  // may be far from their nearest edge) are reachable.
+  // Max distance from center: for a loop, the farthest point is roughly
+  // distance / (2π × overhead). Cap at a reasonable multiple to keep routes
+  // from crossing rivers/boroughs. For a 5km run this is ~1.1km, for 10km ~2.2km.
   const loopRadius = targetDistanceKm / (2 * Math.PI * ROUTING_OVERHEAD);
-  const maxRadius = Math.max(loopRadius * 4.0, targetDistanceKm * 0.55);
+  const maxRadius = Math.min(loopRadius * 3.0, targetDistanceKm * 0.4);
 
   // Annotate each green space with bearing and distance from center
   // Only use parks, gardens, and nature reserves as loop waypoints —
@@ -1136,11 +1105,9 @@ export async function generateOSRMRoutes(
         console.log(`[RouteScoring] Rejecting candidate ${i}: dist=${distKm.toFixed(2)}km (ratio=${distRatio.toFixed(2)}, target=${distanceKm.toFixed(2)}km)`);
         continue;
       }
-      // Check the routed path for long straight segments (tunnels/bridges)
-      // Sample the route every ~50 points and look for segments where
-      // consecutive route points are very far apart relative to their
-      // count, indicating the route passes through a tunnel or over a bridge
-      if (routeType !== 'point-to-point' && hasRoutedBarrierCrossing(points, greenSpaces)) {
+      // Check the routed path for tunnels/bridges (straight-line segments)
+      // and geographic drift (route leaving the starting area)
+      if (routeType !== 'point-to-point' && hasRoutedBarrierCrossing(points, greenSpaces, center, distanceKm)) {
         console.log(`[RouteScoring] Rejecting candidate ${i}: route crosses a likely barrier (tunnel/bridge)`);
         continue;
       }

@@ -148,35 +148,41 @@ const ROUTE_STYLES: { value: RouteStyle; label: string; desc: string }[] = [
   { value: 'point-to-point', label: 'Point to Point', desc: 'Run from A to B in one direction' },
 ];
 
-const NOMINATIM_BASE = 'https://nominatim.openstreetmap.org/search';
+const PHOTON_BASE = 'https://photon.komoot.io/api';
 
-/** Debounced Nominatim geocoding for address autocomplete, biased to user location */
+/** Autocomplete geocoding via Photon (Komoot), biased toward user location */
 async function searchAddresses(query: string, center?: { lat: number; lng: number }): Promise<GeocodeSuggestion[]> {
-  if (query.trim().length < 3) return [];
+  if (query.trim().length < 2) return [];
   try {
     const params = new URLSearchParams({
       q: query.trim(),
-      format: 'json',
       limit: '5',
-      addressdetails: '0',
     });
-    // Strictly limit results to within ~50km of the user's current location
+    // Bias results toward user location (soft bias, not a hard boundary)
     if (center) {
-      const offset = 0.5; // ~50km in degrees
-      params.set('viewbox', `${center.lng - offset},${center.lat + offset},${center.lng + offset},${center.lat - offset}`);
-      params.set('bounded', '1'); // strictly limit results to viewbox
+      params.set('lat', String(center.lat));
+      params.set('lon', String(center.lng));
     }
-    const res = await fetch(`${NOMINATIM_BASE}?${params}`, {
-      headers: { 'User-Agent': 'RunningRoutes/1.0' },
-    });
+    const res = await fetch(`${PHOTON_BASE}?${params}`);
     if (!res.ok) return [];
     const data = await res.json();
-    return data.map((item: any) => ({
-      placeId: String(item.place_id),
-      displayName: item.display_name,
-      lat: parseFloat(item.lat),
-      lng: parseFloat(item.lon),
-    }));
+    return (data.features || []).map((f: any) => {
+      const p = f.properties || {};
+      const parts: string[] = [];
+      if (p.housenumber && p.street) parts.push(`${p.housenumber} ${p.street}`);
+      else if (p.street) parts.push(p.street);
+      else if (p.name) parts.push(p.name);
+      if (p.city || p.town || p.village) parts.push(p.city || p.town || p.village);
+      if (p.state) parts.push(p.state);
+      const displayName = parts.length > 0 ? parts.join(', ') : (p.name || 'Unknown');
+      const [lng, lat] = f.geometry.coordinates;
+      return {
+        placeId: String(p.osm_id || `${lat},${lng}`),
+        displayName,
+        lat,
+        lng,
+      };
+    });
   } catch {
     return [];
   }
@@ -274,13 +280,13 @@ export default function SetupScreen() {
     };
   }, []);
 
-  // Re-fetch GPS every time the screen is focused, unless the user has manually
-  // set a start location. This ensures returning from a run resets center to the
-  // user's actual position instead of keeping the previously searched location.
+  // Re-fetch GPS every time the screen is focused, but only if the user hasn't
+  // manually set a start location. This ensures returning from a run resets
+  // center to the user's actual position, while preserving any typed address.
   useFocusEffect(
     useCallback(() => {
-      // Reset manual location override when returning to this screen
-      setStartLocationName(null);
+      // Only auto-update location if user hasn't manually set one
+      if (startLocationName) return;
       (async () => {
         const { status } = await Location.requestForegroundPermissionsAsync();
         if (status === 'granted') {
@@ -310,14 +316,14 @@ export default function SetupScreen() {
           ctx.setHasLocation(true);
         }
       })();
-    }, [])
+    }, [startLocationName])
   );
 
   // Debounced start address autocomplete
   const handleStartAddressChange = useCallback((text: string) => {
     setStartAddressText(text);
     if (startDebounceRef.current) clearTimeout(startDebounceRef.current);
-    if (text.trim().length < 3) {
+    if (text.trim().length < 2) {
       setStartSuggestions([]);
       return;
     }
@@ -328,14 +334,14 @@ export default function SetupScreen() {
       if (requestId === startRequestIdRef.current) {
         setStartSuggestions(results);
       }
-    }, 400);
+    }, 200);
   }, [ctx.center]);
 
   // Debounced end address autocomplete
   const handleEndAddressChange = useCallback((text: string) => {
     setEndAddressText(text);
     if (endDebounceRef.current) clearTimeout(endDebounceRef.current);
-    if (text.trim().length < 3) {
+    if (text.trim().length < 2) {
       setEndSuggestions([]);
       return;
     }
@@ -346,7 +352,7 @@ export default function SetupScreen() {
       if (requestId === endRequestIdRef.current) {
         setEndSuggestions(results);
       }
-    }, 400);
+    }, 200);
   }, [ctx.center]);
 
   const selectStartSuggestion = useCallback((suggestion: GeocodeSuggestion) => {
