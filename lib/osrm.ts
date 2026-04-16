@@ -1,7 +1,7 @@
 import type { RoutePoint, GeneratedRoute, RoutePreferences } from './route-generator';
-import { fetchQuietScore, fetchGreenSpacesEnriched } from './overpass';
+import { fetchQuietScore, fetchGreenSpacesEnriched, fetchHighwaySegments } from './overpass';
 import type { GreenSpace } from './overpass';
-import { scoreRoute, computeGreenSpaceProximity, computeRunPathProximity } from './route-scoring';
+import { scoreRoute, computeGreenSpaceProximity, computeRunPathProximity, computeHighwayProximity, computeWaterfrontProximity } from './route-scoring';
 
 const OSRM_BASE = 'https://router.project-osrm.org/route/v1/foot';
 const CANDIDATE_COUNT = 3;
@@ -25,7 +25,7 @@ const ROUTING_OVERHEAD = 1.45;
  * keeping the shorter path. This prevents routes where runners
  * would have to double back on the same streets.
  */
-function removeSelfintersections(points: RoutePoint[]): RoutePoint[] {
+export function removeSelfintersections(points: RoutePoint[]): RoutePoint[] {
   if (points.length < 20) return points;
 
   // Sample every N points for performance (checking all pairs is O(n^2))
@@ -53,7 +53,7 @@ function removeSelfintersections(points: RoutePoint[]): RoutePoint[] {
 }
 
 /** Check if two line segments cross each other */
-function segmentsCross(
+export function segmentsCross(
   a1: RoutePoint, a2: RoutePoint,
   b1: RoutePoint, b2: RoutePoint
 ): boolean {
@@ -132,7 +132,7 @@ export function angleDiff(a: number, b: number): number {
  * more than 1.5km apart in a straight line, OSRM will likely route
  * through a tunnel or over a bridge to connect them.
  */
-function hasLikelyWaterCrossing(
+export function hasLikelyWaterCrossing(
   p1: RoutePoint,
   p2: RoutePoint,
   _greenSpaces: GreenSpace[]
@@ -146,12 +146,12 @@ function hasLikelyWaterCrossing(
  * general direction from center that is itself accessible. If no safe
  * replacement exists, the waypoint is dropped entirely.
  */
-function removeWaterCrossings(
+export function removeWaterCrossings(
   waypoints: RoutePoint[],
   greenSpaces: GreenSpace[],
   center: RoutePoint
 ): RoutePoint[] {
-  if (waypoints.length < 3 || greenSpaces.length === 0) return waypoints;
+  if (waypoints.length < 3) return waypoints;
 
   const result = [...waypoints];
   const toRemove = new Set<number>();
@@ -166,24 +166,26 @@ function removeWaterCrossings(
     const targetBearing = bearingFrom(center, result[i]);
     let replaced = false;
 
-    // Sort green spaces by score (prefer large named parks)
-    const candidates = [...greenSpaces]
-      .filter((gs) => {
-        const gsBearing = bearingFrom(center, gs.point);
-        return angleDiff(gsBearing, targetBearing) <= 60;
-      })
-      .sort((a, b) => (b.areaSize * 10 + (b.name ? 5 : 0)) - (a.areaSize * 10 + (a.name ? 5 : 0)));
+    if (greenSpaces.length > 0) {
+      // Sort green spaces by score (prefer large named parks)
+      const candidates = [...greenSpaces]
+        .filter((gs) => {
+          const gsBearing = bearingFrom(center, gs.point);
+          return angleDiff(gsBearing, targetBearing) <= 60;
+        })
+        .sort((a, b) => (b.areaSize * 10 + (b.name ? 5 : 0)) - (a.areaSize * 10 + (a.name ? 5 : 0)));
 
-    for (const gs of candidates) {
-      if (hasLikelyWaterCrossing(center, gs.point, greenSpaces)) continue;
-      const prevOk = !hasLikelyWaterCrossing(result[i - 1], gs.point, greenSpaces);
-      const nextOk = i + 1 < result.length
-        ? !hasLikelyWaterCrossing(gs.point, result[i + 1], greenSpaces)
-        : true;
-      if (prevOk && nextOk) {
-        result[i] = gs.point;
-        replaced = true;
-        break;
+      for (const gs of candidates) {
+        if (hasLikelyWaterCrossing(center, gs.point, greenSpaces)) continue;
+        const prevOk = !hasLikelyWaterCrossing(result[i - 1], gs.point, greenSpaces);
+        const nextOk = i + 1 < result.length
+          ? !hasLikelyWaterCrossing(gs.point, result[i + 1], greenSpaces)
+          : true;
+        if (prevOk && nextOk) {
+          result[i] = gs.point;
+          replaced = true;
+          break;
+        }
       }
     }
 
@@ -202,7 +204,7 @@ function removeWaterCrossings(
  * only rejects waypoints that are extremely far (>3km), which almost certainly
  * require a bridge or tunnel in dense urban areas.
  */
-function isAccessibleFromCenter(
+export function isAccessibleFromCenter(
   center: RoutePoint,
   target: RoutePoint,
   _greenSpaces: GreenSpace[]
@@ -226,7 +228,7 @@ function isAccessibleFromCenter(
  *    Manhattan → NJ via Lincoln Tunnel). The max allowed drift scales with the
  *    route's target distance so short runs stay local.
  */
-function hasRoutedBarrierCrossing(
+export function hasRoutedBarrierCrossing(
   routePoints: RoutePoint[],
   _greenSpaces: GreenSpace[],
   center?: RoutePoint,
@@ -237,6 +239,8 @@ function hasRoutedBarrierCrossing(
   // --- Heuristic 1: Straight-line (tunnel/bridge) detection ---
   // Sample every N points and look for segments with very high tortuosity ratio
   // (direct distance ÷ walked distance close to 1.0 over a long stretch)
+  // AND low bearing variance (tunnels/bridges maintain constant direction,
+  // while smooth curves have steadily changing bearings).
   const sampleInterval = Math.max(1, Math.floor(routePoints.length / 60));
   const minStraightKm = 0.4; // 400m minimum to flag
 
@@ -259,6 +263,28 @@ function hasRoutedBarrierCrossing(
       // City streets are typically 0.5-0.7. Tunnels/bridges are 0.85+
       const ratio = walkedDist > 0 ? directDist / walkedDist : 0;
       if (ratio >= 0.85 && directDist >= minStraightKm) {
+        // Check total bearing change to distinguish tunnels from smooth curves.
+        // Tunnels/bridges maintain near-constant bearing (total change < 15°).
+        // Smooth curves (arcs) accumulate bearing change across the span (> 15°).
+        // We measure the total accumulated bearing change, not just the max
+        // consecutive change, because a smooth arc changes direction gradually
+        // (each step may be only ~6°) but the total over many steps is large.
+        const bearings: number[] = [];
+        for (let k = i; k < j; k++) {
+          const segDist = haversineDistance(routePoints[k], routePoints[k + 1]);
+          if (segDist > 0.001) { // skip near-zero segments
+            bearings.push(bearingFrom(routePoints[k], routePoints[k + 1]));
+          }
+        }
+        if (bearings.length >= 2) {
+          let totalBearingChange = 0;
+          for (let k = 1; k < bearings.length; k++) {
+            totalBearingChange += angleDiff(bearings[k], bearings[k - 1]);
+          }
+          // If total bearing change exceeds 15°, this is a curve, not a tunnel
+          if (totalBearingChange > 15) continue;
+        }
+
         console.log(`[BarrierCheck] Straight segment detected: ${directDist.toFixed(3)}km, ratio=${ratio.toFixed(3)}`);
         return true;
       }
@@ -341,10 +367,19 @@ export function scoreGreenSpace(
   if (gs.name) score += strategy === 'named-paths' ? 8 : 3;
 
   // Area bonus (parks/gardens/nature reserves)
+  // Use log scale so large parks (Central Park ~3.4km², McCarren ~0.14km²)
+  // score meaningfully higher than pocket parks (~0.01km²)
   if (gs.areaSize > 0) {
-    const areaBonus = Math.min(gs.areaSize * 50, 10); // cap at 10
+    // log10(0.01*1000)=1, log10(0.14*1000)=2.1, log10(3.4*1000)=3.5
+    const areaBonus = Math.min(Math.log10(gs.areaSize * 1000 + 1) * 5, 18);
     score += strategy === 'large-parks' ? areaBonus * 2 : areaBonus;
-    if (strict) score += areaBonus; // doubled in strict mode
+    if (strict) score += areaBonus;
+  }
+
+  // Large named parks are landmarks — runners specifically seek these out
+  if (gs.name && gs.areaSize > 0.05) {
+    score += 5; // named park bonus
+    if (gs.areaSize > 0.5) score += 5; // major park bonus (e.g., Central Park, Prospect Park)
   }
 
   // Kind bonuses
@@ -353,6 +388,8 @@ export function scoreGreenSpace(
   // Bike lanes and footways are ideal running surfaces — boost them
   if (gs.kind === 'cycleway') score += 4;
   if (gs.kind === 'footway' || gs.kind === 'path') score += 3;
+  // Waterfront paths are among the most popular running corridors
+  if (gs.kind === 'waterfront') score += 6;
 
   return score;
 }
@@ -371,7 +408,7 @@ export function scoreGreenSpace(
  *
  * Returns null if fewer than 3 green space waypoints found (caller should fall back).
  */
-function selectGreenSpaceWaypoints(
+export function selectGreenSpaceWaypoints(
   center: RoutePoint,
   greenSpaces: GreenSpace[],
   targetDistanceKm: number,
@@ -387,11 +424,11 @@ function selectGreenSpaceWaypoints(
   const maxRadius = Math.max(loopRadius * 3.0, 2.0);
 
   // Annotate each green space with bearing and distance from center
-  // Only use parks, gardens, and nature reserves as loop waypoints —
+  // Use parks, gardens, nature reserves, and waterfront as loop waypoints —
   // bike lanes and footways should influence scoring, not force OSRM detours
-  const parkKinds = new Set(['park', 'garden', 'nature']);
+  const waypointKinds = new Set(['park', 'garden', 'nature', 'waterfront']);
   const annotated = greenSpaces
-    .filter((gs) => parkKinds.has(gs.kind) || (gs.kind === 'route' && gs.name))
+    .filter((gs) => waypointKinds.has(gs.kind) || (gs.kind === 'route' && gs.name))
     .map((gs) => {
     // Variant-dependent perturbation for refresh diversity
     const perturbation = Math.sin(variant * 1000 + gs.point.lat * 10000 + gs.point.lng * 10000) * 2;
@@ -551,6 +588,59 @@ export function estimateCircuitDistance(waypoints: RoutePoint[]): number {
     sum += haversineDistance(waypoints[i - 1], waypoints[i]);
   }
   return sum * ROUTING_OVERHEAD;
+}
+
+/**
+ * Expand large park waypoints into entry/exit pairs so OSRM routes
+ * *through* the park interior, not just past its edge.
+ *
+ * For each waypoint backed by a park above the area threshold, replaces
+ * the single center point with two points:
+ *   - Entry: offset from center toward the previous waypoint
+ *   - Exit: offset from center toward the next waypoint
+ *
+ * This forces OSRM to find a path from the entry edge to the exit edge,
+ * which traverses the park's internal footways/paths.
+ */
+export function expandParkWaypoints(
+  waypoints: RoutePoint[],
+  anchors: GreenSpace[],
+  minAreaForExpansion: number = 0.1
+): RoutePoint[] {
+  if (waypoints.length < 3 || anchors.length === 0) return waypoints;
+
+  const result: RoutePoint[] = [waypoints[0]];
+
+  for (let i = 1; i < waypoints.length - 1; i++) {
+    const anchorIdx = i - 1;
+    if (anchorIdx >= anchors.length || anchors[anchorIdx].areaSize < minAreaForExpansion) {
+      result.push(waypoints[i]);
+      continue;
+    }
+
+    const anchor = anchors[anchorIdx];
+    // Estimate park "radius" from area (assuming roughly square)
+    // and cap offset so we don't overshoot small-medium parks
+    const parkRadiusKm = Math.sqrt(anchor.areaSize) / 2;
+    const offset = Math.min(parkRadiusKm * 0.6, 0.4);
+
+    const prev = waypoints[i - 1];
+    const next = i + 1 < waypoints.length ? waypoints[i + 1] : waypoints[0];
+    const parkCenter = waypoints[i];
+
+    // Entry: offset toward previous waypoint (where runner enters the park)
+    const entryBearing = bearingFrom(parkCenter, prev);
+    const entry = destinationPoint(parkCenter, entryBearing, offset);
+
+    // Exit: offset toward next waypoint (where runner leaves the park)
+    const exitBearing = bearingFrom(parkCenter, next);
+    const exit = destinationPoint(parkCenter, exitBearing, offset);
+
+    result.push(entry, exit);
+  }
+
+  result.push(waypoints[waypoints.length - 1]);
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -780,7 +870,7 @@ interface ResolvedCandidate {
  * Scale intermediate waypoints toward/away from center to adjust route distance.
  * scaleFactor < 1 shrinks (closer to center), > 1 expands (farther from center).
  */
-function scaleWaypoints(
+export function scaleWaypoints(
   waypoints: RoutePoint[],
   center: RoutePoint,
   scaleFactor: number
@@ -1003,9 +1093,12 @@ export async function generateOSRMRoutes(
   prefs: RoutePreferences = { lowTraffic: false },
   end?: RoutePoint | null
 ): Promise<GeneratedRoute[]> {
-  // Step 1: Always fetch enriched green spaces (shared across all candidates)
+  // Step 1: Fetch enriched green spaces and highway segments (shared across all candidates)
   const radiusKm = calculateSearchRadius(routeType, distanceKm, center, end);
-  const greenSpaces = await fetchGreenSpacesEnriched(center, radiusKm);
+  const [greenSpaces, highwayPoints] = await Promise.all([
+    fetchGreenSpacesEnriched(center, radiusKm),
+    fetchHighwaySegments(center, radiusKm),
+  ]);
 
   // Step 2: Generate candidate waypoint sets with diversity
   // Each candidate excludes parks used by previous candidates so routes
@@ -1071,6 +1164,10 @@ export async function generateOSRMRoutes(
     // Apply water crossing removal before OSRM
     waypoints = removeWaterCrossings(waypoints, greenSpaces, center);
 
+    // Expand large parks into entry/exit pairs so OSRM routes through
+    // the park interior, not just past its edge
+    waypoints = expandParkWaypoints(waypoints, anchors);
+
     candidates.push({ variant, waypoints, anchors });
   }
 
@@ -1110,6 +1207,14 @@ export async function generateOSRMRoutes(
       // and geographic drift (route leaving the starting area)
       if (routeType !== 'point-to-point' && hasRoutedBarrierCrossing(points, greenSpaces, center, distanceKm)) {
         console.log(`[RouteScoring] Rejecting candidate ${i}: route crosses a likely barrier (tunnel/bridge)`);
+        continue;
+      }
+      // Check for highway proximity — reject routes where >15% of points
+      // are near major roads (motorways, trunk, primary). Runners should
+      // never be routed along highways.
+      const hwProximity = computeHighwayProximity(points, highwayPoints);
+      if (hwProximity > 0.15) {
+        console.log(`[RouteScoring] Rejecting candidate ${i}: ${(hwProximity * 100).toFixed(0)}% of route is near highways`);
         continue;
       }
       resolved.push({ index: i, variant: candidates[i].variant, points, distKm, estimatedTime, fromOSRM: true, anchors: candidates[i].anchors });
@@ -1193,20 +1298,29 @@ export async function generateOSRMRoutes(
   const scored = resolved.map((candidate) => {
     const greenProximity = computeGreenSpaceProximity(candidate.points, greenSpaces);
     const runPathProximity = computeRunPathProximity(candidate.points, greenSpaces);
+    const waterfrontProximity = computeWaterfrontProximity(candidate.points, greenSpaces);
+    const hwProximity = computeHighwayProximity(candidate.points, highwayPoints);
     // Use a neutral quiet score (0.5) to avoid extra network calls
     const quietScore = 0.5;
-    const score = scoreRoute(
+    let score = scoreRoute(
       { distanceKm: candidate.distKm, targetDistanceKm: distanceKm },
       prefs,
       quietScore,
       greenProximity,
-      runPathProximity
+      runPathProximity,
+      waterfrontProximity
     );
+
+    // Penalize any highway proximity that slipped through the hard rejection
+    if (hwProximity > 0) {
+      score *= (1 - hwProximity);
+    }
 
     console.log(
       `[RouteScoring] Candidate ${candidate.index}: dist=${candidate.distKm.toFixed(2)}km, ` +
       `green=${greenProximity.toFixed(2)}, ` +
-      `runPath=${runPathProximity.toFixed(2)}, score=${score.toFixed(3)}`
+      `runPath=${runPathProximity.toFixed(2)}, waterfront=${waterfrontProximity.toFixed(2)}, ` +
+      `highway=${hwProximity.toFixed(2)}, score=${score.toFixed(3)}`
     );
 
     return { candidate, score, quietScore };

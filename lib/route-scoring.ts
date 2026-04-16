@@ -55,6 +55,42 @@ export function computeGreenSpaceProximity(
 }
 
 /**
+ * Compute what fraction of route points are near waterfront features
+ * (coastlines, riverbanks, promenades, boardwalks). Waterfront paths
+ * are among the most popular running corridors in any city.
+ *
+ * @param routePoints - The full route polyline
+ * @param greenSpaces - Enriched green spaces (includes waterfront features)
+ * @param proximityKm - Distance threshold in km (default 0.3 = 300m, wider since water features are area-based)
+ * @returns Score between 0 and 1 (fraction of sampled points near waterfront)
+ */
+export function computeWaterfrontProximity(
+  routePoints: RoutePoint[],
+  greenSpaces: GreenSpace[],
+  proximityKm: number = 0.3
+): number {
+  const waterfrontFeatures = greenSpaces.filter((gs) => gs.kind === 'waterfront');
+  if (routePoints.length === 0 || waterfrontFeatures.length === 0) return 0;
+
+  const step = Math.max(1, Math.floor(routePoints.length / Math.ceil(routePoints.length / 20)));
+  let nearCount = 0;
+  let sampleCount = 0;
+
+  for (let i = 0; i < routePoints.length; i += step) {
+    sampleCount++;
+    const rp = routePoints[i];
+    for (const wf of waterfrontFeatures) {
+      if (haversineDistance(rp, wf.point) <= proximityKm) {
+        nearCount++;
+        break;
+      }
+    }
+  }
+
+  return sampleCount > 0 ? nearCount / sampleCount : 0;
+}
+
+/**
  * Compute what fraction of route points are near bike lanes, cycleways,
  * footways, or other car-free paths. These are ideal running surfaces.
  *
@@ -68,9 +104,9 @@ export function computeRunPathProximity(
   greenSpaces: GreenSpace[],
   proximityKm: number = 0.15
 ): number {
-  // Filter to only bike lanes, footways, paths, and designated routes
+  // Filter to only bike lanes, footways, paths, designated routes, and waterfront paths
   const runPaths = greenSpaces.filter(
-    (gs) => gs.kind === 'cycleway' || gs.kind === 'footway' || gs.kind === 'path' || gs.kind === 'route'
+    (gs) => gs.kind === 'cycleway' || gs.kind === 'footway' || gs.kind === 'path' || gs.kind === 'route' || gs.kind === 'waterfront'
   );
   if (routePoints.length === 0 || runPaths.length === 0) return 0;
 
@@ -93,11 +129,46 @@ export function computeRunPathProximity(
 }
 
 /**
+ * Compute what fraction of route points are dangerously close to major highways
+ * (motorways, trunk roads, primary roads). Routes with high highway proximity
+ * are unsafe for runners and should be rejected.
+ *
+ * @param routePoints - The full route polyline
+ * @param highwayPoints - Center points of major highway segments near the route
+ * @param proximityKm - Distance threshold in km (default 0.1 = 100m)
+ * @returns Score between 0 and 1 (fraction of sampled points near a highway)
+ */
+export function computeHighwayProximity(
+  routePoints: RoutePoint[],
+  highwayPoints: RoutePoint[],
+  proximityKm: number = 0.1
+): number {
+  if (routePoints.length === 0 || highwayPoints.length === 0) return 0;
+
+  const step = Math.max(1, Math.floor(routePoints.length / Math.ceil(routePoints.length / 20)));
+  let nearCount = 0;
+  let sampleCount = 0;
+
+  for (let i = 0; i < routePoints.length; i += step) {
+    sampleCount++;
+    const rp = routePoints[i];
+    for (const hp of highwayPoints) {
+      if (haversineDistance(rp, hp) <= proximityKm) {
+        nearCount++;
+        break;
+      }
+    }
+  }
+
+  return sampleCount > 0 ? nearCount / sampleCount : 0;
+}
+
+/**
  * Score a route candidate (0–1) based on user preferences and real API data.
  *
  * Scoring weights:
- * - Avoid Traffic OFF (relaxed): 60% distance, 15% green proximity, 25% run-path proximity
- * - Avoid Traffic ON (strict): 30% distance, 20% quiet, 25% green proximity, 25% run-path proximity
+ * - Avoid Traffic OFF (relaxed): 50% distance, 15% green, 20% run-path, 15% waterfront
+ * - Avoid Traffic ON (strict): 25% distance, 15% quiet, 20% green, 20% run-path, 20% waterfront
  *
  * @returns score between 0 and 1 (higher is better)
  */
@@ -106,7 +177,8 @@ export function scoreRoute(
   prefs: RoutePreferences,
   quietScore: number,
   greenSpaceProximity: number = 0.5,
-  runPathProximity: number = 0.5
+  runPathProximity: number = 0.5,
+  waterfrontProximity: number = 0
 ): number {
   // Distance accuracy score (same for both modes)
   const distRatio = candidate.targetDistanceKm > 0
@@ -115,10 +187,10 @@ export function scoreRoute(
   const distScore = Math.max(1.0 - Math.abs(1.0 - distRatio) * 4, 0);
 
   if (prefs.lowTraffic) {
-    // Strict mode: 30% distance, 20% quiet, 25% green, 25% run-path
-    return 0.30 * distScore + 0.20 * quietScore + 0.25 * greenSpaceProximity + 0.25 * runPathProximity;
+    // Strict mode: 25% distance, 15% quiet, 20% green, 20% run-path, 20% waterfront
+    return 0.25 * distScore + 0.15 * quietScore + 0.20 * greenSpaceProximity + 0.20 * runPathProximity + 0.20 * waterfrontProximity;
   } else {
-    // Relaxed mode: 60% distance, 15% green, 25% run-path
-    return 0.60 * distScore + 0.15 * greenSpaceProximity + 0.25 * runPathProximity;
+    // Relaxed mode: 50% distance, 15% green, 20% run-path, 15% waterfront
+    return 0.50 * distScore + 0.15 * greenSpaceProximity + 0.20 * runPathProximity + 0.15 * waterfrontProximity;
   }
 }
