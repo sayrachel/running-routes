@@ -15,6 +15,15 @@
       "node_modules/(?!((jest-)?react-native|@react-native(-community)?)|expo(nern-fo-web)?|@expo(nent)?/.*)"
     ]
   },
+  "expo": {
+    "install": {
+      "exclude": [
+        "@types/jest",
+        "jest-expo",
+        "react-native-worklets"
+      ]
+    }
+  },
   "dependencies": {
     "@expo-google-fonts/inter": "^0.2.3",
     "@expo-google-fonts/space-mono": "^0.2.3",
@@ -27,6 +36,7 @@
     "expo-asset": "~12.0.12",
     "expo-blur": "~15.0.8",
     "expo-clipboard": "~8.0.8",
+    "expo-constants": "~18.0.13",
     "expo-crypto": "~15.0.8",
     "expo-dev-client": "~6.0.20",
     "expo-file-system": "~19.0.21",
