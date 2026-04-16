@@ -4,7 +4,7 @@ const OVERPASS_URLS = [
   'https://overpass-api.de/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter',
 ];
-const TIMEOUT_MS = 4000;
+const TIMEOUT_MS = 3000;
 const BBOX_BUFFER_DEG = 0.002; // ~200m buffer in degrees
 
 /** Enriched green space with metadata for waypoint selection */
@@ -265,31 +265,19 @@ export async function fetchGreenSpacesEnriched(
   const lat = center.lat;
   const lng = center.lng;
 
-  // Streamlined query: focus on parks/gardens/reserves (waypoint selection),
-  // named cycleways/routes (scoring), and waterfront paths (popular running corridors).
-  // Skip unnamed footways/paths/tracks which return huge result sets.
+  // Consolidated query using regex to reduce sub-query count (faster Overpass response).
+  // Covers parks/gardens/reserves (way+relation), named cycleways, routes, and waterfront.
+  const a = `around:${radiusMeters},${lat},${lng}`;
   const query = `[out:json][timeout:4];(
-    way["leisure"="park"](around:${radiusMeters},${lat},${lng});
-    relation["leisure"="park"](around:${radiusMeters},${lat},${lng});
-    way["leisure"="nature_reserve"](around:${radiusMeters},${lat},${lng});
-    relation["leisure"="nature_reserve"](around:${radiusMeters},${lat},${lng});
-    way["leisure"="garden"](around:${radiusMeters},${lat},${lng});
-    relation["leisure"="garden"](around:${radiusMeters},${lat},${lng});
-    node["leisure"="park"](around:${radiusMeters},${lat},${lng});
-    node["leisure"="nature_reserve"](around:${radiusMeters},${lat},${lng});
-    way["highway"="cycleway"]["name"](around:${radiusMeters},${lat},${lng});
-    way["highway"="pedestrian"](around:${radiusMeters},${lat},${lng});
-    relation["route"="foot"](around:${radiusMeters},${lat},${lng});
-    relation["route"="bicycle"](around:${radiusMeters},${lat},${lng});
-    relation["route"="running"](around:${radiusMeters},${lat},${lng});
-    way["foot"="designated"]["name"](around:${radiusMeters},${lat},${lng});
-    way["man_made"="pier"]["foot"!="no"](around:${radiusMeters},${lat},${lng});
-    way["waterway"="riverbank"](around:${radiusMeters},${lat},${lng});
-    way["natural"="coastline"](around:${radiusMeters},${lat},${lng});
-    way["natural"="water"]["name"](around:${radiusMeters},${lat},${lng});
-    way["leisure"="promenade"](around:${radiusMeters},${lat},${lng});
-    way["highway"]["name"]["waterway"](around:${radiusMeters},${lat},${lng});
-    way["name"~"[Bb]oardwalk|[Pp]romenade|[Ee]splanade|[Ww]aterfront|[Rr]iverwalk|[Ss]eawall|[Bb]each [Ww]alk"](around:${radiusMeters},${lat},${lng});
+    nwr["leisure"~"^(park|nature_reserve|garden)$"](${a});
+    way["highway"="cycleway"]["name"](${a});
+    way["highway"="pedestrian"](${a});
+    relation["route"~"^(foot|bicycle|running)$"](${a});
+    way["foot"="designated"]["name"](${a});
+    way["man_made"="pier"]["foot"!="no"](${a});
+    way["waterway"="riverbank"](${a});
+    way["natural"~"^(coastline|water)$"]["name"](${a});
+    way["name"~"[Bb]oardwalk|[Pp]romenade|[Ee]splanade|[Ww]aterfront|[Rr]iverwalk|[Ss]eawall"](${a});
   );out center bb tags;`;
 
   try {

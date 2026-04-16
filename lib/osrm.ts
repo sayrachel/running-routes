@@ -4,7 +4,7 @@ import type { GreenSpace } from './overpass';
 import { scoreRoute, computeGreenSpaceProximity, computeRunPathProximity, computeHighwayProximity, computeWaterfrontProximity } from './route-scoring';
 
 const OSRM_BASE = 'https://router.project-osrm.org/route/v1/foot';
-const CANDIDATE_COUNT = 3;
+const MAX_CANDIDATE_COUNT = 3;
 
 /**
  * Road routing overhead factor.
@@ -827,16 +827,24 @@ function selectWaypoint(
   };
 }
 
-/** Retry wrapper for fetch */
-async function fetchWithRetry(url: string, retries = 2): Promise<Response> {
+const OSRM_TIMEOUT_MS = 3000;
+
+/** Retry wrapper for fetch with timeout */
+async function fetchWithRetry(url: string, retries = 1): Promise<Response> {
   for (let i = 0; i <= retries; i++) {
     try {
-      const res = await fetch(url);
-      if (res.ok || res.status < 500) return res;
-      if (i < retries) await new Promise((r) => setTimeout(r, 500 * (i + 1)));
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), OSRM_TIMEOUT_MS);
+      try {
+        const res = await fetch(url, { signal: controller.signal });
+        if (res.ok || res.status < 500) return res;
+      } finally {
+        clearTimeout(timeout);
+      }
+      if (i < retries) await new Promise((r) => setTimeout(r, 300 * (i + 1)));
     } catch (err) {
       if (i === retries) throw err;
-      await new Promise((r) => setTimeout(r, 500 * (i + 1)));
+      await new Promise((r) => setTimeout(r, 300 * (i + 1)));
     }
   }
   throw new Error('OSRM request failed after retries');
@@ -895,7 +903,7 @@ async function fetchOSRMRouteAdjusted(
   waypoints: RoutePoint[],
   center: RoutePoint,
   targetDistanceKm: number,
-  maxRetries: number = 2
+  maxRetries: number = 1
 ): Promise<{ route: OSRMRoute | null; waypoints: RoutePoint[] }> {
   let currentWaypoints = waypoints;
 
@@ -1104,11 +1112,14 @@ export async function generateOSRMRoutes(
   // Each candidate excludes parks used by previous candidates so routes
   // go through genuinely different areas (e.g., route 1 via Central Park,
   // route 2 via a different park, route 3 via yet another).
+  // Only generate as many candidates as needed — if count=1, generating
+  // 3 candidates and throwing 2 away wastes ~2 OSRM round trips.
+  const candidateCount = Math.min(MAX_CANDIDATE_COUNT, count + 1); // 1 extra for fallback
   const timeSeed = Date.now() % 100000;
   const candidates: { variant: number; waypoints: RoutePoint[]; anchors: GreenSpace[] }[] = [];
   const usedParkPoints: RoutePoint[] = []; // Parks already used by earlier candidates
 
-  for (let i = 0; i < CANDIDATE_COUNT; i++) {
+  for (let i = 0; i < candidateCount; i++) {
     const variant = timeSeed + i + 1;
     const strategy = STRATEGIES[i % STRATEGIES.length];
     let waypoints: RoutePoint[];
@@ -1261,7 +1272,7 @@ export async function generateOSRMRoutes(
       fallbackWaypoints = generateLoopWaypoints(center, distanceKm, prefs, Date.now() % 100000, []);
     }
 
-    const adjusted = await fetchOSRMRouteAdjusted(fallbackWaypoints, center, distanceKm, 3);
+    const adjusted = await fetchOSRMRouteAdjusted(fallbackWaypoints, center, distanceKm, 1);
     if (adjusted.route) {
       const points = adjusted.route.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }));
       resolved.push({
