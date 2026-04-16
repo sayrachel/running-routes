@@ -1,5 +1,5 @@
 import type { RoutePoint, GeneratedRoute, RoutePreferences } from './route-generator';
-import { fetchQuietScore, fetchGreenSpacesEnriched, fetchHighwaySegments } from './overpass';
+import { fetchGreenSpacesAndHighways } from './overpass';
 import type { GreenSpace } from './overpass';
 import { scoreRoute, computeGreenSpaceProximity, computeRunPathProximity, computeHighwayProximity, computeWaterfrontProximity } from './route-scoring';
 
@@ -24,8 +24,25 @@ const ROUTING_OVERHEAD = 1.45;
  * Detects where the route crosses itself and cuts out the loop,
  * keeping the shorter path. This prevents routes where runners
  * would have to double back on the same streets.
+ *
+ * Iterates so multi-loop lollipops are all removed in a single call.
+ * Each pass cuts at most one loop; we stop as soon as a pass finds nothing.
  */
 export function removeSelfintersections(points: RoutePoint[]): RoutePoint[] {
+  if (points.length < 20) return points;
+
+  const MAX_PASSES = 4;
+  let current = points;
+  for (let pass = 0; pass < MAX_PASSES; pass++) {
+    const next = removeOneSelfIntersection(current);
+    if (next === current) return current;
+    current = next;
+  }
+  return current;
+}
+
+/** One pass of lollipop removal — returns the input unchanged if nothing was cut. */
+function removeOneSelfIntersection(points: RoutePoint[]): RoutePoint[] {
   if (points.length < 20) return points;
 
   // Sample every N points for performance (checking all pairs is O(n^2))
@@ -42,8 +59,7 @@ export function removeSelfintersections(points: RoutePoint[]): RoutePoint[] {
         // If the loop is between 5% and 40% of the route, cut it out
         if (loopLen > totalLen * 0.05 && loopLen < totalLen * 0.4) {
           // Remove the loop: keep points[0..i] then points[j+1..end]
-          const cleaned = [...points.slice(0, i + 1), ...points.slice(j + 1)];
-          return cleaned;
+          return [...points.slice(0, i + 1), ...points.slice(j + 1)];
         }
       }
     }
@@ -935,11 +951,29 @@ async function fetchOSRMRouteAdjusted(
 }
 
 /**
+ * In-memory cache of successful OSRM responses keyed by request URL.
+ * Identical waypoints (e.g. when the user taps refresh from the same start)
+ * skip the network round trip entirely. LRU-bounded to avoid unbounded
+ * growth in long sessions; failures aren't cached so transient network
+ * errors can still be retried.
+ */
+const osrmRouteCache = new Map<string, OSRMRoute>();
+const OSRM_CACHE_MAX = 50;
+
+/**
  * Call OSRM to get a walking route through the given waypoints.
  */
 async function fetchOSRMRoute(waypoints: RoutePoint[]): Promise<OSRMRoute | null> {
   const coords = coordsString(waypoints);
   const url = `${OSRM_BASE}/${coords}?overview=full&geometries=geojson&steps=false`;
+
+  const cached = osrmRouteCache.get(url);
+  if (cached !== undefined) {
+    // Refresh LRU position so hot entries survive eviction.
+    osrmRouteCache.delete(url);
+    osrmRouteCache.set(url, cached);
+    return cached;
+  }
 
   try {
     const res = await fetchWithRetry(url);
@@ -950,7 +984,13 @@ async function fetchOSRMRoute(waypoints: RoutePoint[]): Promise<OSRMRoute | null
       return null;
     }
 
-    return data.routes[0];
+    const route = data.routes[0];
+    if (osrmRouteCache.size >= OSRM_CACHE_MAX) {
+      const oldest = osrmRouteCache.keys().next().value;
+      if (oldest !== undefined) osrmRouteCache.delete(oldest);
+    }
+    osrmRouteCache.set(url, route);
+    return route;
   } catch (err) {
     console.warn('OSRM fetch failed:', err);
     return null;
@@ -1101,20 +1141,18 @@ export async function generateOSRMRoutes(
   prefs: RoutePreferences = { lowTraffic: false },
   end?: RoutePoint | null
 ): Promise<GeneratedRoute[]> {
-  // Step 1: Fetch enriched green spaces and highway segments (shared across all candidates)
+  // Step 1: Fetch enriched green spaces and highway segments in a single
+  // Overpass round trip (shared across all candidates).
   const radiusKm = calculateSearchRadius(routeType, distanceKm, center, end);
-  const [greenSpaces, highwayPoints] = await Promise.all([
-    fetchGreenSpacesEnriched(center, radiusKm),
-    fetchHighwaySegments(center, radiusKm),
-  ]);
+  const { greenSpaces, highwayPoints } = await fetchGreenSpacesAndHighways(center, radiusKm);
 
-  // Step 2: Generate candidate waypoint sets with diversity
-  // Each candidate excludes parks used by previous candidates so routes
-  // go through genuinely different areas (e.g., route 1 via Central Park,
-  // route 2 via a different park, route 3 via yet another).
-  // Only generate as many candidates as needed — if count=1, generating
-  // 3 candidates and throwing 2 away wastes ~2 OSRM round trips.
-  const candidateCount = Math.min(MAX_CANDIDATE_COUNT, count + 1); // 1 extra for fallback
+  // Step 2: Generate exactly `count` candidate waypoint sets with diversity.
+  // Each candidate excludes parks used by previous candidates so routes go
+  // through genuinely different areas. We don't speculate an extra "+1"
+  // candidate as insurance — Promise.all would wait for the slowest of N+1
+  // even though we only ever return N. The Step 3.5 fallback at the bottom
+  // handles the rare case where every candidate is rejected.
+  const candidateCount = Math.min(MAX_CANDIDATE_COUNT, count);
   const timeSeed = Date.now() % 100000;
   const candidates: { variant: number; waypoints: RoutePoint[]; anchors: GreenSpace[] }[] = [];
   const usedParkPoints: RoutePoint[] = []; // Parks already used by earlier candidates

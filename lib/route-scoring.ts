@@ -19,6 +19,94 @@ function haversineDistance(p1: RoutePoint, p2: RoutePoint): number {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+// ---------------------------------------------------------------------------
+// Spatial grid: bucket candidate points into cells sized to the proximity
+// threshold so each query only checks a 3×3 neighborhood instead of the full
+// list. Lng cell width is widened by 1/cos(lat) so a 3×3 lookup is guaranteed
+// to cover everything within `proximityKm`, no matter the latitude.
+// ---------------------------------------------------------------------------
+
+interface SpatialGrid {
+  cellLatDeg: number;
+  cellLngDeg: number;
+  cells: Map<number, RoutePoint[]>;
+}
+
+const KM_PER_DEG_LAT = 111;
+
+function buildGrid(points: RoutePoint[], proximityKm: number): SpatialGrid | null {
+  if (points.length === 0) return null;
+  const cellLatDeg = proximityKm / KM_PER_DEG_LAT;
+  // Widen lng cells by 1/cos(lat) so cell width in km ≥ proximityKm everywhere.
+  // Use the centroid lat as the reference; the grid only needs to be conservative.
+  let latSum = 0;
+  for (const p of points) latSum += p.lat;
+  const refLat = latSum / points.length;
+  const cosLat = Math.max(0.01, Math.cos((refLat * Math.PI) / 180));
+  const cellLngDeg = proximityKm / (KM_PER_DEG_LAT * cosLat);
+
+  const cells = new Map<number, RoutePoint[]>();
+  for (const p of points) {
+    const key = cellKey(p.lat, p.lng, cellLatDeg, cellLngDeg);
+    const bucket = cells.get(key);
+    if (bucket) bucket.push(p);
+    else cells.set(key, [p]);
+  }
+  return { cellLatDeg, cellLngDeg, cells };
+}
+
+// Pack two signed cell indices into one number key. Each fits in 21 bits
+// (covers ±1M cells; at proximityKm=0.1 that's ±100,000 km — plenty).
+function cellKey(lat: number, lng: number, cellLatDeg: number, cellLngDeg: number): number {
+  const cy = Math.floor(lat / cellLatDeg);
+  const cx = Math.floor(lng / cellLngDeg);
+  return ((cy + (1 << 20)) << 21) | (cx + (1 << 20));
+}
+
+function hasPointWithin(grid: SpatialGrid | null, p: RoutePoint, proximityKm: number): boolean {
+  if (!grid) return false;
+  const cy = Math.floor(p.lat / grid.cellLatDeg);
+  const cx = Math.floor(p.lng / grid.cellLngDeg);
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      const yi = cy + dy + (1 << 20);
+      const xi = cx + dx + (1 << 20);
+      const bucket = grid.cells.get((yi << 21) | xi);
+      if (!bucket) continue;
+      for (const q of bucket) {
+        if (haversineDistance(p, q) <= proximityKm) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** Indices of route points to sample. Matches prior `step = floor(n / ceil(n/20))`. */
+function sampleIndices(n: number): number[] {
+  if (n === 0) return [];
+  const step = Math.max(1, Math.floor(n / Math.ceil(n / 20)));
+  const out: number[] = [];
+  for (let i = 0; i < n; i += step) out.push(i);
+  return out;
+}
+
+/** Shared proximity computation: fraction of sampled route points within `proximityKm` of any candidate. */
+function proximityFraction(
+  routePoints: RoutePoint[],
+  candidatePoints: RoutePoint[],
+  proximityKm: number
+): number {
+  if (routePoints.length === 0 || candidatePoints.length === 0) return 0;
+  const grid = buildGrid(candidatePoints, proximityKm);
+  const samples = sampleIndices(routePoints.length);
+  if (samples.length === 0) return 0;
+  let nearCount = 0;
+  for (const i of samples) {
+    if (hasPointWithin(grid, routePoints[i], proximityKm)) nearCount++;
+  }
+  return nearCount / samples.length;
+}
+
 /**
  * Compute what fraction of route points are within proximity of a green space.
  * Samples every ~20th point to avoid expensive computation on dense routes.
@@ -33,25 +121,7 @@ export function computeGreenSpaceProximity(
   greenSpaces: GreenSpace[],
   proximityKm: number = 0.2
 ): number {
-  if (routePoints.length === 0 || greenSpaces.length === 0) return 0;
-
-  // Sample every ~20th point
-  const step = Math.max(1, Math.floor(routePoints.length / Math.ceil(routePoints.length / 20)));
-  let nearCount = 0;
-  let sampleCount = 0;
-
-  for (let i = 0; i < routePoints.length; i += step) {
-    sampleCount++;
-    const rp = routePoints[i];
-    for (const gs of greenSpaces) {
-      if (haversineDistance(rp, gs.point) <= proximityKm) {
-        nearCount++;
-        break;
-      }
-    }
-  }
-
-  return sampleCount > 0 ? nearCount / sampleCount : 0;
+  return proximityFraction(routePoints, greenSpaces.map((gs) => gs.point), proximityKm);
 }
 
 /**
@@ -69,25 +139,9 @@ export function computeWaterfrontProximity(
   greenSpaces: GreenSpace[],
   proximityKm: number = 0.3
 ): number {
-  const waterfrontFeatures = greenSpaces.filter((gs) => gs.kind === 'waterfront');
-  if (routePoints.length === 0 || waterfrontFeatures.length === 0) return 0;
-
-  const step = Math.max(1, Math.floor(routePoints.length / Math.ceil(routePoints.length / 20)));
-  let nearCount = 0;
-  let sampleCount = 0;
-
-  for (let i = 0; i < routePoints.length; i += step) {
-    sampleCount++;
-    const rp = routePoints[i];
-    for (const wf of waterfrontFeatures) {
-      if (haversineDistance(rp, wf.point) <= proximityKm) {
-        nearCount++;
-        break;
-      }
-    }
-  }
-
-  return sampleCount > 0 ? nearCount / sampleCount : 0;
+  const waterfront: RoutePoint[] = [];
+  for (const gs of greenSpaces) if (gs.kind === 'waterfront') waterfront.push(gs.point);
+  return proximityFraction(routePoints, waterfront, proximityKm);
 }
 
 /**
@@ -104,28 +158,19 @@ export function computeRunPathProximity(
   greenSpaces: GreenSpace[],
   proximityKm: number = 0.15
 ): number {
-  // Filter to only bike lanes, footways, paths, designated routes, and waterfront paths
-  const runPaths = greenSpaces.filter(
-    (gs) => gs.kind === 'cycleway' || gs.kind === 'footway' || gs.kind === 'path' || gs.kind === 'route' || gs.kind === 'waterfront'
-  );
-  if (routePoints.length === 0 || runPaths.length === 0) return 0;
-
-  const step = Math.max(1, Math.floor(routePoints.length / Math.ceil(routePoints.length / 20)));
-  let nearCount = 0;
-  let sampleCount = 0;
-
-  for (let i = 0; i < routePoints.length; i += step) {
-    sampleCount++;
-    const rp = routePoints[i];
-    for (const rp2 of runPaths) {
-      if (haversineDistance(rp, rp2.point) <= proximityKm) {
-        nearCount++;
-        break;
-      }
+  const runPaths: RoutePoint[] = [];
+  for (const gs of greenSpaces) {
+    if (
+      gs.kind === 'cycleway' ||
+      gs.kind === 'footway' ||
+      gs.kind === 'path' ||
+      gs.kind === 'route' ||
+      gs.kind === 'waterfront'
+    ) {
+      runPaths.push(gs.point);
     }
   }
-
-  return sampleCount > 0 ? nearCount / sampleCount : 0;
+  return proximityFraction(routePoints, runPaths, proximityKm);
 }
 
 /**
@@ -143,24 +188,7 @@ export function computeHighwayProximity(
   highwayPoints: RoutePoint[],
   proximityKm: number = 0.1
 ): number {
-  if (routePoints.length === 0 || highwayPoints.length === 0) return 0;
-
-  const step = Math.max(1, Math.floor(routePoints.length / Math.ceil(routePoints.length / 20)));
-  let nearCount = 0;
-  let sampleCount = 0;
-
-  for (let i = 0; i < routePoints.length; i += step) {
-    sampleCount++;
-    const rp = routePoints[i];
-    for (const hp of highwayPoints) {
-      if (haversineDistance(rp, hp) <= proximityKm) {
-        nearCount++;
-        break;
-      }
-    }
-  }
-
-  return sampleCount > 0 ? nearCount / sampleCount : 0;
+  return proximityFraction(routePoints, highwayPoints, proximityKm);
 }
 
 /**

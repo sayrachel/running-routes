@@ -131,6 +131,27 @@ describe('removeSelfintersections', () => {
     // Should have removed the crossing loop
     expect(result.length).toBeLessThan(route.length);
   });
+
+  it('iterates to remove multiple stacked lollipops in one call', () => {
+    // Two lollipops back-to-back: each loop must be 5%-40% of total length
+    // to be cut, so we build them deliberately and pad with straight segments.
+    const a = makeSelfCrossingRoute(NYC, 1.0);
+    const tail = a[a.length - 1];
+    const b = makeSelfCrossingRoute(tail, 1.0);
+    const stacked = [...a, ...b.slice(1)];
+    const cleaned = removeSelfintersections(stacked);
+    // Both loops should be cut, not just one
+    let crossings = 0;
+    const step = Math.max(1, Math.floor(cleaned.length / 200));
+    for (let i = 0; i < cleaned.length - 3; i += step) {
+      for (let j = i + 10; j < cleaned.length - 1; j += step) {
+        if (segmentsCross(cleaned[i], cleaned[i + 1], cleaned[j], cleaned[j + 1])) {
+          crossings++;
+        }
+      }
+    }
+    expect(crossings).toBeLessThanOrEqual(1);
+  });
 });
 
 // ---------------------------------------------------------------------------

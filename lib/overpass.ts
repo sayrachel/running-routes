@@ -253,131 +253,150 @@ function haversineDistance(p1: RoutePoint, p2: RoutePoint): number {
  *
  * Returns [] on failure — callers skip biasing.
  */
+/** Set of `highway=*` values considered "major" (unsafe for runners). */
+const MAJOR_HIGHWAY_TYPES = new Set([
+  'motorway', 'motorway_link',
+  'trunk', 'trunk_link',
+  'primary', 'primary_link',
+]);
+
+/** Overpass sub-queries shared by the green-space and combined fetchers. */
+function greenSpaceSubQuery(a: string): string {
+  return [
+    `nwr["leisure"~"^(park|nature_reserve|garden)$"](${a});`,
+    `way["highway"="cycleway"]["name"](${a});`,
+    `way["highway"="pedestrian"](${a});`,
+    `relation["route"~"^(foot|bicycle|running)$"](${a});`,
+    `way["foot"="designated"]["name"](${a});`,
+    `way["man_made"="pier"]["foot"!="no"](${a});`,
+    `way["waterway"="riverbank"](${a});`,
+    `way["natural"~"^(coastline|water)$"]["name"](${a});`,
+    `way["name"~"[Bb]oardwalk|[Pp]romenade|[Ee]splanade|[Ww]aterfront|[Rr]iverwalk|[Ss]eawall"](${a});`,
+  ].join('');
+}
+
+function highwaySubQuery(a: string): string {
+  return `way["highway"~"^(motorway|motorway_link|trunk|trunk_link|primary|primary_link)$"](${a});`;
+}
+
+/** Convert one Overpass element to a coordinate, or null if it has no usable position. */
+function elementPoint(el: any): RoutePoint | null {
+  if (el.type === 'node' && el.lat != null && el.lon != null) {
+    return { lat: el.lat, lng: el.lon };
+  }
+  if ((el.type === 'way' || el.type === 'relation') && el.center?.lat != null && el.center?.lon != null) {
+    return { lat: el.center.lat, lng: el.center.lon };
+  }
+  return null;
+}
+
+/** Build GreenSpace[] from the green-space subset of an Overpass response. */
+function parseGreenSpaceElements(elements: any[]): GreenSpace[] {
+  const leisureTypes = new Set(['park', 'nature_reserve', 'garden']);
+  const results: GreenSpace[] = [];
+
+  for (const el of elements) {
+    const point = elementPoint(el);
+    if (!point) continue;
+
+    const tags = el.tags || {};
+    const leisure = tags.leisure;
+    const highway = tags.highway;
+    const hasName = !!tags.name;
+    const footDesignated = tags.foot === 'designated';
+    const bicycleDesignated = tags.bicycle === 'designated';
+    const isRoute = el.type === 'relation' && (tags.route === 'foot' || tags.route === 'bicycle' || tags.route === 'running');
+    const isWaterfront = !!(
+      tags.natural === 'coastline' ||
+      tags.natural === 'water' ||
+      tags.waterway === 'riverbank' ||
+      tags.waterway ||
+      tags.man_made === 'pier' ||
+      leisure === 'promenade' ||
+      (tags.name && /boardwalk|promenade|esplanade|waterfront|riverwalk|seawall|beach walk/i.test(tags.name))
+    );
+
+    let kind: GreenSpace['kind'];
+    if (isWaterfront) kind = 'waterfront';
+    else if (leisure === 'park') kind = 'park';
+    else if (leisure === 'garden') kind = 'garden';
+    else if (leisure === 'nature_reserve') kind = 'nature';
+    else if (highway === 'cycleway') kind = 'cycleway';
+    else if (highway === 'footway') kind = 'footway';
+    else if (highway === 'path' || highway === 'pedestrian' || highway === 'track') kind = 'path';
+    else if (isRoute) kind = 'route';
+    else kind = 'other';
+
+    const tier: 1 | 2 =
+      leisureTypes.has(leisure) || (highway && hasName) || footDesignated || bicycleDesignated || isRoute || isWaterfront
+        ? 1
+        : 2;
+
+    let areaSize = 0;
+    if (el.bounds && el.bounds.minlat != null) {
+      const latSpan = Math.abs(el.bounds.maxlat - el.bounds.minlat);
+      const lngSpan = Math.abs(el.bounds.maxlon - el.bounds.minlon);
+      const latKm = latSpan * 111;
+      const lngKm = lngSpan * 111 * Math.cos((point.lat * Math.PI) / 180);
+      areaSize = latKm * lngKm;
+    }
+
+    results.push({ point, tier, kind, name: tags.name || null, areaSize });
+  }
+
+  // Deduplicate within 50m
+  const deduped: GreenSpace[] = [];
+  for (const gs of results) {
+    if (!deduped.some((r) => haversineDistance(r.point, gs.point) < 0.05)) {
+      deduped.push(gs);
+    }
+  }
+
+  // Sort: tier 1 first, then by area descending. Cap at 50.
+  deduped.sort((a, b) => (a.tier !== b.tier ? a.tier - b.tier : b.areaSize - a.areaSize));
+  return deduped.slice(0, 50);
+}
+
+/** Build deduplicated highway centers from the highway subset of an Overpass response. */
+function parseHighwayElements(elements: any[]): RoutePoint[] {
+  const points: RoutePoint[] = [];
+  for (const el of elements) {
+    if (el.center?.lat != null && el.center?.lon != null) {
+      points.push({ lat: el.center.lat, lng: el.center.lon });
+    }
+  }
+  // Deduplicate within 100m
+  const deduped: RoutePoint[] = [];
+  for (const p of points) {
+    if (!deduped.some((d) => haversineDistance(d, p) < 0.1)) deduped.push(p);
+  }
+  return deduped;
+}
+
+/** Cache key for a (center, radiusKm) tuple. Rounded to ~111m so nearby starts share hits. */
+function locationKey(prefix: string, center: RoutePoint, radiusKm: number): string {
+  return `${prefix}:${center.lat.toFixed(3)},${center.lng.toFixed(3)},${radiusKm.toFixed(3)}`;
+}
+
 export async function fetchGreenSpacesEnriched(
   center: RoutePoint,
   radiusKm: number
 ): Promise<GreenSpace[]> {
-  const cacheKey = `enriched:${center.lat.toFixed(3)},${center.lng.toFixed(3)},${radiusKm.toFixed(3)}`;
+  const cacheKey = locationKey('enriched', center, radiusKm);
   const cached = enrichedGreenSpaceCache.get(cacheKey);
   if (cached !== undefined) return cached;
 
   const radiusMeters = Math.round(radiusKm * 1000);
-  const lat = center.lat;
-  const lng = center.lng;
-
-  // Consolidated query using regex to reduce sub-query count (faster Overpass response).
-  // Covers parks/gardens/reserves (way+relation), named cycleways, routes, and waterfront.
-  const a = `around:${radiusMeters},${lat},${lng}`;
-  const query = `[out:json][timeout:4];(
-    nwr["leisure"~"^(park|nature_reserve|garden)$"](${a});
-    way["highway"="cycleway"]["name"](${a});
-    way["highway"="pedestrian"](${a});
-    relation["route"~"^(foot|bicycle|running)$"](${a});
-    way["foot"="designated"]["name"](${a});
-    way["man_made"="pier"]["foot"!="no"](${a});
-    way["waterway"="riverbank"](${a});
-    way["natural"~"^(coastline|water)$"]["name"](${a});
-    way["name"~"[Bb]oardwalk|[Pp]romenade|[Ee]splanade|[Ww]aterfront|[Rr]iverwalk|[Ss]eawall"](${a});
-  );out center bb tags;`;
+  const a = `around:${radiusMeters},${center.lat},${center.lng}`;
+  const query = `[out:json][timeout:4];(${greenSpaceSubQuery(a)});out center bb tags;`;
 
   try {
     const res = await fetchOverpassRace(query);
     const data = await res.json();
-    if (!data.elements || data.elements.length === 0) {
-      enrichedGreenSpaceCache.set(cacheKey, []);
-      return [];
-    }
-
-    const leisureTypes = new Set(['park', 'nature_reserve', 'garden']);
-    const results: GreenSpace[] = [];
-
-    for (const el of data.elements) {
-      let point: RoutePoint | null = null;
-
-      if (el.type === 'node' && el.lat != null && el.lon != null) {
-        point = { lat: el.lat, lng: el.lon };
-      } else if (el.type === 'way' && el.center?.lat != null && el.center?.lon != null) {
-        point = { lat: el.center.lat, lng: el.center.lon };
-      } else if (el.type === 'relation' && el.center?.lat != null && el.center?.lon != null) {
-        point = { lat: el.center.lat, lng: el.center.lon };
-      }
-
-      if (!point) continue;
-
-      const tags = el.tags || {};
-      const leisure = tags.leisure;
-      const highway = tags.highway;
-      const hasName = !!tags.name;
-      const footDesignated = tags.foot === 'designated';
-      const bicycleDesignated = tags.bicycle === 'designated';
-      const isRoute = el.type === 'relation' && (tags.route === 'foot' || tags.route === 'bicycle' || tags.route === 'running');
-      const isWaterfront = !!(
-        tags.natural === 'coastline' ||
-        tags.natural === 'water' ||
-        tags.waterway === 'riverbank' ||
-        tags.waterway ||
-        tags.man_made === 'pier' ||
-        leisure === 'promenade' ||
-        (tags.name && /boardwalk|promenade|esplanade|waterfront|riverwalk|seawall|beach walk/i.test(tags.name))
-      );
-
-      // Classify kind
-      let kind: GreenSpace['kind'];
-      if (isWaterfront) kind = 'waterfront';
-      else if (leisure === 'park') kind = 'park';
-      else if (leisure === 'garden') kind = 'garden';
-      else if (leisure === 'nature_reserve') kind = 'nature';
-      else if (highway === 'cycleway') kind = 'cycleway';
-      else if (highway === 'footway') kind = 'footway';
-      else if (highway === 'path' || highway === 'pedestrian' || highway === 'track') kind = 'path';
-      else if (isRoute) kind = 'route';
-      else kind = 'other';
-
-      // Classify tier
-      const tier: 1 | 2 =
-        leisureTypes.has(leisure) || (highway && hasName) || footDesignated || bicycleDesignated || isRoute || isWaterfront
-          ? 1
-          : 2;
-
-      // Estimate area from bounding box (ways only)
-      let areaSize = 0;
-      if (el.bounds && el.bounds.minlat != null) {
-        const latSpan = Math.abs(el.bounds.maxlat - el.bounds.minlat);
-        const lngSpan = Math.abs(el.bounds.maxlon - el.bounds.minlon);
-        // Convert degrees to approximate km (1° lat ≈ 111km, 1° lng ≈ 111*cos(lat) km)
-        const latKm = latSpan * 111;
-        const lngKm = lngSpan * 111 * Math.cos((point.lat * Math.PI) / 180);
-        areaSize = latKm * lngKm;
-      }
-
-      results.push({
-        point,
-        tier,
-        kind,
-        name: tags.name || null,
-        areaSize,
-      });
-    }
-
-    // Deduplicate within 50m
-    const dedupThreshold = 0.05;
-    const deduped: GreenSpace[] = [];
-    for (const gs of results) {
-      if (!deduped.some((r) => haversineDistance(r.point, gs.point) < dedupThreshold)) {
-        deduped.push(gs);
-      }
-    }
-
-    // Sort: tier 1 first, then by area descending
-    deduped.sort((a, b) => {
-      if (a.tier !== b.tier) return a.tier - b.tier;
-      return b.areaSize - a.areaSize;
-    });
-
-    // Cap at 50 results
-    const capped = deduped.slice(0, 50);
-    enrichedGreenSpaceCache.set(cacheKey, capped);
-    return capped;
+    const elements = data.elements || [];
+    const result = parseGreenSpaceElements(elements);
+    enrichedGreenSpaceCache.set(cacheKey, result);
+    return result;
   } catch (err) {
     console.warn('Overpass enriched green space query failed:', err);
     enrichedGreenSpaceCache.set(cacheKey, []);
@@ -421,51 +440,76 @@ export async function fetchHighwaySegments(
   center: RoutePoint,
   radiusKm: number
 ): Promise<RoutePoint[]> {
-  const cacheKey = `highway:${center.lat.toFixed(3)},${center.lng.toFixed(3)},${radiusKm.toFixed(3)}`;
+  const cacheKey = locationKey('highway', center, radiusKm);
   const cached = highwayCache.get(cacheKey);
   if (cached !== undefined) return cached;
 
   const radiusMeters = Math.round(radiusKm * 1000);
-  const lat = center.lat;
-  const lng = center.lng;
-
-  const query = `[out:json][timeout:4];(
-    way["highway"="motorway"](around:${radiusMeters},${lat},${lng});
-    way["highway"="motorway_link"](around:${radiusMeters},${lat},${lng});
-    way["highway"="trunk"](around:${radiusMeters},${lat},${lng});
-    way["highway"="trunk_link"](around:${radiusMeters},${lat},${lng});
-    way["highway"="primary"](around:${radiusMeters},${lat},${lng});
-    way["highway"="primary_link"](around:${radiusMeters},${lat},${lng});
-  );out center;`;
+  const a = `around:${radiusMeters},${center.lat},${center.lng}`;
+  const query = `[out:json][timeout:4];(${highwaySubQuery(a)});out center;`;
 
   try {
     const res = await fetchOverpassRace(query);
     const data = await res.json();
-    if (!data.elements || data.elements.length === 0) {
-      highwayCache.set(cacheKey, []);
-      return [];
-    }
-
-    const points: RoutePoint[] = [];
-    for (const el of data.elements) {
-      if (el.center?.lat != null && el.center?.lon != null) {
-        points.push({ lat: el.center.lat, lng: el.center.lon });
-      }
-    }
-
-    // Deduplicate within 100m
-    const deduped: RoutePoint[] = [];
-    for (const p of points) {
-      if (!deduped.some((d) => haversineDistance(d, p) < 0.1)) {
-        deduped.push(p);
-      }
-    }
-
-    highwayCache.set(cacheKey, deduped);
-    return deduped;
+    const result = parseHighwayElements(data.elements || []);
+    highwayCache.set(cacheKey, result);
+    return result;
   } catch (err) {
     console.warn('Overpass highway query failed:', err);
     highwayCache.set(cacheKey, []);
     return [];
+  }
+}
+
+/**
+ * Fetch enriched green spaces and major-highway centers in a single Overpass
+ * round trip. The two queries hit the same bbox and return disjoint tag sets
+ * (`leisure`/cycleway/etc. vs `highway=motorway|trunk|primary`), so they can
+ * be unioned and split client-side. Halves the Overpass fan-out vs calling
+ * fetchGreenSpacesEnriched + fetchHighwaySegments in parallel, and populates
+ * both per-query caches so subsequent callers of either function get hits.
+ */
+export async function fetchGreenSpacesAndHighways(
+  center: RoutePoint,
+  radiusKm: number
+): Promise<{ greenSpaces: GreenSpace[]; highwayPoints: RoutePoint[] }> {
+  const greenKey = locationKey('enriched', center, radiusKm);
+  const hwKey = locationKey('highway', center, radiusKm);
+
+  const cachedGreen = enrichedGreenSpaceCache.get(greenKey);
+  const cachedHw = highwayCache.get(hwKey);
+  if (cachedGreen !== undefined && cachedHw !== undefined) {
+    return { greenSpaces: cachedGreen, highwayPoints: cachedHw };
+  }
+
+  const radiusMeters = Math.round(radiusKm * 1000);
+  const a = `around:${radiusMeters},${center.lat},${center.lng}`;
+  // Combined union — `out center bb tags;` works for both halves; highway
+  // parsing only needs `center`, but the extra `bb tags` payload is small.
+  const query = `[out:json][timeout:5];(${greenSpaceSubQuery(a)}${highwaySubQuery(a)});out center bb tags;`;
+
+  try {
+    const res = await fetchOverpassRace(query);
+    const data = await res.json();
+    const elements = data.elements || [];
+
+    const greenElements: any[] = [];
+    const highwayElements: any[] = [];
+    for (const el of elements) {
+      if (MAJOR_HIGHWAY_TYPES.has(el.tags?.highway)) highwayElements.push(el);
+      else greenElements.push(el);
+    }
+
+    const greenSpaces = parseGreenSpaceElements(greenElements);
+    const highwayPoints = parseHighwayElements(highwayElements);
+
+    enrichedGreenSpaceCache.set(greenKey, greenSpaces);
+    highwayCache.set(hwKey, highwayPoints);
+    return { greenSpaces, highwayPoints };
+  } catch (err) {
+    console.warn('Combined Overpass query failed:', err);
+    enrichedGreenSpaceCache.set(greenKey, []);
+    highwayCache.set(hwKey, []);
+    return { greenSpaces: [], highwayPoints: [] };
   }
 }
