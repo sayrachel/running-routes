@@ -8,7 +8,8 @@
     "android": "expo run:android",
     "web": "expo start --web",
     "test": "jest",
-    "quality": "tsx lib/__tests__/route-quality-harness.ts"
+    "quality": "tsx lib/__tests__/route-quality-harness.ts",
+    "quality:record": "tsx lib/__tests__/route-quality-harness.ts --record"
   },
   "jest": {
     "preset": "jest-expo",

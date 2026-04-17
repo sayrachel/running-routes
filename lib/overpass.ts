@@ -27,6 +27,32 @@ const enrichedGreenSpaceCache = new Map<string, GreenSpace[]>();
 const highwayCache = new Map<string, RoutePoint[]>();
 
 /**
+ * Snapshot the green-space and highway caches for record-and-replay testing.
+ * Used by the quality harness to avoid burning Overpass's per-IP quota on
+ * every run — record once when the cache is fresh, replay forever.
+ */
+export interface OverpassSnapshot {
+  enriched: Array<[string, GreenSpace[]]>;
+  highway: Array<[string, RoutePoint[]]>;
+}
+
+export function dumpOverpassCaches(): OverpassSnapshot {
+  return {
+    enriched: Array.from(enrichedGreenSpaceCache.entries()),
+    highway: Array.from(highwayCache.entries()),
+  };
+}
+
+export function loadOverpassCaches(snapshot: Partial<OverpassSnapshot>): void {
+  if (snapshot.enriched) {
+    for (const [k, v] of snapshot.enriched) enrichedGreenSpaceCache.set(k, v);
+  }
+  if (snapshot.highway) {
+    for (const [k, v] of snapshot.highway) highwayCache.set(k, v);
+  }
+}
+
+/**
  * Compute bounding box from route points with a small buffer.
  * Returns [south, west, north, east] for Overpass bbox format.
  */

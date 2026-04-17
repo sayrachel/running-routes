@@ -11,14 +11,20 @@
  * Exits with code 1 if any fixture fails — wire into CI / pre-build hooks.
  */
 
+import * as fs from 'fs';
+import * as path from 'path';
 import { generateOSRMRoutes, retraceRatio, overlapSegmentRatio, haversineDistance, calculateSearchRadius } from '../osrm';
-import { fetchGreenSpacesAndHighways } from '../overpass';
+import { fetchGreenSpacesAndHighways, dumpOverpassCaches, loadOverpassCaches } from '../overpass';
 import type { RoutePoint, RoutePreferences } from '../route-generator';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // Overpass enforces a per-IP rate limit; spacing requests avoids 429 storms
 // that would force every fixture down the geometric-fallback path.
 const FIXTURE_DELAY_MS = 3000;
+
+// Snapshot path for record-and-replay. Committed to the repo so the harness
+// runs offline (no Overpass quota burned, deterministic across machines).
+const SNAPSHOT_PATH = path.join(__dirname, 'fixtures', 'overpass-snapshot.json');
 
 interface Fixture {
   name: string;
@@ -174,10 +180,32 @@ function fmtRow(r: FixtureResult): string {
   return `${tag}  ${dataTag}${pad(r.fixture.name, 32)}  ${summary}${tail}`;
 }
 
+function loadSnapshot(): { enriched: number; highway: number } {
+  if (!fs.existsSync(SNAPSHOT_PATH)) return { enriched: 0, highway: 0 };
+  try {
+    const data = JSON.parse(fs.readFileSync(SNAPSHOT_PATH, 'utf8'));
+    loadOverpassCaches(data);
+    return { enriched: data.enriched?.length ?? 0, highway: data.highway?.length ?? 0 };
+  } catch (err) {
+    console.warn(`Snapshot load failed (${SNAPSHOT_PATH}): ${(err as Error).message}`);
+    return { enriched: 0, highway: 0 };
+  }
+}
+
+function saveSnapshot(): { enriched: number; highway: number } {
+  const dir = path.dirname(SNAPSHOT_PATH);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const snap = dumpOverpassCaches();
+  fs.writeFileSync(SNAPSHOT_PATH, JSON.stringify(snap, null, 2));
+  return { enriched: snap.enriched.length, highway: snap.highway.length };
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   const onlyIdx = argv.indexOf('--only');
   const only = onlyIdx >= 0 ? argv[onlyIdx + 1] : null;
+  const record = argv.includes('--record');
+  const noSnapshot = argv.includes('--no-snapshot');
 
   const fixtures = only ? FIXTURES.filter((f) => f.name.includes(only)) : FIXTURES;
   if (fixtures.length === 0) {
@@ -185,14 +213,25 @@ async function main() {
     process.exit(2);
   }
 
-  console.log(`Running ${fixtures.length} fixture(s) against live OSRM + Overpass...\n`);
+  const loaded = noSnapshot ? { enriched: 0, highway: 0 } : loadSnapshot();
+  const mode = record ? 'RECORD (will hit live Overpass for any cache misses)' : 'REPLAY (cache hits skip the network)';
+  console.log(`Running ${fixtures.length} fixture(s) — mode: ${mode}`);
+  console.log(`Snapshot: ${loaded.enriched} green entries, ${loaded.highway} highway entries loaded from ${SNAPSHOT_PATH}\n`);
 
   const results: FixtureResult[] = [];
   for (let i = 0; i < fixtures.length; i++) {
     const r = await runFixture(fixtures[i]);
     results.push(r);
     console.log(fmtRow(r));
-    if (i < fixtures.length - 1) await sleep(FIXTURE_DELAY_MS);
+    // Only sleep between fixtures we expect to hit the network. In replay
+    // mode (no record + cache loaded), all calls are local and we can rip.
+    const willHitNetwork = record || !r.metrics?.hasOverpassData;
+    if (i < fixtures.length - 1 && willHitNetwork) await sleep(FIXTURE_DELAY_MS);
+  }
+
+  if (record) {
+    const saved = saveSnapshot();
+    console.log(`\nSaved snapshot: ${saved.enriched} green entries, ${saved.highway} highway entries`);
   }
 
   const passed = results.filter((r) => r.pass).length;
@@ -200,7 +239,7 @@ async function main() {
   const fallback = results.filter((r) => r.metrics && !r.metrics.hasOverpassData).length;
   console.log('');
   console.log(`Summary: ${passed}/${results.length} passed, ${failed} failed` +
-    (fallback > 0 ? `  (${fallback} hit geometric-fallback path — Overpass unavailable)` : ''));
+    (fallback > 0 ? `  (${fallback} hit geometric-fallback path — Overpass unavailable for those)` : ''));
 
   if (failed > 0) process.exit(1);
 }
