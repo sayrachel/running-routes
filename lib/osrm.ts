@@ -68,6 +68,38 @@ function removeOneSelfIntersection(points: RoutePoint[]): RoutePoint[] {
   return points;
 }
 
+/**
+ * Fraction of total route distance covered by edges traversed more than once.
+ * High values mean the route forces the runner to retrace ground (out-and-back
+ * stubs, stacked rectangles, doubled-back spines). Useful as a rejection
+ * signal — a route that *looks* connected on the map but requires retracing
+ * isn't really a single-pass route.
+ */
+export function retraceRatio(points: RoutePoint[]): number {
+  if (points.length < 2) return 0;
+
+  // Round endpoints to ~5 decimal places (~1m) so OSRM-generated coordinates
+  // for the same physical edge collide reliably. Sort the pair so direction
+  // doesn't matter — going N→S on a street is the same edge as going S→N.
+  const seen = new Set<string>();
+  let totalLen = 0;
+  let retracedLen = 0;
+
+  for (let i = 0; i < points.length - 1; i++) {
+    const segLen = haversineDistance(points[i], points[i + 1]);
+    totalLen += segLen;
+
+    const a = `${points[i].lat.toFixed(5)},${points[i].lng.toFixed(5)}`;
+    const b = `${points[i + 1].lat.toFixed(5)},${points[i + 1].lng.toFixed(5)}`;
+    const key = a < b ? `${a}|${b}` : `${b}|${a}`;
+
+    if (seen.has(key)) retracedLen += segLen;
+    else seen.add(key);
+  }
+
+  return totalLen > 0 ? retracedLen / totalLen : 0;
+}
+
 /** Check if two line segments cross each other */
 export function segmentsCross(
   a1: RoutePoint, a2: RoutePoint,
@@ -1264,6 +1296,14 @@ export async function generateOSRMRoutes(
       const hwProximity = computeHighwayProximity(points, highwayPoints);
       if (hwProximity > 0.15) {
         console.log(`[RouteScoring] Rejecting candidate ${i}: ${(hwProximity * 100).toFixed(0)}% of route is near highways`);
+        continue;
+      }
+      // Reject routes where >15% of distance is on retraced edges — the line
+      // looks connected on the map but the runner can't follow it as a single
+      // pass without doubling back over the same blocks.
+      const retraced = retraceRatio(points);
+      if (retraced > 0.15) {
+        console.log(`[RouteScoring] Rejecting candidate ${i}: ${(retraced * 100).toFixed(0)}% of distance is retraced`);
         continue;
       }
       resolved.push({ index: i, variant: candidates[i].variant, points, distKm, estimatedTime, fromOSRM: true, anchors: candidates[i].anchors });

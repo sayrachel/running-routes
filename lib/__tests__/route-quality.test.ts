@@ -1,5 +1,6 @@
 import {
   removeSelfintersections,
+  retraceRatio,
   segmentsCross,
   hasLikelyWaterCrossing,
   removeWaterCrossings,
@@ -157,6 +158,31 @@ describe('removeSelfintersections', () => {
 // ---------------------------------------------------------------------------
 // 2. Segment crossing detection
 // ---------------------------------------------------------------------------
+
+describe('retraceRatio', () => {
+  it('returns 0 for a clean non-retracing path', () => {
+    const route = makeStraightLine(NYC, destinationPoint(NYC, 90, 1), 30);
+    expect(retraceRatio(route)).toBe(0);
+  });
+
+  it('returns ~1 for a perfect out-and-back over the same edges', () => {
+    const out = makeStraightLine(NYC, destinationPoint(NYC, 90, 1), 30);
+    const back = [...out].reverse().slice(1);
+    const route = [...out, ...back];
+    // Every back-segment retraces an out-segment (within rounding).
+    expect(retraceRatio(route)).toBeGreaterThan(0.45);
+  });
+
+  it('returns a moderate value for a partial retrace stub', () => {
+    // 30 segments total, last 10 retrace the previous 10
+    const out = makeStraightLine(NYC, destinationPoint(NYC, 90, 2), 20);
+    const stub = out.slice(10).reverse().slice(1);
+    const route = [...out, ...stub];
+    const r = retraceRatio(route);
+    expect(r).toBeGreaterThan(0.2);
+    expect(r).toBeLessThan(0.5);
+  });
+});
 
 describe('segmentsCross', () => {
   it('detects crossing segments (X shape)', () => {
