@@ -4,7 +4,7 @@ const OVERPASS_URLS = [
   'https://overpass-api.de/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter',
 ];
-const TIMEOUT_MS = 3000;
+const TIMEOUT_MS = 8000;
 const BBOX_BUFFER_DEG = 0.002; // ~200m buffer in degrees
 
 /** Enriched green space with metadata for waypoint selection */

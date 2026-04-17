@@ -11,14 +11,14 @@
  * Exits with code 1 if any fixture fails — wire into CI / pre-build hooks.
  */
 
-import { generateOSRMRoutes, retraceRatio, overlapSegmentRatio, haversineDistance } from '../osrm';
+import { generateOSRMRoutes, retraceRatio, overlapSegmentRatio, haversineDistance, calculateSearchRadius } from '../osrm';
 import { fetchGreenSpacesAndHighways } from '../overpass';
 import type { RoutePoint, RoutePreferences } from '../route-generator';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // Overpass enforces a per-IP rate limit; spacing requests avoids 429 storms
 // that would force every fixture down the geometric-fallback path.
-const FIXTURE_DELAY_MS = 1500;
+const FIXTURE_DELAY_MS = 3000;
 
 interface Fixture {
   name: string;
@@ -124,9 +124,9 @@ async function runFixture(f: Fixture): Promise<FixtureResult> {
   const distKm = f.distanceMi * KM_PER_MI;
   try {
     // Pre-fetch Overpass so we can flag whether the algorithm got real data.
-    // The result populates the in-process cache, so generateOSRMRoutes won't
-    // make a second call.
-    const radiusKm = Math.max(distKm / 2, 1.5);
+    // Use the same radius the production path will use so the in-process cache
+    // hits and generateOSRMRoutes doesn't make a second Overpass call.
+    const radiusKm = calculateSearchRadius(f.routeType, distKm, f.center, f.end);
     const op = await fetchGreenSpacesAndHighways(f.center, radiusKm);
     const hasOverpassData = op.greenSpaces.length > 0 || op.highwayPoints.length > 0;
 
