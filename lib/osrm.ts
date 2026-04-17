@@ -1000,35 +1000,51 @@ async function fetchOSRMRouteAdjusted(
   waypoints: RoutePoint[],
   center: RoutePoint,
   targetDistanceKm: number,
-  maxRetries: number = 1
+  maxRetries: number = 3
 ): Promise<{ route: OSRMRoute | null; waypoints: RoutePoint[] }> {
   let currentWaypoints = waypoints;
+  // Track the best result we've seen across attempts so we don't accidentally
+  // return a worse-fitting later attempt just because it ran last.
+  let best: { route: OSRMRoute; waypoints: RoutePoint[]; ratio: number } | null = null;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const route = await fetchOSRMRoute(currentWaypoints);
-    if (!route) return { route: null, waypoints: currentWaypoints };
+    if (!route) {
+      if (best) return { route: best.route, waypoints: best.waypoints };
+      return { route: null, waypoints: currentWaypoints };
+    }
 
     const routeDistKm = route.distance / 1000;
     const ratio = routeDistKm / targetDistanceKm;
 
-    // Accept if within 30%
-    if (ratio >= 0.7 && ratio <= 1.3) {
+    // Track best-so-far by closeness to ratio = 1.
+    if (!best || Math.abs(1 - ratio) < Math.abs(1 - best.ratio)) {
+      best = { route, waypoints: currentWaypoints, ratio };
+    }
+
+    // Tightened accept window (was ±30%): with more retries available we
+    // can afford to keep correcting borderline cases.
+    if (ratio >= 0.85 && ratio <= 1.15) {
       return { route, waypoints: currentWaypoints };
     }
 
-    // On last attempt, return whatever we got
+    // Out of retries — return the closest attempt rather than the latest.
     if (attempt === maxRetries) {
-      return { route, waypoints: currentWaypoints };
+      return { route: best.route, waypoints: best.waypoints };
     }
 
-    // Scale waypoints: if route is too long, shrink toward center
-    // Dampen the correction to avoid oscillation
+    // Scale waypoints toward/away from center. Lighter damping (0.85 vs 0.7)
+    // means each correction moves further; with a 3-retry budget this
+    // converges in ~2 iterations on most fixtures instead of getting stuck
+    // 20–30% off after the single under-corrected retry.
     const scaleFactor = 1 / ratio;
-    const dampedScale = 1 + (scaleFactor - 1) * 0.7;
+    const dampedScale = 1 + (scaleFactor - 1) * 0.85;
     currentWaypoints = scaleWaypoints(currentWaypoints, center, dampedScale);
   }
 
-  return { route: null, waypoints: currentWaypoints };
+  return best
+    ? { route: best.route, waypoints: best.waypoints }
+    : { route: null, waypoints: currentWaypoints };
 }
 
 /**

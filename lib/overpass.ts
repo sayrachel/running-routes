@@ -114,7 +114,12 @@ async function fetchOverpassRace(
       OVERPASS_URLS.map((url) =>
         fetch(url, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            // Identifying ourselves to Overpass earns gentler rate limiting
+            // — anonymous clients get throttled aggressively.
+            'User-Agent': 'RunRoutes/1.0 (irachelma@gmail.com)',
+          },
           body,
           signal: controller.signal,
         }).then((res) => {
