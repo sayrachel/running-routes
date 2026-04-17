@@ -109,9 +109,13 @@ async function fetchOverpassRace(
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   const body = `data=${encodeURIComponent(query)}`;
 
+  // Track per-mirror outcomes so failure logs show which URL failed and how
+  // (rather than the generic "All promises were rejected").
+  const attempts: { url: string; status: string }[] = OVERPASS_URLS.map((u) => ({ url: u, status: 'pending' }));
+
   try {
     const response = await Promise.any(
-      OVERPASS_URLS.map((url) =>
+      OVERPASS_URLS.map((url, i) =>
         fetch(url, {
           method: 'POST',
           headers: {
@@ -122,13 +126,25 @@ async function fetchOverpassRace(
           },
           body,
           signal: controller.signal,
-        }).then((res) => {
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
-          return res;
-        })
+        }).then(
+          (res) => {
+            attempts[i].status = res.ok ? `ok (${res.status})` : `http ${res.status}`;
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            return res;
+          },
+          (err) => {
+            attempts[i].status = `err ${err?.name ?? ''} ${err?.message ?? err}`.trim();
+            throw err;
+          }
+        )
       )
     );
     return response;
+  } catch (err) {
+    // Only logged when *every* mirror failed (Promise.any rejected).
+    const summary = attempts.map((a) => `  ${a.url}: ${a.status}`).join('\n');
+    console.warn(`Overpass mirrors all failed:\n${summary}`);
+    throw err;
   } finally {
     clearTimeout(timeout);
   }
