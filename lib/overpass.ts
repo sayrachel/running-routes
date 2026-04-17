@@ -506,8 +506,10 @@ export async function fetchGreenSpacesAndHighways(
     enrichedGreenSpaceCache.set(greenKey, greenSpaces);
     highwayCache.set(hwKey, highwayPoints);
     return { greenSpaces, highwayPoints };
-  } catch (err) {
-    console.warn('Combined Overpass query failed:', err);
+  } catch (err: any) {
+    // Keep the message short — full AggregateError stacks flood test output.
+    const msg = err?.message ?? String(err);
+    console.warn(`Combined Overpass query failed: ${msg.split('\n')[0]}`);
     enrichedGreenSpaceCache.set(greenKey, []);
     highwayCache.set(hwKey, []);
     return { greenSpaces: [], highwayPoints: [] };

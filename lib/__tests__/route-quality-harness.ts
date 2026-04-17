@@ -12,7 +12,13 @@
  */
 
 import { generateOSRMRoutes, retraceRatio, overlapSegmentRatio, haversineDistance } from '../osrm';
+import { fetchGreenSpacesAndHighways } from '../overpass';
 import type { RoutePoint, RoutePreferences } from '../route-generator';
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// Overpass enforces a per-IP rate limit; spacing requests avoids 429 storms
+// that would force every fixture down the geometric-fallback path.
+const FIXTURE_DELAY_MS = 1500;
 
 interface Fixture {
   name: string;
@@ -78,6 +84,8 @@ interface RouteMetrics {
   retraceRatio: number;
   overlapRatio: number;
   pointCount: number;
+  /** True if Overpass returned real data (i.e. the green-space algorithm was actually exercised). */
+  hasOverpassData: boolean;
 }
 
 interface FixtureResult {
@@ -115,6 +123,13 @@ function applyThresholds(f: Fixture, m: RouteMetrics): string[] {
 async function runFixture(f: Fixture): Promise<FixtureResult> {
   const distKm = f.distanceMi * KM_PER_MI;
   try {
+    // Pre-fetch Overpass so we can flag whether the algorithm got real data.
+    // The result populates the in-process cache, so generateOSRMRoutes won't
+    // make a second call.
+    const radiusKm = Math.max(distKm / 2, 1.5);
+    const op = await fetchGreenSpacesAndHighways(f.center, radiusKm);
+    const hasOverpassData = op.greenSpaces.length > 0 || op.highwayPoints.length > 0;
+
     const routes = await generateOSRMRoutes(f.center, distKm, f.routeType, 1, f.prefs, f.end);
     if (routes.length === 0) {
       return { fixture: f, pass: false, failures: ['no routes generated'], metrics: null };
@@ -130,6 +145,7 @@ async function runFixture(f: Fixture): Promise<FixtureResult> {
       retraceRatio: retraceRatio(points),
       overlapRatio: overlapSegmentRatio(points),
       pointCount: points.length,
+      hasOverpassData,
     };
     const failures = applyThresholds(f, metrics);
     return { fixture: f, pass: failures.length === 0, failures, metrics };
@@ -146,13 +162,16 @@ function fmtRow(r: FixtureResult): string {
   const tag = r.pass ? 'PASS' : 'FAIL';
   if (!r.metrics) return `${tag}  ${pad(r.fixture.name, 32)}  ${r.failures.join('; ')}`;
   const m = r.metrics;
+  // Annotate fallback path so we can tell which results reflect the real
+  // algorithm vs. the geometric-fallback path (when Overpass was down/429).
+  const dataTag = m.hasOverpassData ? '     ' : '[fb] ';
   const summary =
     `dist=${m.distanceMi.toFixed(2)}mi(${(m.distanceErrorPct * 100).toFixed(0)}%)  ` +
     `retr=${(m.retraceRatio * 100).toFixed(0)}%  ` +
     `over=${(m.overlapRatio * 100).toFixed(0)}%  ` +
     `pts=${m.pointCount}`;
   const tail = r.failures.length ? `  -- ${r.failures.join('; ')}` : '';
-  return `${tag}  ${pad(r.fixture.name, 32)}  ${summary}${tail}`;
+  return `${tag}  ${dataTag}${pad(r.fixture.name, 32)}  ${summary}${tail}`;
 }
 
 async function main() {
@@ -169,16 +188,19 @@ async function main() {
   console.log(`Running ${fixtures.length} fixture(s) against live OSRM + Overpass...\n`);
 
   const results: FixtureResult[] = [];
-  for (const f of fixtures) {
-    const r = await runFixture(f);
+  for (let i = 0; i < fixtures.length; i++) {
+    const r = await runFixture(fixtures[i]);
     results.push(r);
     console.log(fmtRow(r));
+    if (i < fixtures.length - 1) await sleep(FIXTURE_DELAY_MS);
   }
 
   const passed = results.filter((r) => r.pass).length;
   const failed = results.length - passed;
+  const fallback = results.filter((r) => r.metrics && !r.metrics.hasOverpassData).length;
   console.log('');
-  console.log(`Summary: ${passed}/${results.length} passed, ${failed} failed`);
+  console.log(`Summary: ${passed}/${results.length} passed, ${failed} failed` +
+    (fallback > 0 ? `  (${fallback} hit geometric-fallback path — Overpass unavailable)` : ''));
 
   if (failed > 0) process.exit(1);
 }
