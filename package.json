@@ -8,7 +8,7 @@
     "android": "expo run:android",
     "web": "expo start --web",
     "test": "jest",
-    "quality": "ts-node --transpile-only -O '{\"module\":\"CommonJS\",\"esModuleInterop\":true}' lib/__tests__/route-quality-harness.ts"
+    "quality": "ts-node --transpile-only -O '{\"module\":\"CommonJS\",\"moduleResolution\":\"node\",\"esModuleInterop\":true,\"jsx\":\"react\"}' lib/__tests__/route-quality-harness.ts"
   },
   "jest": {
     "preset": "jest-expo",
