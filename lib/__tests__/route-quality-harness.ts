@@ -195,7 +195,14 @@ function loadSnapshot(): { enriched: number; highway: number } {
 function saveSnapshot(): { enriched: number; highway: number } {
   const dir = path.dirname(SNAPSHOT_PATH);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  const snap = dumpOverpassCaches();
+  // Drop empty entries — those are failed/rate-limited Overpass calls that
+  // shouldn't be cached as "this location has no green spaces". Skipping them
+  // lets the next quality:record run retry just the unfilled fixtures.
+  const raw = dumpOverpassCaches();
+  const snap = {
+    enriched: raw.enriched.filter(([, v]) => v.length > 0),
+    highway: raw.highway.filter(([, v]) => v.length > 0),
+  };
   fs.writeFileSync(SNAPSHOT_PATH, JSON.stringify(snap, null, 2));
   return { enriched: snap.enriched.length, highway: snap.highway.length };
 }
