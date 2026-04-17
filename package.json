@@ -7,7 +7,8 @@
     "ios": "expo run:ios",
     "android": "expo run:android",
     "web": "expo start --web",
-    "test": "jest"
+    "test": "jest",
+    "quality": "ts-node --transpile-only -O '{\"module\":\"CommonJS\",\"esModuleInterop\":true}' lib/__tests__/route-quality-harness.ts"
   },
   "jest": {
     "preset": "jest-expo",

@@ -71,16 +71,16 @@ function removeOneSelfIntersection(points: RoutePoint[]): RoutePoint[] {
 /**
  * Fraction of total route distance covered by edges traversed more than once.
  * High values mean the route forces the runner to retrace ground (out-and-back
- * stubs, stacked rectangles, doubled-back spines). Useful as a rejection
- * signal — a route that *looks* connected on the map but requires retracing
- * isn't really a single-pass route.
+ * stubs, stacked rectangles, doubled-back spines).
+ *
+ * Uses ~10m endpoint rounding so OSRM's sub-meter coordinate wobble between
+ * outbound and inbound on the same street still collides. Catches *exact*
+ * coordinate retraces; for retraces where OSRM samples the same street at
+ * different points, see overlapSegmentRatio().
  */
 export function retraceRatio(points: RoutePoint[]): number {
   if (points.length < 2) return 0;
 
-  // Round endpoints to ~5 decimal places (~1m) so OSRM-generated coordinates
-  // for the same physical edge collide reliably. Sort the pair so direction
-  // doesn't matter — going N→S on a street is the same edge as going S→N.
   const seen = new Set<string>();
   let totalLen = 0;
   let retracedLen = 0;
@@ -89,8 +89,8 @@ export function retraceRatio(points: RoutePoint[]): number {
     const segLen = haversineDistance(points[i], points[i + 1]);
     totalLen += segLen;
 
-    const a = `${points[i].lat.toFixed(5)},${points[i].lng.toFixed(5)}`;
-    const b = `${points[i + 1].lat.toFixed(5)},${points[i + 1].lng.toFixed(5)}`;
+    const a = `${points[i].lat.toFixed(4)},${points[i].lng.toFixed(4)}`;
+    const b = `${points[i + 1].lat.toFixed(4)},${points[i + 1].lng.toFixed(4)}`;
     const key = a < b ? `${a}|${b}` : `${b}|${a}`;
 
     if (seen.has(key)) retracedLen += segLen;
@@ -98,6 +98,55 @@ export function retraceRatio(points: RoutePoint[]): number {
   }
 
   return totalLen > 0 ? retracedLen / totalLen : 0;
+}
+
+/**
+ * Fraction of total route distance covered by segments that overlap a later
+ * segment in space — i.e. they sit within `proximityKm` of another segment
+ * and run roughly parallel or antiparallel (same physical street).
+ *
+ * Catches retraces that retraceRatio() misses when OSRM samples the same
+ * street at different vertex positions on the way out vs. the way back.
+ */
+export function overlapSegmentRatio(
+  points: RoutePoint[],
+  proximityKm: number = 0.012,
+  bearingTolDeg: number = 20
+): number {
+  if (points.length < 2) return 0;
+
+  // Pre-compute midpoints, bearings, and lengths once.
+  const n = points.length - 1;
+  const mid: RoutePoint[] = new Array(n);
+  const brg: number[] = new Array(n);
+  const len: number[] = new Array(n);
+  let totalLen = 0;
+  for (let i = 0; i < n; i++) {
+    mid[i] = { lat: (points[i].lat + points[i + 1].lat) / 2, lng: (points[i].lng + points[i + 1].lng) / 2 };
+    brg[i] = bearingFrom(points[i], points[i + 1]);
+    len[i] = haversineDistance(points[i], points[i + 1]);
+    totalLen += len[i];
+  }
+  if (totalLen === 0) return 0;
+
+  let overlapLen = 0;
+  for (let i = 0; i < n; i++) {
+    let overlaps = false;
+    // Skip near-adjacent segments — those are the route continuing forward.
+    for (let j = i + 5; j < n; j++) {
+      if (haversineDistance(mid[i], mid[j]) > proximityKm) continue;
+      // Co-linear if bearings are equal (parallel) OR differ by 180° (antiparallel).
+      const raw = Math.abs(brg[i] - brg[j]) % 360;
+      const ang = Math.min(raw, 360 - raw);
+      if (ang < bearingTolDeg || (180 - ang) < bearingTolDeg) {
+        overlaps = true;
+        break;
+      }
+    }
+    if (overlaps) overlapLen += len[i];
+  }
+
+  return overlapLen / totalLen;
 }
 
 /** Check if two line segments cross each other */
