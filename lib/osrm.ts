@@ -1364,7 +1364,11 @@ export function mockOSRMRoute(waypoints: RoutePoint[]): OSRMRoute {
   // Wobble amplitude as fraction of segment length. Tuned so arc length
   // sits at ~1.25–1.4× straight line — close enough to ROUTING_OVERHEAD
   // that the distance-adjustment loop converges similarly to real OSRM.
-  const WOBBLE_FRACTION = 0.09;
+  // Tuned so mock arc length is ~1.35-1.45× straight-line — matches real
+  // OSRM's typical road-routing overhead. Was 0.09 (gave ~1.10×) which
+  // made anchored routes look 25% shorter in mock than they'd actually
+  // be in production, causing false rounding-distance failures.
+  const WOBBLE_FRACTION = 0.22;
 
   const coords: [number, number][] = [];
 
@@ -1456,6 +1460,10 @@ const osrmRouteCache = new Map<string, OSRMRoute>();
 // 50 would silently evict half of them, breaking deterministic replay).
 let osrmCacheMax = 50;
 export function setOSRMCacheMax(n: number): void { osrmCacheMax = n; }
+/** Clear the in-memory OSRM cache. The harness calls this between fixtures
+ *  in deterministic mode so cross-fixture cache hits don't make results
+ *  depend on which fixtures preceded the current one. */
+export function clearOSRMCache(): void { osrmRouteCache.clear(); }
 
 /**
  * Snapshot the OSRM cache for record-and-replay testing — same pattern as
