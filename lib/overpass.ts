@@ -53,6 +53,21 @@ export function loadOverpassCaches(snapshot: Partial<OverpassSnapshot>): void {
 }
 
 /**
+ * Seed the caches for a (center, radiusKm) under the correct internal key.
+ * Used by the test harness to inject synthetic green-space fixtures so the
+ * green-space-first algorithm can be exercised when Overpass is unavailable.
+ */
+export function prefillOverpassCaches(
+  center: RoutePoint,
+  radiusKm: number,
+  greenSpaces: GreenSpace[],
+  highwayPoints: RoutePoint[],
+): void {
+  enrichedGreenSpaceCache.set(locationKey('enriched', center, radiusKm), greenSpaces);
+  highwayCache.set(locationKey('highway', center, radiusKm), highwayPoints);
+}
+
+/**
  * Compute bounding box from route points with a small buffer.
  * Returns [south, west, north, east] for Overpass bbox format.
  */

@@ -15,6 +15,12 @@
     "preset": "jest-expo",
     "transformIgnorePatterns": [
       "node_modules/(?!((jest-)?react-native|@react-native(-community)?)|expo(nern-fo-web)?|@expo(nent)?/.*)"
+    ],
+    "testPathIgnorePatterns": [
+      "/node_modules/",
+      "/lib/__tests__/route-quality-harness\\.ts$",
+      "/lib/__tests__/simulate-routes\\.ts$",
+      "/lib/__tests__/fixtures/"
     ]
   },
   "expo": {

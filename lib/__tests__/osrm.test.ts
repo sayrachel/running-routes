@@ -187,10 +187,12 @@ describe('pickRouteName', () => {
     areaSize: 0.1,
   });
 
-  it('uses named anchors for loop with 2+ named anchors', () => {
+  it('uses both named anchors for loop with 2+ named anchors', () => {
     const anchors = [makeAnchor('Central Park'), makeAnchor('Riverside Park')];
     const name = pickRouteName({ lowTraffic: false }, 0, 40.7, anchors, 'loop');
-    expect(name).toBe('Central Park Loop');
+    // Mention both anchors so the title reflects the route's character;
+    // strip the "Park" suffix from the second name to keep titles readable.
+    expect(name).toBe('Central Park & Riverside Loop');
   });
 
   it('uses "A to B" format for non-loop with 2+ named anchors', () => {

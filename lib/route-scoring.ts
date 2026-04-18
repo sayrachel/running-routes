@@ -81,10 +81,13 @@ function hasPointWithin(grid: SpatialGrid | null, p: RoutePoint, proximityKm: nu
   return false;
 }
 
-/** Indices of route points to sample. Matches prior `step = floor(n / ceil(n/20))`. */
+/** Indices of route points to sample. Aims for ~50 samples — sparser misses
+ *  brief park visits entirely (a 5km route passing through a 200m-wide park
+ *  spends ~4% of its length there; with only 10 samples there's <40% chance
+ *  any sample lands inside). 50 samples bring coverage close to 90%. */
 function sampleIndices(n: number): number[] {
   if (n === 0) return [];
-  const step = Math.max(1, Math.floor(n / Math.ceil(n / 20)));
+  const step = Math.max(1, Math.floor(n / 50));
   const out: number[] = [];
   for (let i = 0; i < n; i += step) out.push(i);
   return out;

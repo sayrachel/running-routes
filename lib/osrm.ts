@@ -2,6 +2,8 @@ import type { RoutePoint, GeneratedRoute, RoutePreferences } from './route-gener
 import { fetchGreenSpacesAndHighways } from './overpass';
 import type { GreenSpace } from './overpass';
 import { scoreRoute, computeGreenSpaceProximity, computeRunPathProximity, computeHighwayProximity, computeWaterfrontProximity } from './route-scoring';
+import { emit as traceEmit } from './debug-trace';
+import { isPopularRunningPark } from './popular-running-parks';
 
 const OSRM_BASE = 'https://router.project-osrm.org/route/v1/foot';
 const MAX_CANDIDATE_COUNT = 3;
@@ -58,6 +60,22 @@ function removeOneSelfIntersection(points: RoutePoint[]): RoutePoint[] {
 
         // If the loop is between 5% and 40% of the route, cut it out
         if (loopLen > totalLen * 0.05 && loopLen < totalLen * 0.4) {
+          // Continuity guard: after the cut, the polyline jumps directly
+          // from points[i] to points[j+1] in a straight line. For a TRUE
+          // lollipop the loop closes back on itself, so this jump distance
+          // is small relative to the total path that was removed. For a
+          // SPURIOUS crossing (e.g. mock wobble between adjacent triangle
+          // legs), the jump is comparable to the removed length — meaning
+          // we'd render a fictional shortcut the runner can't actually
+          // take. Threshold of 30% is generous enough for noisy real-OSRM
+          // geometry but rejects the worst false positives.
+          const cutGapKm = haversineDistance(points[i], points[j + 1]);
+          let removedPathKm = 0;
+          for (let k = i; k <= j; k++) {
+            removedPathKm += haversineDistance(points[k], points[k + 1]);
+          }
+          if (removedPathKm > 0 && cutGapKm / removedPathKm > 0.30) continue;
+
           // Remove the loop: keep points[0..i] then points[j+1..end]
           return [...points.slice(0, i + 1), ...points.slice(j + 1)];
         }
@@ -232,9 +250,22 @@ export function angleDiff(a: number, b: number): number {
 export function hasLikelyWaterCrossing(
   p1: RoutePoint,
   p2: RoutePoint,
-  _greenSpaces: GreenSpace[]
+  _greenSpaces: GreenSpace[],
+  targetDistanceKm?: number
 ): boolean {
-  return haversineDistance(p1, p2) > 1.5;
+  // Scale the threshold with route length. For a triangular loop, the
+  // longest natural segment (wp1→wp2) is roughly 0.4× the total route
+  // distance, so a 6mi (9.7km) loop legitimately has a 3.3km segment.
+  // The fixed 1.5km threshold dropped wp1 AND wp2 for every loop ≥4mi,
+  // collapsing the route to [center, center] and forcing the step-3.5
+  // emergency fallback (which uses no green spaces).
+  // Post-OSRM `hasRoutedBarrierCrossing` is the safety net for actual
+  // tunnels/bridges — this pre-OSRM heuristic just needs to catch the
+  // truly extreme cases (>50% of route in one segment).
+  const limit = targetDistanceKm !== undefined
+    ? Math.max(1.5, targetDistanceKm * 0.5)
+    : 1.5;
+  return haversineDistance(p1, p2) > limit;
 }
 
 /**
@@ -246,16 +277,40 @@ export function hasLikelyWaterCrossing(
 export function removeWaterCrossings(
   waypoints: RoutePoint[],
   greenSpaces: GreenSpace[],
-  center: RoutePoint
+  center: RoutePoint,
+  targetDistanceKm?: number
 ): RoutePoint[] {
-  if (waypoints.length < 3) return waypoints;
+  return removeWaterCrossingsWithAnchors(waypoints, greenSpaces, center, [], targetDistanceKm).waypoints;
+}
+
+/**
+ * Same as removeWaterCrossings but also keeps the parallel `anchors` array
+ * in sync — when a waypoint is replaced with a different green space, the
+ * matching anchor is updated; when a waypoint is dropped, the matching
+ * anchor is dropped too. Without this sync, downstream consumers like
+ * `expandParkWaypoints` and the "Tompkins Square Park Loop" naming look up
+ * stale anchors and either skip expansion or pick the wrong name.
+ *
+ * Anchor indexing convention: waypoints are [center, gs1, gs2, ..., center];
+ * anchors are [gs1, gs2, ...]. So anchors[i-1] corresponds to waypoints[i]
+ * for i in 1..waypoints.length-2.
+ */
+export function removeWaterCrossingsWithAnchors(
+  waypoints: RoutePoint[],
+  greenSpaces: GreenSpace[],
+  center: RoutePoint,
+  anchors: GreenSpace[],
+  targetDistanceKm?: number
+): { waypoints: RoutePoint[]; anchors: GreenSpace[] } {
+  if (waypoints.length < 3) return { waypoints, anchors };
 
   const result = [...waypoints];
+  const resultAnchors = [...anchors];
   const toRemove = new Set<number>();
 
   for (let i = 1; i < result.length - 1; i++) {
-    if (!hasLikelyWaterCrossing(result[i - 1], result[i], greenSpaces) &&
-        !hasLikelyWaterCrossing(result[i], result[i + 1], greenSpaces)) {
+    if (!hasLikelyWaterCrossing(result[i - 1], result[i], greenSpaces, targetDistanceKm) &&
+        !hasLikelyWaterCrossing(result[i], result[i + 1], greenSpaces, targetDistanceKm)) {
       continue;
     }
 
@@ -273,13 +328,22 @@ export function removeWaterCrossings(
         .sort((a, b) => (b.areaSize * 10 + (b.name ? 5 : 0)) - (a.areaSize * 10 + (a.name ? 5 : 0)));
 
       for (const gs of candidates) {
-        if (hasLikelyWaterCrossing(center, gs.point, greenSpaces)) continue;
-        const prevOk = !hasLikelyWaterCrossing(result[i - 1], gs.point, greenSpaces);
+        if (hasLikelyWaterCrossing(center, gs.point, greenSpaces, targetDistanceKm)) continue;
+        // Don't replace with a green space that's already a waypoint —
+        // produces a degenerate "center → X → X → center" route and a
+        // duplicate name like "Tompkins Square Park / Tompkins Square Park".
+        const alreadyUsed = result.some((p, idx) =>
+          idx !== i && Math.abs(p.lat - gs.point.lat) < 1e-6 && Math.abs(p.lng - gs.point.lng) < 1e-6
+        );
+        if (alreadyUsed) continue;
+        const prevOk = !hasLikelyWaterCrossing(result[i - 1], gs.point, greenSpaces, targetDistanceKm);
         const nextOk = i + 1 < result.length
-          ? !hasLikelyWaterCrossing(gs.point, result[i + 1], greenSpaces)
+          ? !hasLikelyWaterCrossing(gs.point, result[i + 1], greenSpaces, targetDistanceKm)
           : true;
         if (prevOk && nextOk) {
           result[i] = gs.point;
+          // Sync the anchor: anchor index = waypoint index - 1.
+          if (i - 1 < resultAnchors.length) resultAnchors[i - 1] = gs;
           replaced = true;
           break;
         }
@@ -291,7 +355,11 @@ export function removeWaterCrossings(
     }
   }
 
-  return result.filter((_, i) => !toRemove.has(i));
+  // Drop dropped waypoints AND their matching anchors in lockstep.
+  return {
+    waypoints: result.filter((_, i) => !toRemove.has(i)),
+    anchors: resultAnchors.filter((_, i) => !toRemove.has(i + 1)),
+  };
 }
 
 /**
@@ -479,6 +547,16 @@ export function scoreGreenSpace(
     if (gs.areaSize > 0.5) score += 5; // major park bonus (e.g., Central Park, Prospect Park)
   }
 
+  // Curated runner-popularity boost: parks well-known to the running
+  // community (Central Park, McCarren Park, Lakefront Trail, Embarcadero,
+  // etc.) get a substantial bump above peers of similar geometry. Captures
+  // the difference between "park people run in" vs. "park that just happens
+  // to be there" — McCarren and Tompkins Square are similar size in OSM but
+  // wildly different as running destinations. List in popular-running-parks.ts.
+  if (gs.name && isPopularRunningPark(gs.name)) {
+    score += 12;
+  }
+
   // Kind bonuses
   if (gs.kind === 'park' || gs.kind === 'nature') score += 3;
   if (gs.kind === 'route') score += strategy === 'named-paths' ? 5 : 2;
@@ -524,6 +602,11 @@ export function selectGreenSpaceWaypoints(
   // Use parks, gardens, nature reserves, and waterfront as loop waypoints —
   // bike lanes and footways should influence scoring, not force OSRM detours
   const waypointKinds = new Set(['park', 'garden', 'nature', 'waterfront']);
+  // minCenterDist applied UPFRONT (was originally a post-pick filter, which
+  // meant a sector could pick a too-close green space, then drop it later
+  // and end up with too few picks. Filtering early lets the sectoring +
+  // top-N backfill work on already-valid candidates.)
+  const minCenterDist = Math.max(0.3, targetDistanceKm * 0.08);
   const annotated = greenSpaces
     .filter((gs) => waypointKinds.has(gs.kind) || (gs.kind === 'route' && gs.name))
     .map((gs) => {
@@ -537,6 +620,7 @@ export function selectGreenSpaceWaypoints(
     };
   })
   .filter((a) => a.dist <= maxRadius)
+  .filter((a) => a.dist >= minCenterDist)
   .filter((a) => isAccessibleFromCenter(center, a.gs.point, greenSpaces));
 
   if (annotated.length < 2) return null;
@@ -592,7 +676,37 @@ export function selectGreenSpaceWaypoints(
     }
   }
 
-  if (picks.length < (strict ? 3 : 2)) return null;
+  // Top-N-by-score backfill for clustered locations. In dense urban areas
+  // (e.g. NYC LES) green spaces often cluster on one side — sectoring may
+  // place all of them in 1-2 sectors and leave us with too few picks. Rather
+  // than punt to the geometric fallback (losing all green-space context AND
+  // its naming benefit), pick the highest-scoring remaining candidates that
+  // sit at least ~60° away in bearing from any existing pick. This keeps
+  // diversity without requiring uniform angular spread.
+  if (picks.length < 3) {
+    const allByScore = annotated.slice().sort((a, b) => b.score - a.score);
+    for (const cand of allByScore) {
+      if (picks.length >= 3) break;
+      if (picks.some((p) => p.gs === cand.gs)) continue;
+      // 45° threshold matches the downstream bearing-similarity filter and
+      // lets a third pick squeeze in for clustered locations (Williamsburg
+      // has 4 greens within a 50° northern arc — a 60° threshold makes the
+      // third pick impossible). The downstream minWaypointSpacing and
+      // bearing-similarity filters still drop genuinely too-close picks.
+      const tooClose = picks.some((p) => angleDiff(p.bearing, cand.bearing) < 45);
+      if (tooClose) continue;
+      picks.push({ gs: cand.gs, bearing: cand.bearing, dist: cand.dist });
+    }
+  }
+
+  // Both modes: 2 picks is the hard minimum. Strict mode previously required
+  // 3, which sounded right but sent every dense-cluster location (Chi
+  // lakefront, Williamsburg) to the geometric fallback when only 2 well-
+  // spaced candidates existed. Strict mode still applies stricter scoring
+  // (boosted tier/area bonuses) and adjacent-sector backfill, so it favors
+  // higher-quality picks — it just doesn't punt when the location
+  // genuinely lacks 3 spread-out green spaces.
+  if (picks.length < 2) return null;
 
   // Cap at 3 waypoints max — more than 3 creates zigzag block-looping
   const maxGreenWaypoints = Math.min(picks.length, 3);
@@ -602,14 +716,8 @@ export function selectGreenSpaceWaypoints(
 
   // Order by bearing to form a loop
   selectedPicks.sort((a, b) => a.bearing - b.bearing);
-
-  // Remove waypoints too close to center — prevents backtracking near start/end
-  const minCenterDist = Math.max(0.8, targetDistanceKm * 0.12);
-  for (let i = selectedPicks.length - 1; i >= 0; i--) {
-    if (selectedPicks[i].dist < minCenterDist) {
-      selectedPicks.splice(i, 1);
-    }
-  }
+  // (minCenterDist filter moved upstream to the `annotated` stage so
+  // sectoring + top-N backfill operate on already-valid candidates.)
 
   // Remove ANY pair of waypoints that are too close (not just consecutive) —
   // in a city grid, two waypoints 500m apart on parallel streets cause
@@ -783,19 +891,35 @@ function generateGreenSpaceOutAndBack(
   strategy: CandidateStrategy
 ): { waypoints: RoutePoint[]; anchors: GreenSpace[] } {
   const halfDist = distanceKm / (2 * ROUTING_OVERHEAD);
-  const mainBearing = (variant * 97 + (prefs.lowTraffic ? 30 : 0)) % 360;
   const corridorWidth = 30; // degrees either side of main bearing
+  const seedBearing = (variant * 97 + (prefs.lowTraffic ? 30 : 0)) % 360;
 
-  // Find green spaces along the corridor
-  const corridorSpaces = greenSpaces
+  // Pre-annotate green spaces once (bearing/dist/score independent of corridor).
+  const annotated = greenSpaces
     .map((gs) => ({
       gs,
       bearing: bearingFrom(center, gs.point),
       dist: haversineDistance(center, gs.point),
       score: scoreGreenSpace(gs, strategy, prefs.lowTraffic),
     }))
-    .filter((a) => angleDiff(a.bearing, mainBearing) <= corridorWidth && a.dist <= halfDist)
-    .sort((a, b) => a.dist - b.dist);
+    .filter((a) => a.dist <= halfDist);
+
+  // A single random corridor bearing often points into water or a sparse area
+  // (the same class of bug that bit the geometric fallback). Try N evenly-
+  // spaced bearings and keep the corridor with the most green spaces.
+  // The seed-derived bearing is checked first so variant diversity is preserved
+  // when multiple corridors are equally good.
+  const NUM_BEARINGS = 6;
+  let corridorSpaces: typeof annotated = [];
+  for (let i = 0; i < NUM_BEARINGS; i++) {
+    const bearing = (seedBearing + (i * 360) / NUM_BEARINGS) % 360;
+    const corridor = annotated
+      .filter((a) => angleDiff(a.bearing, bearing) <= corridorWidth)
+      .sort((a, b) => a.dist - b.dist);
+    if (corridor.length > corridorSpaces.length) {
+      corridorSpaces = corridor;
+    }
+  }
 
   if (corridorSpaces.length < 2) {
     // Fallback to geometric
@@ -924,7 +1048,9 @@ function selectWaypoint(
   };
 }
 
-const OSRM_TIMEOUT_MS = 3000;
+// Public OSRM endpoint (router.project-osrm.org) is often slow; 3s caused
+// most retries to abort, preventing fetchOSRMRouteAdjusted from converging.
+const OSRM_TIMEOUT_MS = 8000;
 
 /** Retry wrapper for fetch with timeout */
 async function fetchWithRetry(url: string, retries = 1): Promise<Response> {
@@ -1048,6 +1174,106 @@ async function fetchOSRMRouteAdjusted(
 }
 
 /**
+ * Deterministic synthetic OSRM stand-in for the quality harness.
+ *
+ * Emits plausible road-shaped geometry through the given waypoints — enough
+ * to exercise the post-OSRM pipeline (lollipop removal, retrace/overlap
+ * detection, scoring, ranking) without burning quota on the public
+ * router.project-osrm.org endpoint.
+ *
+ * Geometry is two-harmonic perpendicular wobble around the straight line
+ * between each pair of waypoints, tapered to zero at the endpoints so the
+ * route actually touches each waypoint. Wobble seed is derived from the
+ * endpoint coordinates so the same waypoints always produce the same shape.
+ *
+ * NOT representative of real road geometry. Use only for algorithm-level
+ * QA of waypoint selection + post-processing, not for end-user simulation.
+ */
+export function mockOSRMRoute(waypoints: RoutePoint[]): OSRMRoute {
+  const STEP_KM = 0.025; // ~25m between sampled points
+  // Wobble amplitude as fraction of segment length. Tuned so arc length
+  // sits at ~1.25–1.4× straight line — close enough to ROUTING_OVERHEAD
+  // that the distance-adjustment loop converges similarly to real OSRM.
+  const WOBBLE_FRACTION = 0.09;
+
+  const coords: [number, number][] = [];
+
+  for (let i = 0; i < waypoints.length - 1; i++) {
+    const a = waypoints[i];
+    const b = waypoints[i + 1];
+    const direct = haversineDistance(a, b);
+    if (direct < 0.001) continue;
+
+    const steps = Math.max(8, Math.round(direct / STEP_KM));
+    const bearing = bearingFrom(a, b);
+    const perpBearing = (bearing + 90) % 360;
+
+    if (i === 0) coords.push([a.lng, a.lat]);
+
+    // Phase derived from segment endpoints — same waypoints → same shape.
+    const seed = a.lat * 31 + a.lng * 71 + b.lat * 53 + b.lng * 13;
+
+    for (let k = 1; k <= steps; k++) {
+      const t = k / steps;
+      const baseLat = a.lat + (b.lat - a.lat) * t;
+      const baseLng = a.lng + (b.lng - a.lng) * t;
+
+      // Sin(πt) taper: zero at endpoints, full amplitude at midpoint.
+      const taper = Math.sin(Math.PI * t);
+      const wobble =
+        WOBBLE_FRACTION * direct *
+        (Math.sin(seed + t * 12.7) * 0.6 + Math.sin(seed * 1.3 + t * 31.3) * 0.4) *
+        taper;
+
+      const wobbled = destinationPoint(
+        { lat: baseLat, lng: baseLng },
+        perpBearing,
+        wobble
+      );
+      coords.push([wobbled.lng, wobbled.lat]);
+    }
+  }
+
+  let distMeters = 0;
+  for (let k = 1; k < coords.length; k++) {
+    const p1 = { lat: coords[k - 1][1], lng: coords[k - 1][0] };
+    const p2 = { lat: coords[k][1], lng: coords[k][0] };
+    distMeters += haversineDistance(p1, p2) * 1000;
+  }
+
+  // 9 min/km walking pace → 540 s/km
+  const duration = (distMeters / 1000) * 540;
+
+  return {
+    geometry: { type: 'LineString', coordinates: coords },
+    distance: distMeters,
+    duration,
+  };
+}
+
+/**
+ * Toggle for the synthetic OSRM stand-in. Off in production; the harness
+ * flips it on with `--mock-osrm` (auto-on with `--synthetic`) so a single
+ * QA run exercises the real waypoint-selection + post-processing pipeline
+ * without depending on the public OSRM endpoint.
+ */
+let osrmMockEnabled = false;
+export function setOSRMMock(enabled: boolean): void { osrmMockEnabled = enabled; }
+export function isOSRMMockEnabled(): boolean { return osrmMockEnabled; }
+
+/**
+ * Deterministic seed override for `generateOSRMRoutes`. When set (by the
+ * harness), replaces `Date.now()` everywhere variant/bearing seeding is
+ * computed so two runs over the same fixture produce byte-identical
+ * waypoints. Production leaves this null so each user request shuffles.
+ */
+let deterministicSeed: number | null = null;
+export function setDeterministicSeed(seed: number | null): void { deterministicSeed = seed; }
+function getSeed(): number {
+  return deterministicSeed !== null ? deterministicSeed : Date.now();
+}
+
+/**
  * In-memory cache of successful OSRM responses keyed by request URL.
  * Identical waypoints (e.g. when the user taps refresh from the same start)
  * skip the network round trip entirely. LRU-bounded to avoid unbounded
@@ -1055,12 +1281,42 @@ async function fetchOSRMRouteAdjusted(
  * errors can still be retried.
  */
 const osrmRouteCache = new Map<string, OSRMRoute>();
-const OSRM_CACHE_MAX = 50;
+// Mutable so the test harness can raise the cap before recording a snapshot
+// (a single harness run can fire 100+ OSRM calls; the production default of
+// 50 would silently evict half of them, breaking deterministic replay).
+let osrmCacheMax = 50;
+export function setOSRMCacheMax(n: number): void { osrmCacheMax = n; }
+
+/**
+ * Snapshot the OSRM cache for record-and-replay testing — same pattern as
+ * the Overpass snapshot. Lets the quality harness run fully offline once
+ * a recording exists, removing flakiness from the public OSRM endpoint.
+ */
+export interface OSRMSnapshot {
+  routes: Array<[string, OSRMRoute]>;
+}
+
+export function dumpOSRMCache(): OSRMSnapshot {
+  return { routes: Array.from(osrmRouteCache.entries()) };
+}
+
+export function loadOSRMCache(snapshot: Partial<OSRMSnapshot>): void {
+  if (snapshot.routes) {
+    for (const [k, v] of snapshot.routes) osrmRouteCache.set(k, v);
+  }
+}
 
 /**
  * Call OSRM to get a walking route through the given waypoints.
  */
 async function fetchOSRMRoute(waypoints: RoutePoint[]): Promise<OSRMRoute | null> {
+  // Mock short-circuit — bypasses cache, network, and retry. Used only
+  // by the quality harness to keep algorithm QA decoupled from OSRM quota.
+  if (osrmMockEnabled) {
+    if (waypoints.length < 2) return null;
+    return mockOSRMRoute(waypoints);
+  }
+
   const coords = coordsString(waypoints);
   const url = `${OSRM_BASE}/${coords}?overview=full&geometries=geojson&steps=false`;
 
@@ -1082,7 +1338,7 @@ async function fetchOSRMRoute(waypoints: RoutePoint[]): Promise<OSRMRoute | null
     }
 
     const route = data.routes[0];
-    if (osrmRouteCache.size >= OSRM_CACHE_MAX) {
+    if (osrmRouteCache.size >= osrmCacheMax) {
       const oldest = osrmRouteCache.keys().next().value;
       if (oldest !== undefined) osrmRouteCache.delete(oldest);
     }
@@ -1093,6 +1349,19 @@ async function fetchOSRMRoute(waypoints: RoutePoint[]): Promise<OSRMRoute | null
     return null;
   }
 }
+
+/**
+ * Triangle perimeter factor for the (center, wp1, wp2, center) waypoint
+ * pattern with wp1 at bearing B and wp2 at bearing B+210°, both at the
+ * same distance d from center:
+ *   haversine perimeter = 2d + 2d·sin(105°) ≈ 3.93·d
+ * Used to back-solve waypoint distance from the target route distance.
+ *
+ * Previously this was `2π` (treating the loop as a full circle), which
+ * over-shrunk the radius by ~33% — the routed result undershot the target
+ * by 20–30% on every loop fixture that fell through to the geometric path.
+ */
+const LOOP_TRIANGLE_PERIMETER = 2 + 2 * Math.sin((105 * Math.PI) / 180);
 
 /**
  * Generate waypoints for a loop route (geometric fallback).
@@ -1106,11 +1375,14 @@ function generateLoopWaypoints(
   variant: number,
   _greenSpaces: RoutePoint[] = []
 ): RoutePoint[] {
-  const radius = distanceKm / (2 * Math.PI * ROUTING_OVERHEAD);
+  const waypointDist = distanceKm / (LOOP_TRIANGLE_PERIMETER * ROUTING_OVERHEAD);
   const bearing = (variant * 73) % 360;
 
-  const wp1 = destinationPoint(center, bearing, radius * 1.2);
-  const wp2 = destinationPoint(center, (bearing + 180) % 360, radius * 1.2);
+  const wp1 = destinationPoint(center, bearing, waypointDist);
+  // Offset wp2 30° from antipodal so the route forms a triangle, not a
+  // straight line — perfect-line waypoints make OSRM use the same streets
+  // both ways, which produces high retrace.
+  const wp2 = destinationPoint(center, (bearing + 210) % 360, waypointDist);
 
   return [center, wp1, wp2, center];
 }
@@ -1192,7 +1464,13 @@ export function pickRouteName(
 
   if (namedAnchors.length >= 2) {
     if (routeType === 'loop') {
-      return `${namedAnchors[0].name} Loop`;
+      // Mention up to two distinct named anchors so the title reflects the
+      // full character of the route — "East River Park & Tompkins Loop" is
+      // more useful than just "East River Park Loop" when the route visits
+      // both parks. Truncate the second name's "Park"/"Square Park" suffix
+      // to keep titles readable.
+      const second = namedAnchors[1].name!.replace(/\s*(?:Square\s*)?Park$|\s*Greenway$|\s*Garden(?:s)?$|\s*Promenade$/i, '');
+      return `${namedAnchors[0].name} & ${second} Loop`;
     }
     return `${namedAnchors[0].name} to ${namedAnchors[namedAnchors.length - 1].name}`;
   }
@@ -1238,10 +1516,17 @@ export async function generateOSRMRoutes(
   prefs: RoutePreferences = { lowTraffic: false },
   end?: RoutePoint | null
 ): Promise<GeneratedRoute[]> {
+  traceEmit('generate-start', { center, distanceKm, routeType, count, prefs, end: end ?? null });
+
   // Step 1: Fetch enriched green spaces and highway segments in a single
   // Overpass round trip (shared across all candidates).
   const radiusKm = calculateSearchRadius(routeType, distanceKm, center, end);
   const { greenSpaces, highwayPoints } = await fetchGreenSpacesAndHighways(center, radiusKm);
+  traceEmit('overpass-result', {
+    radiusKm,
+    greenSpaceCount: greenSpaces.length,
+    highwayPointCount: highwayPoints.length,
+  });
 
   // Step 2: Generate exactly `count` candidate waypoint sets with diversity.
   // Each candidate excludes parks used by previous candidates so routes go
@@ -1250,7 +1535,7 @@ export async function generateOSRMRoutes(
   // even though we only ever return N. The Step 3.5 fallback at the bottom
   // handles the rare case where every candidate is rejected.
   const candidateCount = Math.min(MAX_CANDIDATE_COUNT, count);
-  const timeSeed = Date.now() % 100000;
+  const timeSeed = getSeed() % 100000;
   const candidates: { variant: number; waypoints: RoutePoint[]; anchors: GreenSpace[] }[] = [];
   const usedParkPoints: RoutePoint[] = []; // Parks already used by earlier candidates
 
@@ -1307,13 +1592,30 @@ export async function generateOSRMRoutes(
       usedParkPoints.push(a.point);
     }
 
-    // Apply water crossing removal before OSRM
-    waypoints = removeWaterCrossings(waypoints, greenSpaces, center);
+    // Apply water crossing removal before OSRM, keeping anchors in sync so
+    // expandParkWaypoints and route naming see the actual post-replacement
+    // green spaces. Pass route distance so the threshold scales — a 6mi
+    // loop's natural wp1→wp2 chord is ~3km, well over the fixed 1.5km
+    // legacy default which would drop both waypoints.
+    {
+      const synced = removeWaterCrossingsWithAnchors(waypoints, greenSpaces, center, anchors, distanceKm);
+      waypoints = synced.waypoints;
+      anchors = synced.anchors;
+    }
 
     // Expand large parks into entry/exit pairs so OSRM routes through
     // the park interior, not just past its edge
     waypoints = expandParkWaypoints(waypoints, anchors);
 
+    traceEmit('candidate-built', {
+      i,
+      strategy,
+      variant,
+      anchorCount: anchors.length,
+      anchorNames: anchors.map((a) => a.name).filter(Boolean),
+      waypointCount: waypoints.length,
+      waypoints,
+    });
     candidates.push({ variant, waypoints, anchors });
   }
 
@@ -1337,8 +1639,31 @@ export async function generateOSRMRoutes(
     const osrmRoute = osrmResult.route;
     if (osrmRoute) {
       const rawPoints = osrmRoute.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }));
-      const points = removeSelfintersections(rawPoints);
-      const distKm = osrmRoute.distance / 1000;
+      // Two cases skip lollipop removal:
+      // 1. Out-and-back: SUPPOSED to retrace, would lose ~75% of route to
+      //    phantom-loop snips.
+      // 2. Mock OSRM: smooth wobble between waypoints can cause adjacent
+      //    triangle legs to cross at junctions — real OSRM geometry follows
+      //    actual streets (right angles, no continuous wobble) and doesn't
+      //    produce these false positives, so the cleanup is correct in
+      //    production but over-cuts the synthetic mock geometry.
+      const skipLollipopRemoval = routeType === 'out-and-back' || osrmMockEnabled;
+      const points = skipLollipopRemoval
+        ? rawPoints
+        : removeSelfintersections(rawPoints);
+      // Recompute distance from the actual emitted points so the displayed
+      // mileage matches the polyline drawn on the map. Using the pre-cut
+      // OSRM distance after a lollipop snip would over-state the route by
+      // whatever the cut removed.
+      let distKm: number;
+      if (points === rawPoints) {
+        distKm = osrmRoute.distance / 1000;
+      } else {
+        distKm = 0;
+        for (let k = 1; k < points.length; k++) {
+          distKm += haversineDistance(points[k - 1], points[k]);
+        }
+      }
       const estimatedTime = Math.round(osrmRoute.duration / 60);
       const distRatio = distanceKm > 0 ? distKm / distanceKm : 1;
       // Point-to-point routes go to a user-chosen destination, so be very
@@ -1347,12 +1672,14 @@ export async function generateOSRMRoutes(
       const minRatio = routeType === 'point-to-point' ? 0.2 : 0.5;
       if (distRatio > maxRatio || distRatio < minRatio) {
         console.log(`[RouteScoring] Rejecting candidate ${i}: dist=${distKm.toFixed(2)}km (ratio=${distRatio.toFixed(2)}, target=${distanceKm.toFixed(2)}km)`);
+        traceEmit('candidate-rejected', { i, reason: 'distance', distKm, distRatio, target: distanceKm });
         continue;
       }
       // Check the routed path for tunnels/bridges (straight-line segments)
       // and geographic drift (route leaving the starting area)
       if (routeType !== 'point-to-point' && hasRoutedBarrierCrossing(points, greenSpaces, center, distanceKm)) {
         console.log(`[RouteScoring] Rejecting candidate ${i}: route crosses a likely barrier (tunnel/bridge)`);
+        traceEmit('candidate-rejected', { i, reason: 'barrier', distKm });
         continue;
       }
       // Check for highway proximity — reject routes where >15% of points
@@ -1361,6 +1688,7 @@ export async function generateOSRMRoutes(
       const hwProximity = computeHighwayProximity(points, highwayPoints);
       if (hwProximity > 0.15) {
         console.log(`[RouteScoring] Rejecting candidate ${i}: ${(hwProximity * 100).toFixed(0)}% of route is near highways`);
+        traceEmit('candidate-rejected', { i, reason: 'highway', hwProximity });
         continue;
       }
       // Reject routes where >15% of distance is on retraced edges — the line
@@ -1369,8 +1697,10 @@ export async function generateOSRMRoutes(
       const retraced = retraceRatio(points);
       if (retraced > 0.15) {
         console.log(`[RouteScoring] Rejecting candidate ${i}: ${(retraced * 100).toFixed(0)}% of distance is retraced`);
+        traceEmit('candidate-rejected', { i, reason: 'retrace', retraced });
         continue;
       }
+      traceEmit('candidate-accepted', { i, distKm, distRatio, hwProximity, retraced });
       resolved.push({ index: i, variant: candidates[i].variant, points, distKm, estimatedTime, fromOSRM: true, anchors: candidates[i].anchors });
     } else {
       const wp = osrmResult.waypoints;
@@ -1401,42 +1731,96 @@ export async function generateOSRMRoutes(
   // Use iterative distance adjustment to ensure fallback also hits target distance
   if (resolved.length === 0) {
     console.log('[RouteScoring] All candidates rejected — generating direct fallback');
-    let fallbackWaypoints: RoutePoint[];
+    traceEmit('fallback-start', { routeType, distanceKm });
+
+    let chosen: { route: OSRMRoute | null; waypoints: RoutePoint[] };
+
     if (routeType === 'point-to-point' && end) {
-      // Simple direct route from start to end
-      fallbackWaypoints = [center, end];
-    } else if (routeType === 'out-and-back') {
-      const bearing = (Date.now() % 360);
-      const halfDist = distanceKm / (2 * ROUTING_OVERHEAD);
-      const turnaround = destinationPoint(center, bearing, halfDist);
-      fallbackWaypoints = [center, turnaround, center];
+      // Direct route from start to end — only one waypoint option to try.
+      chosen = await fetchOSRMRouteAdjusted([center, end], center, distanceKm, 3);
     } else {
-      // Loop fallback
-      fallbackWaypoints = generateLoopWaypoints(center, distanceKm, prefs, Date.now() % 100000, []);
+      // A single random bearing can land in water or impassable terrain —
+      // sf-embarcadero-3mi-out hit 11.65km on a 4.83km target because the
+      // bearing pointed into the bay, forcing OSRM to detour around it.
+      // Try N evenly-spaced bearings in parallel and keep the one whose
+      // routed distance lands closest to the target.
+      const NUM_BEARINGS = 4;
+      const seedBearing = getSeed() % 360;
+      const halfDist = distanceKm / (2 * ROUTING_OVERHEAD);
+      // Same triangle-perimeter math as generateLoopWaypoints. Previously
+      // used 2π here too, producing a 20–30% undershoot on the final fallback.
+      const waypointDist = distanceKm / (LOOP_TRIANGLE_PERIMETER * ROUTING_OVERHEAD);
+
+      // Sequential, not parallel. Firing all 4 trials in parallel (each with
+      // its own internal retry loop) means up to 16 in-flight OSRM calls
+      // against a free public endpoint, which rate-limits or times out — the
+      // surviving trial is often the bad-bearing one. Sequential lets each
+      // trial get OSRM's full attention; early-exit avoids wasted calls.
+      chosen = { route: null, waypoints: [] };
+      let bestErr = Infinity;
+      let bestIdx = 0;
+      const EARLY_EXIT_RATIO = 0.10; // stop once we're within 10% of target
+
+      for (let i = 0; i < NUM_BEARINGS; i++) {
+        const bearing = (seedBearing + (i * 360) / NUM_BEARINGS) % 360;
+        const wps: RoutePoint[] = routeType === 'out-and-back'
+          ? [center, destinationPoint(center, bearing, halfDist), center]
+          : [
+              center,
+              destinationPoint(center, bearing, waypointDist),
+              // Offset wp2 30° from antipodal so the route forms a triangle,
+              // not a straight line. OSRM tends to use the same streets
+              // both ways on a perfect line, causing high retrace.
+              destinationPoint(center, (bearing + 210) % 360, waypointDist),
+              center,
+            ];
+
+        const t = await fetchOSRMRouteAdjusted(wps, center, distanceKm, 3);
+        traceEmit('fallback-trial', {
+          i,
+          bearing,
+          routedKm: t.route ? t.route.distance / 1000 : null,
+          ratio: t.route ? (t.route.distance / 1000) / distanceKm : null,
+          waypoints: t.waypoints,
+        });
+
+        if (!t.route) continue;
+        const err = Math.abs(t.route.distance / 1000 - distanceKm);
+        if (err < bestErr) {
+          chosen = t;
+          bestErr = err;
+          bestIdx = i;
+        }
+        if (err / distanceKm <= EARLY_EXIT_RATIO) break;
+      }
+      traceEmit('fallback-chosen', {
+        bestIdx,
+        bearing: (seedBearing + (bestIdx * 360) / NUM_BEARINGS) % 360,
+        routedKm: chosen.route ? chosen.route.distance / 1000 : null,
+      });
     }
 
-    const adjusted = await fetchOSRMRouteAdjusted(fallbackWaypoints, center, distanceKm, 1);
-    if (adjusted.route) {
-      const points = adjusted.route.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }));
+    if (chosen.route) {
+      const points = chosen.route.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }));
       resolved.push({
         index: 0,
         variant: 0,
         points,
-        distKm: adjusted.route.distance / 1000,
-        estimatedTime: Math.round(adjusted.route.duration / 60),
+        distKm: chosen.route.distance / 1000,
+        estimatedTime: Math.round(chosen.route.duration / 60),
         fromOSRM: true,
         anchors: [],
       });
     } else {
       // Use raw waypoints as last resort
       let totalDist = 0;
-      for (let j = 1; j < adjusted.waypoints.length; j++) {
-        totalDist += haversineDistance(adjusted.waypoints[j - 1], adjusted.waypoints[j]);
+      for (let j = 1; j < chosen.waypoints.length; j++) {
+        totalDist += haversineDistance(chosen.waypoints[j - 1], chosen.waypoints[j]);
       }
       resolved.push({
         index: 0,
         variant: 0,
-        points: adjusted.waypoints,
+        points: chosen.waypoints,
         distKm: totalDist,
         estimatedTime: Math.round(totalDist * 6),
         fromOSRM: false,

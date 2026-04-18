@@ -3,32 +3,33 @@ import type { GreenSpace } from '../overpass';
 import type { RoutePoint } from '../route-generator';
 
 describe('scoreRoute', () => {
-  it('with lowTraffic=false: quiet score is ignored, 60% distance + 15% green + 25% runPath', () => {
+  // Current weights (matching scoreRoute):
+  //   relaxed: 0.50·dist + 0.15·green + 0.20·runPath + 0.15·waterfront
+  //   strict:  0.25·dist + 0.15·quiet + 0.20·green + 0.20·runPath + 0.20·waterfront
+
+  it('with lowTraffic=false: quiet score is ignored', () => {
     const candidate = { distanceKm: 5, targetDistanceKm: 5 };
     const prefs = { lowTraffic: false };
-
-    // Perfect distance match → distScore = 1.0
-    // quietScore should be irrelevant in relaxed mode
     const score1 = scoreRoute(candidate, prefs, 0.0, 0.5, 0.5);
     const score2 = scoreRoute(candidate, prefs, 1.0, 0.5, 0.5);
     expect(score1).toBeCloseTo(score2, 10);
   });
 
-  it('with lowTraffic=true: 30% distance + 20% quiet + 25% green + 25% runPath', () => {
+  it('with lowTraffic=true: weighted sum across distance/quiet/green/runPath/waterfront', () => {
     const candidate = { distanceKm: 5, targetDistanceKm: 5 };
     const prefs = { lowTraffic: true };
-
-    // Perfect distance → distScore = 1.0
+    // distScore=1.0, quiet=0.8, green=0.6, runPath=0.4, waterfront=0 (default)
     const score = scoreRoute(candidate, prefs, 0.8, 0.6, 0.4);
-    // 0.30 * 1.0 + 0.20 * 0.8 + 0.25 * 0.6 + 0.25 * 0.4 = 0.30 + 0.16 + 0.15 + 0.10 = 0.71
-    expect(score).toBeCloseTo(0.71, 5);
+    // 0.25·1.0 + 0.15·0.8 + 0.20·0.6 + 0.20·0.4 + 0.20·0 = 0.25 + 0.12 + 0.12 + 0.08 = 0.57
+    expect(score).toBeCloseTo(0.57, 5);
   });
 
-  it('perfect distance match yields distScore = 1.0', () => {
+  it('perfect distance match + perfect proximities (relaxed) yields distScore = 1.0', () => {
     const candidate = { distanceKm: 10, targetDistanceKm: 10 };
     const prefs = { lowTraffic: false };
-    const score = scoreRoute(candidate, prefs, 0.5, 1.0, 1.0);
-    // 0.60 * 1.0 + 0.15 * 1.0 + 0.25 * 1.0 = 1.0
+    // green=1.0, runPath=1.0, waterfront=1.0
+    const score = scoreRoute(candidate, prefs, 0.5, 1.0, 1.0, 1.0);
+    // 0.50·1.0 + 0.15·1.0 + 0.20·1.0 + 0.15·1.0 = 1.0
     expect(score).toBeCloseTo(1.0, 5);
   });
 
@@ -40,13 +41,13 @@ describe('scoreRoute', () => {
     expect(score).toBeCloseTo(0, 5);
   });
 
-  it('distance 10% off yields distScore = 0.6', () => {
+  it('distance 10% off (relaxed) yields the right weighted score', () => {
     const candidate = { distanceKm: 11, targetDistanceKm: 10 };
     const prefs = { lowTraffic: false };
-    // distRatio = 1.1, |1 - 1.1| = 0.1, 0.1 * 4 = 0.4, max(1 - 0.4, 0) = 0.6
+    // distRatio = 1.1, distScore = max(1 - 0.4, 0) = 0.6
     const score = scoreRoute(candidate, prefs, 0.5, 0.0, 0.0);
-    // 0.60 * 0.6 + 0.15 * 0.0 + 0.25 * 0.0 = 0.36
-    expect(score).toBeCloseTo(0.36, 5);
+    // 0.50·0.6 + 0.15·0.0 + 0.20·0.0 + 0.15·0 = 0.30
+    expect(score).toBeCloseTo(0.30, 5);
   });
 
   it('with targetDistanceKm=0, distScore defaults to 1.0', () => {
@@ -54,8 +55,8 @@ describe('scoreRoute', () => {
     const prefs = { lowTraffic: false };
     // distRatio = 1 (fallback), distScore = 1.0
     const score = scoreRoute(candidate, prefs, 0.5, 0.5, 0.5);
-    // 0.60 * 1.0 + 0.15 * 0.5 + 0.25 * 0.5 = 0.60 + 0.075 + 0.125 = 0.80
-    expect(score).toBeCloseTo(0.80, 5);
+    // 0.50·1.0 + 0.15·0.5 + 0.20·0.5 + 0.15·0 = 0.50 + 0.075 + 0.10 + 0 = 0.675
+    expect(score).toBeCloseTo(0.675, 5);
   });
 });
 
