@@ -97,8 +97,10 @@ interface Thresholds {
   // can see is not a single continuous path.
   // Out-and-back routes inherently overlap ~50%; we exempt them below.
   maxOverlapRatio: number;
-  // Hard cap on dead-end stubs (small jutting-out segments). >1 means
-  // OSRM is threading awkwardly through close waypoints.
+  // Hard cap on dead-end stubs (small jutting-out segments). User-facing
+  // requirement: ZERO stubs. Production code calls trimStubs() on every
+  // route to enforce this; the harness threshold of 0 catches any case
+  // where trimStubs misses a pattern.
   maxStubs: number;
 }
 
@@ -106,7 +108,7 @@ const DEFAULT_THRESHOLDS: Thresholds = {
   maxDistanceErrorPct: 0.20,
   maxRetraceRatio: 0.08,
   maxOverlapRatio: 0.10,
-  maxStubs: 1,
+  maxStubs: 0,
 };
 
 interface RouteMetrics {

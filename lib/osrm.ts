@@ -16,7 +16,7 @@ export function setOSRMBase(url: string | null): void {
 // User-facing route count cap. The internal candidate pool is larger so
 // quality rejection has alternatives — see SAFETY_EXTRAS below.
 const MAX_CANDIDATE_COUNT = 3;
-const MAX_INTERNAL_CANDIDATES = 6;
+const MAX_INTERNAL_CANDIDATES = 9;
 
 /**
  * Road routing overhead factor.
@@ -126,6 +126,88 @@ export function retraceRatio(points: RoutePoint[]): number {
   }
 
   return totalLen > 0 ? retracedLen / totalLen : 0;
+}
+
+/**
+ * Trim dead-end stubs out of a route. A stub is a "go out 50-150m, U-turn,
+ * come back" pattern that visibly juts off the main path. Trimming replaces
+ * the [out-leg, U-turn, back-leg] sequence with a direct connection — the
+ * runner just doesn't take the detour. The trimmed polyline is shorter and
+ * cleaner; the runner skips visiting the stub tip but the rest of the route
+ * is identical.
+ *
+ * Iterates until no more stubs are found (some routes have multiple).
+ */
+export function trimStubs(points: RoutePoint[], maxStubLenKm: number = 0.15): RoutePoint[] {
+  if (points.length < 4) return points;
+
+  const MAX_PASSES = 6;
+  let current = points;
+  for (let pass = 0; pass < MAX_PASSES; pass++) {
+    const next = trimOneStub(current, maxStubLenKm);
+    if (next === current) return current;
+    current = next;
+  }
+  return current;
+}
+
+/** Walk backwards from index i through segments aligned with bearing b1,
+ *  returning the index where the out-leg starts. */
+function findStubOutStart(points: RoutePoint[], i: number, b1: number, maxLenKm: number): { start: number; len: number } {
+  let outLen = haversineDistance(points[i - 1], points[i]);
+  let k = i - 1;
+  while (k > 0 && outLen <= maxLenKm) {
+    const prevBearing = bearingFrom(points[k - 1], points[k]);
+    if (angleDiff(prevBearing, b1) > 30) break;
+    outLen += haversineDistance(points[k - 1], points[k]);
+    k--;
+  }
+  return { start: k, len: outLen };
+}
+
+/** Walk forward from index i+1 through the back-leg, returning the index
+ *  of the LAST point of the back-leg before the route resumes its original
+ *  forward direction (or runs longer than the allowed back-leg length). */
+function findStubBackEnd(points: RoutePoint[], i: number, b1: number, maxLenKm: number): { end: number; len: number; resumed: boolean } {
+  let backLen = 0;
+  let j = i + 1;
+  let resumed = false;
+  while (j < points.length - 1 && backLen <= maxLenKm) {
+    const segLen = haversineDistance(points[j], points[j + 1]);
+    backLen += segLen;
+    const nextBearing = bearingFrom(points[j], points[j + 1]);
+    // Back-leg ends when the route turns back to the forward direction
+    // (within 60° of original bearing b1).
+    if (j > i + 1 && angleDiff(nextBearing, b1) < 60) {
+      resumed = true;
+      break;
+    }
+    j++;
+  }
+  return { end: j, len: backLen, resumed };
+}
+
+/** Find one stub pattern (out-leg, U-turn, back-leg) and return points
+ *  with that section removed. Returns input unchanged if no stub found.
+ *  Uses the same criteria as countStubs so the two functions agree. */
+function trimOneStub(points: RoutePoint[], maxStubLenKm: number): RoutePoint[] {
+  for (let i = 1; i < points.length - 1; i++) {
+    const b1 = bearingFrom(points[i - 1], points[i]);
+    const b2 = bearingFrom(points[i], points[i + 1]);
+    if (angleDiff(b1, b2) < 150) continue;
+
+    const out = findStubOutStart(points, i, b1, maxStubLenKm);
+    if (out.len > maxStubLenKm) continue; // not a stub: too long
+
+    const back = findStubBackEnd(points, i, b1, maxStubLenKm * 1.5);
+
+    // Trim: skip from out.start to back.end. The polyline jumps directly
+    // across, removing the visible stub jut.
+    const resumeIdx = back.resumed ? back.end + 1 : back.end;
+    if (resumeIdx >= points.length) continue;
+    return [...points.slice(0, out.start + 1), ...points.slice(resumeIdx)];
+  }
+  return points;
 }
 
 /**
@@ -876,7 +958,13 @@ export function estimateCircuitDistance(waypoints: RoutePoint[]): number {
 export function expandParkWaypoints(
   waypoints: RoutePoint[],
   anchors: GreenSpace[],
-  minAreaForExpansion: number = 0.1
+  // Only expand parks ≥ 0.5 km² (Central Park, Prospect Park, Grant Park,
+  // Forest Park). Smaller parks have entry/exit pairs that OSRM threads
+  // through tiny access streets, creating dead-end stubs in the route.
+  // Was 0.1 km² which caught medium parks like East River Park (0.32) and
+  // Boston Common (0.20) — those got stubby routes; better to just route
+  // to the park center and let OSRM pick the natural approach.
+  minAreaForExpansion: number = 0.5
 ): RoutePoint[] {
   if (waypoints.length < 3 || anchors.length === 0) return waypoints;
 
@@ -1219,8 +1307,8 @@ async function fetchOSRMRouteAdjusted(
       best = { route, waypoints: currentWaypoints, ratio };
     }
 
-    // Tightened accept window (was ±30%): with more retries available we
-    // can afford to keep correcting borderline cases.
+    // Accept window ±15%. Tighter (±7%) caused over-iteration and
+    // overshoot — routes ended up FARTHER from target after extra scaling.
     if (ratio >= 0.85 && ratio <= 1.15) {
       return { route, waypoints: currentWaypoints };
     }
@@ -1606,7 +1694,13 @@ export async function generateOSRMRoutes(
   // retrace) has alternatives to fall back to without dropping all the way
   // to the geometric step-3.5 emergency fallback (which produces no-anchor
   // routes the user doesn't want).
-  const SAFETY_EXTRAS = 3;
+  // Generate more candidates than the user asked for — quality rejection
+  // can leave us with too few survivors otherwise. In dense urban grids
+  // (NYC LES, East Village) every candidate may have 20%+ retrace; with a
+  // bigger pool we have a better chance of finding one with cleaner OSRM
+  // geometry. SAFETY_EXTRAS = 6 makes the cost ~6 OSRM calls vs ~3 — still
+  // well under any rate limit.
+  const SAFETY_EXTRAS = 6;
   const candidateCount = Math.min(MAX_INTERNAL_CANDIDATES, count + SAFETY_EXTRAS);
   const timeSeed = getSeed() % 100000;
   const candidates: { variant: number; waypoints: RoutePoint[]; anchors: GreenSpace[] }[] = [];
@@ -1722,9 +1816,19 @@ export async function generateOSRMRoutes(
     if (osrmRoute) {
       const rawPoints = osrmRoute.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }));
       const skipLollipopRemoval = routeType === 'out-and-back' || osrmMockEnabled;
-      const points = skipLollipopRemoval
+      const afterLollipop = skipLollipopRemoval
         ? rawPoints
         : removeSelfintersections(rawPoints);
+      // Always trim dead-end stubs. The user explicitly does not want any
+      // visible stubs — even one ruins the "can the runner follow this as
+      // a single path?" property. Out-and-back routes are exempt because
+      // their U-turn at the far end is the intended pattern, not a stub.
+      const points = routeType === 'out-and-back'
+        ? afterLollipop
+        : trimStubs(afterLollipop);
+      // Recompute distance from the FINAL points (after both lollipop
+      // removal and stub trimming) so the displayed mileage matches the
+      // polyline drawn on the map.
       let distKm: number;
       if (points === rawPoints) {
         distKm = osrmRoute.distance / 1000;
@@ -1777,7 +1881,7 @@ export async function generateOSRMRoutes(
       const qualityPenalty = Math.max(0,
         (isOutAndBack ? 0 : retraced) +
         (isOutAndBack ? 0 : overlap) +
-        stubs * 0.10 +
+        stubs * 0.20 +  // Was 0.10; bumped because dead-end stubs are highly visible UX failures
         Math.abs(1 - distRatio) * 1.0 -
         anchorBonus
       );
