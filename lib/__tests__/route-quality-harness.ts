@@ -178,7 +178,10 @@ function applyThresholds(f: Fixture, m: RouteMetrics): string[] {
       `overlap ${(m.overlapRatio * 100).toFixed(0)}% > ${(t.maxOverlapRatio * 100).toFixed(0)}%`
     );
   }
-  if (m.stubs > t.maxStubs) {
+  // Out-and-back routes have an intentional U-turn at the far end which
+  // countStubs detects — that's expected, not a UX failure. Loops should
+  // have zero stubs.
+  if (f.routeType !== 'out-and-back' && m.stubs > t.maxStubs) {
     failures.push(
       `${m.stubs} dead-end stubs (max ${t.maxStubs}) — runner can't follow as one path`
     );

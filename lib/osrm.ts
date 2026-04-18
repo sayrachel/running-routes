@@ -750,7 +750,10 @@ export function selectGreenSpaceWaypoints(
   // meant a sector could pick a too-close green space, then drop it later
   // and end up with too few picks. Filtering early lets the sectoring +
   // top-N backfill work on already-valid candidates.)
-  const minCenterDist = Math.max(0.3, targetDistanceKm * 0.08);
+  // Capped at 0.6km so very long routes (8+ mi) don't filter out their
+  // only nearby parks. trimStubs removes any visit-and-return artifact
+  // a too-close waypoint creates, so allowing them costs little.
+  const minCenterDist = Math.min(Math.max(0.3, targetDistanceKm * 0.08), 0.6);
   const annotated = greenSpaces
     .filter((gs) => waypointKinds.has(gs.kind) || (gs.kind === 'route' && gs.name))
     .map((gs) => {
@@ -856,8 +859,16 @@ export function selectGreenSpaceWaypoints(
   // forces them too close together and OSRM weaves through blocks producing
   // visible figure-8/rectangle patterns. 2 waypoints gives a cleaner triangle
   // loop that the runner can follow as one continuous path.
-  const isShortRoute = targetDistanceKm < 6.5;  // ~4mi
-  const maxGreenWaypoints = Math.min(picks.length, isShortRoute ? 2 : 3);
+  // Allow up to 3 waypoints for all routes. Previously capped to 2 for
+  // short routes on the theory that 3 close waypoints would force OSRM
+  // to weave between blocks. Real-OSRM testing in dense Manhattan grid
+  // showed the OPPOSITE: 3 waypoints spread at ~120° apart give OSRM
+  // three distinct corridors to use, reducing retrace vs. 2 waypoints
+  // where the wp2→center return leg often shares streets with the
+  // center→wp1 outbound leg. Quality scoring picks the best regardless
+  // of waypoint count, so generating 3-waypoint candidates alongside
+  // 2-waypoint ones gives the algorithm more options.
+  const maxGreenWaypoints = Math.min(picks.length, 3);
   const selectedPicks = picks
     .sort((a, b) => b.dist - a.dist) // drop farthest first if over cap
     .slice(picks.length - maxGreenWaypoints);
@@ -1881,7 +1892,9 @@ export async function generateOSRMRoutes(
       const qualityPenalty = Math.max(0,
         (isOutAndBack ? 0 : retraced) +
         (isOutAndBack ? 0 : overlap) +
-        stubs * 0.20 +  // Was 0.10; bumped because dead-end stubs are highly visible UX failures
+        // Out-and-back routes have an intentional U-turn at the far end
+        // which countStubs flags; don't penalize it.
+        (isOutAndBack ? 0 : stubs * 0.20) +
         Math.abs(1 - distRatio) * 1.0 -
         anchorBonus
       );
