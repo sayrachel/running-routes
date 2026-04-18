@@ -13,6 +13,20 @@
 import type { GreenSpace } from '../../overpass';
 
 export const SYNTHETIC_GREEN_SPACES: Record<string, GreenSpace[]> = {
+  // NYC East Village / NoHo — matches the user's screenshot location, the
+  // dense Manhattan grid where block-weaving routes shipped before. Lots
+  // of small parks plus distant waterfront on both sides.
+  '40.728,-73.992': [
+    { point: { lat: 40.7308, lng: -73.9973 }, tier: 1, kind: 'park',       name: 'Washington Square Park',    areaSize: 0.04  },
+    { point: { lat: 40.7268, lng: -73.9817 }, tier: 1, kind: 'park',       name: 'Tompkins Square Park',      areaSize: 0.04  },
+    { point: { lat: 40.7194, lng: -73.9919 }, tier: 1, kind: 'park',       name: 'Sara D. Roosevelt Park',    areaSize: 0.03  },
+    { point: { lat: 40.7186, lng: -73.9778 }, tier: 1, kind: 'park',       name: 'East River Park',           areaSize: 0.32  },
+    { point: { lat: 40.7330, lng: -73.9846 }, tier: 1, kind: 'park',       name: 'Stuyvesant Square',         areaSize: 0.018 },
+    { point: { lat: 40.7160, lng: -73.9750 }, tier: 1, kind: 'waterfront', name: 'East River Greenway',       areaSize: 0     },
+    { point: { lat: 40.7300, lng: -74.0100 }, tier: 1, kind: 'waterfront', name: 'Hudson River Greenway',     areaSize: 0     },
+    { point: { lat: 40.7290, lng: -73.9911 }, tier: 2, kind: 'park',       name: 'Cooper Triangle',           areaSize: 0.002 },
+  ],
+
   // NYC Lower East Side — dense Manhattan grid with East River edge.
   '40.715,-73.985': [
     { point: { lat: 40.7186, lng: -73.9778 }, tier: 1, kind: 'park',       name: 'East River Park',           areaSize: 0.32  },

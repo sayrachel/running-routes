@@ -5,7 +5,14 @@ import { scoreRoute, computeGreenSpaceProximity, computeRunPathProximity, comput
 import { emit as traceEmit } from './debug-trace';
 import { isPopularRunningPark } from './popular-running-parks';
 
-const OSRM_BASE = 'https://router.project-osrm.org/route/v1/foot';
+const OSRM_BASE_DEFAULT = 'https://router.project-osrm.org/route/v1/foot';
+let osrmBase = OSRM_BASE_DEFAULT;
+/** Override the OSRM endpoint. The harness uses this to point at a local
+ *  self-hosted OSRM (real Manhattan-grid geometry, no public-endpoint rate
+ *  limits). Production leaves it null and uses the public router. */
+export function setOSRMBase(url: string | null): void {
+  osrmBase = url ?? OSRM_BASE_DEFAULT;
+}
 // User-facing route count cap. The internal candidate pool is larger so
 // quality rejection has alternatives — see SAFETY_EXTRAS below.
 const MAX_CANDIDATE_COUNT = 3;
@@ -457,7 +464,12 @@ export function hasRoutedBarrierCrossing(
   // AND low bearing variance (tunnels/bridges maintain constant direction,
   // while smooth curves have steadily changing bearings).
   const sampleInterval = Math.max(1, Math.floor(routePoints.length / 60));
-  const minStraightKm = 0.4; // 400m minimum to flag
+  // Only flag VERY long straight segments (>1.2km) as likely tunnels/bridges.
+  // Was 400m, which produced false positives on Manhattan avenues — going
+  // 6 blocks straight east on a normal street is ~1.5km of "straight line"
+  // and was being rejected as a barrier crossing. Real tunnels/bridges are
+  // typically longer than 1km of fully-straight constant-bearing geometry.
+  const minStraightKm = 1.2;
 
   for (let i = 0; i < routePoints.length - sampleInterval * 3; i += sampleInterval) {
     // Look ahead by multiple sample intervals to catch longer straight segments
@@ -1149,6 +1161,11 @@ interface ResolvedCandidate {
   estimatedTime: number;
   fromOSRM: boolean;
   anchors: GreenSpace[];
+  /** Lower = better. Sums retrace + overlap + 0.1·stubs + 0.3·|1−distRatio|.
+   *  Used to pick the best of several candidates that all passed hard
+   *  rejection. Geometric step-3.5 fallback assigns a high penalty so it
+   *  loses to any real candidate. */
+  qualityPenalty: number;
 }
 
 /**
@@ -1372,7 +1389,7 @@ async function fetchOSRMRoute(waypoints: RoutePoint[]): Promise<OSRMRoute | null
   }
 
   const coords = coordsString(waypoints);
-  const url = `${OSRM_BASE}/${coords}?overview=full&geometries=geojson&steps=false`;
+  const url = `${osrmBase}/${coords}?overview=full&geometries=geojson&steps=false`;
 
   const cached = osrmRouteCache.get(url);
   if (cached !== undefined) {
@@ -1688,29 +1705,26 @@ export async function generateOSRMRoutes(
     )
   );
 
-  // Build resolved candidates
+  // Build resolved candidates. NEW BEHAVIOR: don't hard-reject candidates
+  // that fail strict thresholds — KEEP them with a quality score so we can
+  // pick the least-bad survivor instead of falling through to the geometric
+  // step-3.5 fallback (which often produces *worse* routes than the
+  // candidates we'd otherwise discard). Step-3.5 only fires now when the
+  // OSRM call itself returned nothing.
   const resolved: ResolvedCandidate[] = [];
+  // Hard rejection only for "completely unusable" cases: distance way off,
+  // crosses a clear barrier, or routes along highways. Soft thresholds on
+  // retrace/overlap/stubs feed into a quality score; the worst-quality
+  // candidates lose to better ones but still beat the geometric fallback.
   for (let i = 0; i < candidates.length; i++) {
     const osrmResult = osrmResults[i];
     const osrmRoute = osrmResult.route;
     if (osrmRoute) {
       const rawPoints = osrmRoute.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }));
-      // Two cases skip lollipop removal:
-      // 1. Out-and-back: SUPPOSED to retrace, would lose ~75% of route to
-      //    phantom-loop snips.
-      // 2. Mock OSRM: smooth wobble between waypoints can cause adjacent
-      //    triangle legs to cross at junctions — real OSRM geometry follows
-      //    actual streets (right angles, no continuous wobble) and doesn't
-      //    produce these false positives, so the cleanup is correct in
-      //    production but over-cuts the synthetic mock geometry.
       const skipLollipopRemoval = routeType === 'out-and-back' || osrmMockEnabled;
       const points = skipLollipopRemoval
         ? rawPoints
         : removeSelfintersections(rawPoints);
-      // Recompute distance from the actual emitted points so the displayed
-      // mileage matches the polyline drawn on the map. Using the pre-cut
-      // OSRM distance after a lollipop snip would over-state the route by
-      // whatever the cut removed.
       let distKm: number;
       if (points === rawPoints) {
         distKm = osrmRoute.distance / 1000;
@@ -1722,67 +1736,53 @@ export async function generateOSRMRoutes(
       }
       const estimatedTime = Math.round(osrmRoute.duration / 60);
       const distRatio = distanceKm > 0 ? distKm / distanceKm : 1;
-      // Point-to-point routes go to a user-chosen destination, so be very
-      // lenient on distance — the route must exist even if roads are indirect.
+      // HARD REJECT: distance catastrophically wrong (catches OSRM degenerate cases)
       const maxRatio = routeType === 'point-to-point' ? 3.0 : 1.3;
       const minRatio = routeType === 'point-to-point' ? 0.2 : 0.5;
       if (distRatio > maxRatio || distRatio < minRatio) {
-        console.log(`[RouteScoring] Rejecting candidate ${i}: dist=${distKm.toFixed(2)}km (ratio=${distRatio.toFixed(2)}, target=${distanceKm.toFixed(2)}km)`);
         traceEmit('candidate-rejected', { i, reason: 'distance', distKm, distRatio, target: distanceKm });
         continue;
       }
-      // Check the routed path for tunnels/bridges (straight-line segments)
-      // and geographic drift (route leaving the starting area)
+      // HARD REJECT: route crosses a clear barrier (tunnel, bridge, water)
       if (routeType !== 'point-to-point' && hasRoutedBarrierCrossing(points, greenSpaces, center, distanceKm)) {
-        console.log(`[RouteScoring] Rejecting candidate ${i}: route crosses a likely barrier (tunnel/bridge)`);
         traceEmit('candidate-rejected', { i, reason: 'barrier', distKm });
         continue;
       }
-      // Check for highway proximity — reject routes where >15% of points
-      // are near major roads (motorways, trunk, primary). Runners should
-      // never be routed along highways.
       const hwProximity = computeHighwayProximity(points, highwayPoints);
+      // HARD REJECT: route runs alongside major highways
       if (hwProximity > 0.15) {
-        console.log(`[RouteScoring] Rejecting candidate ${i}: ${(hwProximity * 100).toFixed(0)}% of route is near highways`);
         traceEmit('candidate-rejected', { i, reason: 'highway', hwProximity });
         continue;
       }
-      // Reject routes where >8% of distance is on retraced edges — the line
-      // looks connected on the map but the runner can't follow it as a single
-      // pass without doubling back over the same blocks. Was 15%, lowered
-      // because user-visible block-weaving in the dense Manhattan grid
-      // shipped at 8-14% retrace and looked terrible. Out-and-back is
-      // exempt — its retrace IS the route.
+      // SOFT METRICS: feed into a quality score. Lower retrace/overlap/stubs
+      // = higher quality. We KEEP all candidates that pass hard rejection
+      // and pick the best by quality at the end. This avoids the past bug
+      // where a 28%-retrace candidate was thrown out and replaced by a
+      // 50%-retrace step-3.5 fallback.
       const retraced = retraceRatio(points);
-      if (routeType !== 'out-and-back' && retraced > 0.08) {
-        console.log(`[RouteScoring] Rejecting candidate ${i}: ${(retraced * 100).toFixed(0)}% of distance is retraced`);
-        traceEmit('candidate-rejected', { i, reason: 'retrace', retraced });
-        continue;
-      }
-      // Reject routes with too much parallel-street overlap. retraceRatio
-      // catches exact-coordinate retraces, but OSRM often samples the same
-      // street at slightly different vertex positions on out vs. back; that
-      // leaves the polyline visibly doubled but invisible to retraceRatio.
-      // overlapSegmentRatio catches it.
       const overlap = overlapSegmentRatio(points);
-      if (routeType !== 'out-and-back' && overlap > 0.10) {
-        console.log(`[RouteScoring] Rejecting candidate ${i}: ${(overlap * 100).toFixed(0)}% of distance overlaps a parallel segment`);
-        traceEmit('candidate-rejected', { i, reason: 'overlap', overlap });
-        continue;
-      }
-      // Reject routes with dead-end stubs — small jutting-out segments where
-      // the runner enters a non-thoroughfare and exits the same way. Visible
-      // on the map as a small line off the main route. More than 1 stub means
-      // OSRM is threading awkwardly between waypoints and the runner can't
-      // follow as a single continuous path.
       const stubs = countStubs(points);
-      if (stubs > 1) {
-        console.log(`[RouteScoring] Rejecting candidate ${i}: ${stubs} dead-end stubs detected`);
-        traceEmit('candidate-rejected', { i, reason: 'stubs', stubs });
-        continue;
-      }
-      traceEmit('candidate-accepted', { i, distKm, distRatio, hwProximity, retraced, overlap, stubs });
-      resolved.push({ index: i, variant: candidates[i].variant, points, distKm, estimatedTime, fromOSRM: true, anchors: candidates[i].anchors });
+      // Quality score: 0 = perfect, higher = worse. Out-and-back is exempt
+      // from retrace/overlap. Components:
+      //   retrace + overlap: visible polyline ugliness
+      //   stubs * 0.10: each dead-end is a UX hit but not catastrophic
+      //   |1 - distRatio| * 1.0: hitting target distance is critical — if
+      //     a "4 mi route" returns 3 mi the user feels misled
+      //   - anchorBonus: small thumb on the scale toward named green
+      //     spaces, but small enough that distance / cleanliness still wins
+      const isOutAndBack = routeType === 'out-and-back';
+      const anchorBonus = candidates[i].anchors.length >= 2 ? 0.10
+        : candidates[i].anchors.length === 1 ? 0.05
+        : 0;
+      const qualityPenalty = Math.max(0,
+        (isOutAndBack ? 0 : retraced) +
+        (isOutAndBack ? 0 : overlap) +
+        stubs * 0.10 +
+        Math.abs(1 - distRatio) * 1.0 -
+        anchorBonus
+      );
+      traceEmit('candidate-evaluated', { i, distKm, distRatio, hwProximity, retraced, overlap, stubs, qualityPenalty });
+      resolved.push({ index: i, variant: candidates[i].variant, points, distKm, estimatedTime, fromOSRM: true, anchors: candidates[i].anchors, qualityPenalty });
     } else {
       const wp = osrmResult.waypoints;
       const totalDist = wp.reduce((sum, p, j) => {
@@ -1796,6 +1796,8 @@ export async function generateOSRMRoutes(
         console.log(`[RouteScoring] Rejecting fallback ${i}: dist=${totalDist.toFixed(2)}km (ratio=${fallbackRatio.toFixed(2)})`);
         continue;
       }
+      // Non-OSRM fallback gets a high quality penalty so any real OSRM
+      // candidate beats it.
       resolved.push({
         index: i,
         variant: candidates[i].variant,
@@ -1804,6 +1806,7 @@ export async function generateOSRMRoutes(
         estimatedTime: Math.round(totalDist * 6),
         fromOSRM: false,
         anchors: candidates[i].anchors,
+        qualityPenalty: 1.0,
       });
     }
   }
@@ -1891,6 +1894,7 @@ export async function generateOSRMRoutes(
         estimatedTime: Math.round(chosen.route.duration / 60),
         fromOSRM: true,
         anchors: [],
+        qualityPenalty: 0.5, // step-3.5 emergency fallback — no anchors, but real OSRM geometry
       });
     } else {
       // Use raw waypoints as last resort
@@ -1905,6 +1909,7 @@ export async function generateOSRMRoutes(
         distKm: totalDist,
         estimatedTime: Math.round(totalDist * 6),
         fromOSRM: false,
+        qualityPenalty: 2.0, // raw waypoints, no real routing — last resort
         anchors: [],
       });
     }
@@ -1945,11 +1950,16 @@ export async function generateOSRMRoutes(
     return { candidate, score, quietScore };
   });
 
-  // Step 6: Return candidates in generation order (not sorted by score).
-  // Candidate 0 uses the best parks, candidate 1 excludes those parks
-  // and finds alternatives, candidate 2 excludes both. This gives the user
-  // genuinely different route options rather than minor variations.
-  const topCandidates = scored.slice(0, count);
+  // Step 6: Sort by quality (lower penalty = better) and return top `count`.
+  // Was previously generation-order, which assumed candidate 0 = best parks
+  // = best route. That assumption broke in dense grids where candidate 0's
+  // OSRM output had high retrace despite using "best" parks. Sorting by
+  // quality means a candidate-2 with 5% retrace beats candidate-0 with 30%
+  // retrace, regardless of which parks each used.
+  const sortedByQuality = [...scored].sort(
+    (a, b) => a.candidate.qualityPenalty - b.candidate.qualityPenalty
+  );
+  const topCandidates = sortedByQuality.slice(0, count);
 
   // Build final GeneratedRoute objects
   const terrain = routeType === 'point-to-point' ? 'Point to Point'

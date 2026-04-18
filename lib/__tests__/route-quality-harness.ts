@@ -13,7 +13,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { generateOSRMRoutes, retraceRatio, overlapSegmentRatio, haversineDistance, calculateSearchRadius, dumpOSRMCache, loadOSRMCache, setOSRMCacheMax, setOSRMMock, setDeterministicSeed, countStubs } from '../osrm';
+import { generateOSRMRoutes, retraceRatio, overlapSegmentRatio, haversineDistance, calculateSearchRadius, dumpOSRMCache, loadOSRMCache, setOSRMCacheMax, setOSRMMock, setDeterministicSeed, countStubs, setOSRMBase } from '../osrm';
 import { fetchGreenSpacesAndHighways, dumpOverpassCaches, loadOverpassCaches, prefillOverpassCaches } from '../overpass';
 import { computeGreenSpaceProximity } from '../route-scoring';
 import type { RoutePoint, RoutePreferences } from '../route-generator';
@@ -74,6 +74,15 @@ const FIXTURES: Fixture[] = [
   { name: 'nyc-les-2mi-loop-quiet',     center: { lat: 40.715, lng: -73.985 }, distanceMi: 2, routeType: 'loop',         prefs: { lowTraffic: true } },
   { name: 'nyc-columbus-8mi-loop',      center: { lat: 40.768, lng: -73.982 }, distanceMi: 8, routeType: 'loop',         prefs: { lowTraffic: false } },
   { name: 'nyc-columbus-10mi-loop',     center: { lat: 40.768, lng: -73.982 }, distanceMi: 10, routeType: 'loop',        prefs: { lowTraffic: true } },
+
+  // East Village / NoHo — matches the user's screenshots showing block-
+  // weaving, dead-end stubs, and figure-8 patterns. The dense Manhattan
+  // grid is where mock geometry diverges most from real OSRM behavior, so
+  // these only meaningfully run with --osrm-base pointing at local OSRM.
+  { name: 'nyc-east-village-2mi-loop',  center: { lat: 40.7280, lng: -73.9920 }, distanceMi: 2, routeType: 'loop',       prefs: { lowTraffic: true } },
+  { name: 'nyc-east-village-3mi-loop',  center: { lat: 40.7280, lng: -73.9920 }, distanceMi: 3, routeType: 'loop',       prefs: { lowTraffic: true } },
+  { name: 'nyc-east-village-4mi-loop',  center: { lat: 40.7280, lng: -73.9920 }, distanceMi: 4, routeType: 'loop',       prefs: { lowTraffic: false } },
+  { name: 'nyc-east-village-6mi-loop',  center: { lat: 40.7280, lng: -73.9920 }, distanceMi: 6, routeType: 'loop',       prefs: { lowTraffic: false } },
 ];
 
 interface Thresholds {
@@ -354,7 +363,20 @@ async function main() {
   // moment synthetic green spaces pick different waypoints than what was
   // recorded, the cache misses and we fall through to the rate-limited
   // public endpoint, which is the whole problem we're trying to dodge.
-  const noMockOsrm = argv.includes('--no-mock-osrm');
+  // --osrm-base http://localhost:5000 points at a self-hosted OSRM (real
+  // road geometry, no public-endpoint rate limits). Implies --no-mock-osrm
+  // since we want the real backend, not the synthetic mock.
+  const osrmBaseIdx = argv.indexOf('--osrm-base');
+  let osrmBase: string | null = null;
+  if (osrmBaseIdx >= 0) {
+    const next = argv[osrmBaseIdx + 1];
+    if (!next || next.startsWith('--')) {
+      console.error(`--osrm-base requires a URL (e.g. http://localhost:5000/route/v1/foot)`);
+      process.exit(2);
+    }
+    osrmBase = next;
+  }
+  const noMockOsrm = argv.includes('--no-mock-osrm') || osrmBase !== null;
   const mockOsrm = !noMockOsrm && (argv.includes('--mock-osrm') || useSynthetic);
   // Deterministic seeding: when mocking OSRM, default-on so results are
   // byte-identical across runs and you can tell whether an algorithm change
@@ -385,6 +407,7 @@ async function main() {
   setOSRMCacheMax(5000);
 
   if (mockOsrm) setOSRMMock(true);
+  if (osrmBase) setOSRMBase(osrmBase);
 
   // Skip OSRM cache when mocking — the recorded URLs are stale (they
   // correspond to a different algorithm version's waypoints) and loading
@@ -406,7 +429,7 @@ async function main() {
   }
   const mode = record ? 'RECORD (will hit live network for any cache misses)' : 'REPLAY (cache hits skip the network)';
   const synth = useSynthetic ? ' + SYNTHETIC green spaces' : '';
-  const osrmTag = mockOsrm ? ' + MOCK OSRM' : '';
+  const osrmTag = mockOsrm ? ' + MOCK OSRM' : (osrmBase ? ` + LOCAL OSRM (${osrmBase})` : '');
   const detTag = deterministic ? ' + DETERMINISTIC' : '';
   console.log(`Running ${fixtures.length} fixture(s) — mode: ${mode}${synth}${osrmTag}${detTag}`);
   console.log(`Snapshot: ${loaded.enriched} green / ${loaded.highway} highway / ${loaded.osrm} OSRM entries loaded from ${SNAPSHOT_PATH}\n`);
