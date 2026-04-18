@@ -9,6 +9,7 @@ import {
   pickRouteName,
   scoreGreenSpace,
   estimateCircuitDistance,
+  countStubs,
 } from '../osrm';
 import type { CandidateStrategy } from '../osrm';
 import type { RoutePoint } from '../route-generator';
@@ -286,5 +287,48 @@ describe('estimateCircuitDistance', () => {
 
   it('returns 0 for single point', () => {
     expect(estimateCircuitDistance([{ lat: 0, lng: 0 }])).toBe(0);
+  });
+});
+
+
+describe('countStubs', () => {
+  // Build a route that goes east 200m, U-turns, comes back 100m, then continues
+  // east 500m. Should detect 1 stub (the U-turn back).
+  function makeStubbyRoute(): RoutePoint[] {
+    const start = { lat: 40.7, lng: -74.0 };
+    const points: RoutePoint[] = [start];
+    // East 100m in 4 small segments — a true dead-end stub is short
+    for (let i = 1; i <= 4; i++) {
+      points.push(destinationPoint(start, 90, 0.025 * i));
+    }
+    const stubTip = points[points.length - 1];
+    // U-turn — 100m west, returning to start
+    for (let i = 1; i <= 4; i++) {
+      points.push(destinationPoint(stubTip, 270, 0.025 * i));
+    }
+    const stubBack = points[points.length - 1];
+    // Continue south 500m in 20 segments (genuine forward progress, not a stub)
+    for (let i = 1; i <= 20; i++) {
+      points.push(destinationPoint(stubBack, 180, 0.025 * i));
+    }
+    return points;
+  }
+
+  it('returns 0 for a clean route with no U-turns', () => {
+    // Smooth circle — should never have U-turns
+    const center = { lat: 40.7, lng: -74.0 };
+    const points: RoutePoint[] = [];
+    for (let i = 0; i < 50; i++) {
+      points.push(destinationPoint(center, (i / 50) * 360, 0.5));
+    }
+    expect(countStubs(points)).toBe(0);
+  });
+
+  it('detects a single dead-end stub', () => {
+    expect(countStubs(makeStubbyRoute())).toBe(1);
+  });
+
+  it('returns 0 for routes shorter than 4 points', () => {
+    expect(countStubs([{ lat: 0, lng: 0 }, { lat: 0.1, lng: 0 }, { lat: 0.2, lng: 0 }])).toBe(0);
   });
 });

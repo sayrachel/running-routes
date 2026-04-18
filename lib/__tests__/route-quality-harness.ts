@@ -13,7 +13,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { generateOSRMRoutes, retraceRatio, overlapSegmentRatio, haversineDistance, calculateSearchRadius, dumpOSRMCache, loadOSRMCache, setOSRMCacheMax, setOSRMMock, setDeterministicSeed } from '../osrm';
+import { generateOSRMRoutes, retraceRatio, overlapSegmentRatio, haversineDistance, calculateSearchRadius, dumpOSRMCache, loadOSRMCache, setOSRMCacheMax, setOSRMMock, setDeterministicSeed, countStubs } from '../osrm';
 import { fetchGreenSpacesAndHighways, dumpOverpassCaches, loadOverpassCaches, prefillOverpassCaches } from '../overpass';
 import { computeGreenSpaceProximity } from '../route-scoring';
 import type { RoutePoint, RoutePreferences } from '../route-generator';
@@ -80,17 +80,24 @@ interface Thresholds {
   // Distance must be within ±X of target. Wider for short routes since
   // a 0.5mi shortfall is much more glaring on a 3mi than a 6mi route.
   maxDistanceErrorPct: number;
-  // Hard cap on retraced distance (exact-coordinate match)
+  // Hard cap on retraced distance (exact-coordinate match). Tightened from
+  // 10% to 8% so harness rejects what users would visibly see as backtracking.
   maxRetraceRatio: number;
-  // Hard cap on overlapping/parallel segments (catches OSRM-wobble retraces)
+  // Hard cap on overlapping/parallel segments (catches OSRM-wobble retraces).
+  // Tightened from 20% to 10% — anything above this ships routes the user
+  // can see is not a single continuous path.
   // Out-and-back routes inherently overlap ~50%; we exempt them below.
   maxOverlapRatio: number;
+  // Hard cap on dead-end stubs (small jutting-out segments). >1 means
+  // OSRM is threading awkwardly through close waypoints.
+  maxStubs: number;
 }
 
 const DEFAULT_THRESHOLDS: Thresholds = {
   maxDistanceErrorPct: 0.20,
-  maxRetraceRatio: 0.10,
-  maxOverlapRatio: 0.20,
+  maxRetraceRatio: 0.08,
+  maxOverlapRatio: 0.10,
+  maxStubs: 1,
 };
 
 interface RouteMetrics {
@@ -109,6 +116,9 @@ interface RouteMetrics {
   /** Number of named green-space anchors used by the chosen route — 0 means
    *  the algorithm fell through to the geometric fallback (anchorless). */
   anchorCount: number;
+  /** Count of dead-end stubs (visible "small jutting line" pattern). >0 means
+   *  the route forces the runner into a dead-end and back. */
+  stubs: number;
 }
 
 interface FixtureResult {
@@ -157,7 +167,27 @@ function applyThresholds(f: Fixture, m: RouteMetrics): string[] {
       `overlap ${(m.overlapRatio * 100).toFixed(0)}% > ${(t.maxOverlapRatio * 100).toFixed(0)}%`
     );
   }
+  if (m.stubs > t.maxStubs) {
+    failures.push(
+      `${m.stubs} dead-end stubs (max ${t.maxStubs}) — runner can't follow as one path`
+    );
+  }
   return failures;
+}
+
+/** Build a geojson.io URL that renders the route polyline. Inline-encoded so
+ *  no upload is needed — paste into a browser to SEE the route geometry. */
+function geojsonIoUrl(points: RoutePoint[]): string {
+  const coords = points.map((p) => [p.lng, p.lat]);
+  const geojson = {
+    type: 'FeatureCollection',
+    features: [{
+      type: 'Feature',
+      properties: {},
+      geometry: { type: 'LineString', coordinates: coords },
+    }],
+  };
+  return `https://geojson.io/#data=data:application/json,${encodeURIComponent(JSON.stringify(geojson))}`;
 }
 
 /** Stable hash of a fixture name → integer seed. Two runs on the same fixture
@@ -221,6 +251,7 @@ async function runFixture(f: Fixture, captureTrace: boolean, useSynthetic: boole
       osrmMocked: mockOsrm,
       greenProximity: computeGreenSpaceProximity(points, op.greenSpaces),
       anchorCount,
+      stubs: countStubs(points),
     };
     const failures = applyThresholds(f, metrics);
     return {
@@ -253,6 +284,7 @@ function fmtRow(r: FixtureResult): string {
     `dist=${m.distanceMi.toFixed(2)}mi(${(m.distanceErrorPct * 100).toFixed(0)}%)  ` +
     `retr=${(m.retraceRatio * 100).toFixed(0)}%  ` +
     `over=${(m.overlapRatio * 100).toFixed(0)}%  ` +
+    `stubs=${m.stubs}  ` +
     `green=${(m.greenProximity * 100).toFixed(0)}%  ` +
     `anch=${m.anchorCount}  ` +
     `pts=${m.pointCount}`;
@@ -403,6 +435,13 @@ async function main() {
       pass: r.pass,
       failures: r.failures,
       metrics: r.metrics,
+      // Visualization URLs so I can SEE routes, not just measure them.
+      // Past harness iterations only reported numbers — block-weaving and
+      // dead-end stubs are invisible to numeric metrics. geojson.io renders
+      // the polyline directly.
+      visualizeUrl: r.routePoints && r.routePoints.length > 0
+        ? geojsonIoUrl(r.routePoints)
+        : null,
       trace: r.trace ?? [],
       routePoints: r.routePoints ?? [],
     }));

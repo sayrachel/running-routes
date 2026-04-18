@@ -6,7 +6,10 @@ import { emit as traceEmit } from './debug-trace';
 import { isPopularRunningPark } from './popular-running-parks';
 
 const OSRM_BASE = 'https://router.project-osrm.org/route/v1/foot';
+// User-facing route count cap. The internal candidate pool is larger so
+// quality rejection has alternatives — see SAFETY_EXTRAS below.
 const MAX_CANDIDATE_COUNT = 3;
+const MAX_INTERNAL_CANDIDATES = 6;
 
 /**
  * Road routing overhead factor.
@@ -116,6 +119,53 @@ export function retraceRatio(points: RoutePoint[]): number {
   }
 
   return totalLen > 0 ? retracedLen / totalLen : 0;
+}
+
+/**
+ * Count "dead-end stubs" — places where the route does an immediate U-turn,
+ * meaning the runner has to enter a non-thoroughfare street and exit the
+ * same way. Visible on the map as a small line jutting off the main route.
+ *
+ * Detection: a stub is a sequence of segments where consecutive bearings
+ * differ by ≥150° (near-180° reversal) over a short distance (<150m). A
+ * route with more than 2 such stubs is almost certainly an OSRM-routed
+ * disaster the runner can't follow as a single continuous path.
+ *
+ * Returns the count of stubs found.
+ */
+export function countStubs(points: RoutePoint[], maxStubLenKm: number = 0.15): number {
+  if (points.length < 4) return 0;
+
+  let stubCount = 0;
+  let i = 1;
+  while (i < points.length - 1) {
+    const b1 = bearingFrom(points[i - 1], points[i]);
+    const b2 = bearingFrom(points[i], points[i + 1]);
+    const reversal = angleDiff(b1, b2);
+
+    // U-turn: bearings differ by ≥150° (near-180°)
+    if (reversal >= 150) {
+      // Measure the "out" segment leading into the U-turn
+      let outLen = haversineDistance(points[i - 1], points[i]);
+      // Walk backwards to include any earlier segments going the same direction
+      let k = i - 2;
+      while (k >= 0 && angleDiff(bearingFrom(points[k], points[k + 1]), b1) < 30) {
+        outLen += haversineDistance(points[k], points[k + 1]);
+        k--;
+        if (outLen > maxStubLenKm) break;
+      }
+      // Only count as a stub if the "out" leg was short — a U-turn after
+      // 500m of travel is just the route changing direction, not a stub.
+      if (outLen <= maxStubLenKm) {
+        stubCount++;
+        // Skip past the return leg so we don't double-count the same stub
+        i += 2;
+        continue;
+      }
+    }
+    i++;
+  }
+  return stubCount;
 }
 
 /**
@@ -708,8 +758,12 @@ export function selectGreenSpaceWaypoints(
   // genuinely lacks 3 spread-out green spaces.
   if (picks.length < 2) return null;
 
-  // Cap at 3 waypoints max — more than 3 creates zigzag block-looping
-  const maxGreenWaypoints = Math.min(picks.length, 3);
+  // Cap waypoints. For short routes (<4mi) in dense urban grids, 3 waypoints
+  // forces them too close together and OSRM weaves through blocks producing
+  // visible figure-8/rectangle patterns. 2 waypoints gives a cleaner triangle
+  // loop that the runner can follow as one continuous path.
+  const isShortRoute = targetDistanceKm < 6.5;  // ~4mi
+  const maxGreenWaypoints = Math.min(picks.length, isShortRoute ? 2 : 3);
   const selectedPicks = picks
     .sort((a, b) => b.dist - a.dist) // drop farthest first if over cap
     .slice(picks.length - maxGreenWaypoints);
@@ -1528,13 +1582,15 @@ export async function generateOSRMRoutes(
     highwayPointCount: highwayPoints.length,
   });
 
-  // Step 2: Generate exactly `count` candidate waypoint sets with diversity.
-  // Each candidate excludes parks used by previous candidates so routes go
-  // through genuinely different areas. We don't speculate an extra "+1"
-  // candidate as insurance — Promise.all would wait for the slowest of N+1
-  // even though we only ever return N. The Step 3.5 fallback at the bottom
-  // handles the rare case where every candidate is rejected.
-  const candidateCount = Math.min(MAX_CANDIDATE_COUNT, count);
+  // Step 2: Generate count + safety-margin candidate waypoint sets with
+  // diversity. Each candidate excludes parks used by previous candidates so
+  // routes go through genuinely different areas. We deliberately generate
+  // more than `count` so the tightened quality rejection (overlap, stubs,
+  // retrace) has alternatives to fall back to without dropping all the way
+  // to the geometric step-3.5 emergency fallback (which produces no-anchor
+  // routes the user doesn't want).
+  const SAFETY_EXTRAS = 3;
+  const candidateCount = Math.min(MAX_INTERNAL_CANDIDATES, count + SAFETY_EXTRAS);
   const timeSeed = getSeed() % 100000;
   const candidates: { variant: number; waypoints: RoutePoint[]; anchors: GreenSpace[] }[] = [];
   const usedParkPoints: RoutePoint[] = []; // Parks already used by earlier candidates
@@ -1691,16 +1747,41 @@ export async function generateOSRMRoutes(
         traceEmit('candidate-rejected', { i, reason: 'highway', hwProximity });
         continue;
       }
-      // Reject routes where >15% of distance is on retraced edges — the line
+      // Reject routes where >8% of distance is on retraced edges — the line
       // looks connected on the map but the runner can't follow it as a single
-      // pass without doubling back over the same blocks.
+      // pass without doubling back over the same blocks. Was 15%, lowered
+      // because user-visible block-weaving in the dense Manhattan grid
+      // shipped at 8-14% retrace and looked terrible. Out-and-back is
+      // exempt — its retrace IS the route.
       const retraced = retraceRatio(points);
-      if (retraced > 0.15) {
+      if (routeType !== 'out-and-back' && retraced > 0.08) {
         console.log(`[RouteScoring] Rejecting candidate ${i}: ${(retraced * 100).toFixed(0)}% of distance is retraced`);
         traceEmit('candidate-rejected', { i, reason: 'retrace', retraced });
         continue;
       }
-      traceEmit('candidate-accepted', { i, distKm, distRatio, hwProximity, retraced });
+      // Reject routes with too much parallel-street overlap. retraceRatio
+      // catches exact-coordinate retraces, but OSRM often samples the same
+      // street at slightly different vertex positions on out vs. back; that
+      // leaves the polyline visibly doubled but invisible to retraceRatio.
+      // overlapSegmentRatio catches it.
+      const overlap = overlapSegmentRatio(points);
+      if (routeType !== 'out-and-back' && overlap > 0.10) {
+        console.log(`[RouteScoring] Rejecting candidate ${i}: ${(overlap * 100).toFixed(0)}% of distance overlaps a parallel segment`);
+        traceEmit('candidate-rejected', { i, reason: 'overlap', overlap });
+        continue;
+      }
+      // Reject routes with dead-end stubs — small jutting-out segments where
+      // the runner enters a non-thoroughfare and exits the same way. Visible
+      // on the map as a small line off the main route. More than 1 stub means
+      // OSRM is threading awkwardly between waypoints and the runner can't
+      // follow as a single continuous path.
+      const stubs = countStubs(points);
+      if (stubs > 1) {
+        console.log(`[RouteScoring] Rejecting candidate ${i}: ${stubs} dead-end stubs detected`);
+        traceEmit('candidate-rejected', { i, reason: 'stubs', stubs });
+        continue;
+      }
+      traceEmit('candidate-accepted', { i, distKm, distRatio, hwProximity, retraced, overlap, stubs });
       resolved.push({ index: i, variant: candidates[i].variant, points, distKm, estimatedTime, fromOSRM: true, anchors: candidates[i].anchors });
     } else {
       const wp = osrmResult.waypoints;
