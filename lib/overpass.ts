@@ -524,27 +524,41 @@ export async function fetchHighwaySegments(
 }
 
 /**
+ * Maximum search radius — `calculateSearchRadius` clamps to 10km, so all
+ * route requests at a given location can be served from a single Overpass
+ * fetch at this radius. Smaller-radius callers get the same data filtered
+ * in-memory.
+ */
+const MAX_OVERPASS_RADIUS_KM = 10;
+
+/**
  * Fetch enriched green spaces and major-highway centers in a single Overpass
  * round trip. The two queries hit the same bbox and return disjoint tag sets
  * (`leisure`/cycleway/etc. vs `highway=motorway|trunk|primary`), so they can
  * be unioned and split client-side. Halves the Overpass fan-out vs calling
  * fetchGreenSpacesEnriched + fetchHighwaySegments in parallel, and populates
  * both per-query caches so subsequent callers of either function get hits.
+ *
+ * Always queries at MAX_OVERPASS_RADIUS_KM and filters in-memory for the
+ * caller's smaller radius — the public Overpass endpoint is the dominant
+ * cold-start latency, so consolidating per-location requests behind a
+ * single max-radius cache lets a 4mi loop, 6mi loop, and 8mi loop from
+ * the same start share one network round trip.
  */
 export async function fetchGreenSpacesAndHighways(
   center: RoutePoint,
   radiusKm: number
 ): Promise<{ greenSpaces: GreenSpace[]; highwayPoints: RoutePoint[] }> {
-  const greenKey = locationKey('enriched', center, radiusKm);
-  const hwKey = locationKey('highway', center, radiusKm);
+  const greenKey = locationKey('enriched', center, MAX_OVERPASS_RADIUS_KM);
+  const hwKey = locationKey('highway', center, MAX_OVERPASS_RADIUS_KM);
 
   const cachedGreen = enrichedGreenSpaceCache.get(greenKey);
   const cachedHw = highwayCache.get(hwKey);
   if (cachedGreen !== undefined && cachedHw !== undefined) {
-    return { greenSpaces: cachedGreen, highwayPoints: cachedHw };
+    return filterByRadius(cachedGreen, cachedHw, center, radiusKm);
   }
 
-  const radiusMeters = Math.round(radiusKm * 1000);
+  const radiusMeters = Math.round(MAX_OVERPASS_RADIUS_KM * 1000);
   const a = `around:${radiusMeters},${center.lat},${center.lng}`;
   // Combined union — `out center bb tags;` works for both halves; highway
   // parsing only needs `center`, but the extra `bb tags` payload is small.
@@ -567,7 +581,7 @@ export async function fetchGreenSpacesAndHighways(
 
     enrichedGreenSpaceCache.set(greenKey, greenSpaces);
     highwayCache.set(hwKey, highwayPoints);
-    return { greenSpaces, highwayPoints };
+    return filterByRadius(greenSpaces, highwayPoints, center, radiusKm);
   } catch (err: any) {
     // Keep the message short — full AggregateError stacks flood test output.
     const msg = err?.message ?? String(err);
@@ -576,4 +590,30 @@ export async function fetchGreenSpacesAndHighways(
     highwayCache.set(hwKey, []);
     return { greenSpaces: [], highwayPoints: [] };
   }
+}
+
+function filterByRadius(
+  green: GreenSpace[],
+  highway: RoutePoint[],
+  center: RoutePoint,
+  radiusKm: number,
+): { greenSpaces: GreenSpace[]; highwayPoints: RoutePoint[] } {
+  if (radiusKm >= MAX_OVERPASS_RADIUS_KM) {
+    return { greenSpaces: green, highwayPoints: highway };
+  }
+  const greenSpaces = green.filter((g) => haversineDistance(center, g.point) <= radiusKm);
+  const highwayPoints = highway.filter((p) => haversineDistance(center, p) <= radiusKm);
+  return { greenSpaces, highwayPoints };
+}
+
+/**
+ * Kick off a max-radius Overpass fetch in the background and discard the
+ * result — the cache write is the side effect we care about. Use from the
+ * UI as soon as the user's location is known so by the time they tap
+ * "generate" the Overpass round trip is already complete.
+ */
+export function prefetchGreenSpacesAndHighways(center: RoutePoint): void {
+  fetchGreenSpacesAndHighways(center, MAX_OVERPASS_RADIUS_KM).catch(() => {
+    // Swallow — the real call will report any failure to the user.
+  });
 }

@@ -26,6 +26,7 @@ import { ProfileDrawer } from '@/components/ProfileDrawer';
 import { useAppContext, type RouteStyle, type RunPreferences } from '@/lib/AppContext';
 import { distanceUnit } from '@/lib/units';
 import { generateOSRMRoutes } from '@/lib/osrm';
+import { prefetchGreenSpacesAndHighways } from '@/lib/overpass';
 import { accuracyToStrength } from '@/lib/useLocationTracking';
 import { BottomTabBar } from '@/components/BottomTabBar';
 import { Colors, Fonts } from '@/lib/theme';
@@ -255,6 +256,16 @@ export default function SetupScreen() {
       router.replace('/landing');
     }
   }, [ctx.isLoggedIn]);
+
+  // Prefetch the Overpass green-space + highway data for the user's center.
+  // The user typically spends several seconds adjusting distance / route
+  // type before tapping Generate, so kicking the network request off here
+  // hides the ~1-3s Overpass round trip behind UI navigation. Cached at
+  // max radius so any subsequent Generate at this location reuses it
+  // regardless of selected distance.
+  useEffect(() => {
+    if (ctx.center) prefetchGreenSpacesAndHighways(ctx.center);
+  }, [ctx.center]);
 
   // Real GPS strength from location accuracy
   useEffect(() => {
