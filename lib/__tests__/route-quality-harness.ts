@@ -83,6 +83,22 @@ const FIXTURES: Fixture[] = [
   { name: 'nyc-east-village-3mi-loop',  center: { lat: 40.7280, lng: -73.9920 }, distanceMi: 3, routeType: 'loop',       prefs: { lowTraffic: true } },
   { name: 'nyc-east-village-4mi-loop',  center: { lat: 40.7280, lng: -73.9920 }, distanceMi: 4, routeType: 'loop',       prefs: { lowTraffic: false } },
   { name: 'nyc-east-village-6mi-loop',  center: { lat: 40.7280, lng: -73.9920 }, distanceMi: 6, routeType: 'loop',       prefs: { lowTraffic: false } },
+
+  // Additional NYC neighborhoods — broader real-OSRM coverage. Each area
+  // exposes different routing geometry: Tribeca/FiDi narrow streets and
+  // water on three sides; UWS bordered by Central Park and Riverside;
+  // UES bordered by Central Park and East River; Chelsea grid + Hudson;
+  // Brooklyn Heights small grid + waterfront; DUMBO water-bounded.
+  { name: 'nyc-tribeca-3mi-loop',       center: { lat: 40.7170, lng: -74.0080 }, distanceMi: 3, routeType: 'loop',       prefs: { lowTraffic: true } },
+  { name: 'nyc-tribeca-5mi-loop',       center: { lat: 40.7170, lng: -74.0080 }, distanceMi: 5, routeType: 'loop',       prefs: { lowTraffic: false } },
+  { name: 'nyc-uws-4mi-loop',           center: { lat: 40.7850, lng: -73.9750 }, distanceMi: 4, routeType: 'loop',       prefs: { lowTraffic: false } },
+  { name: 'nyc-uws-6mi-loop',           center: { lat: 40.7850, lng: -73.9750 }, distanceMi: 6, routeType: 'loop',       prefs: { lowTraffic: true } },
+  { name: 'nyc-ues-3mi-loop',           center: { lat: 40.7770, lng: -73.9580 }, distanceMi: 3, routeType: 'loop',       prefs: { lowTraffic: false } },
+  { name: 'nyc-ues-5mi-loop',           center: { lat: 40.7770, lng: -73.9580 }, distanceMi: 5, routeType: 'loop',       prefs: { lowTraffic: true } },
+  { name: 'nyc-chelsea-3mi-loop',       center: { lat: 40.7470, lng: -74.0020 }, distanceMi: 3, routeType: 'loop',       prefs: { lowTraffic: true } },
+  { name: 'nyc-chelsea-5mi-loop',       center: { lat: 40.7470, lng: -74.0020 }, distanceMi: 5, routeType: 'loop',       prefs: { lowTraffic: false } },
+  { name: 'nyc-brooklyn-heights-3mi',   center: { lat: 40.6960, lng: -73.9940 }, distanceMi: 3, routeType: 'loop',       prefs: { lowTraffic: true } },
+  { name: 'nyc-dumbo-3mi-loop',         center: { lat: 40.7030, lng: -73.9890 }, distanceMi: 3, routeType: 'loop',       prefs: { lowTraffic: false } },
 ];
 
 interface Thresholds {
