@@ -13,6 +13,7 @@ import {
 import { SpaceMono_400Regular, SpaceMono_700Bold } from '@expo-google-fonts/space-mono';
 import { AppProvider, useAppContext } from '@/lib/AppContext';
 import { Colors } from '@/lib/theme';
+import { loadPersistedOverpassCache } from '@/lib/overpass-persist';
 
 SplashScreen.preventAutoHideAsync();
 
@@ -60,6 +61,14 @@ function AuthGate({ children }: { children: React.ReactNode }) {
   const ctx = useAppContext();
   const router = useRouter();
   const segments = useSegments();
+
+  // Restore the persisted Overpass cache once per app launch. Hydrating
+  // before any route generation lets a returning user (running from home)
+  // skip the ~1-3s green-space fetch entirely. Fire-and-forget — failures
+  // just mean the next request hits the network as usual.
+  useEffect(() => {
+    loadPersistedOverpassCache();
+  }, []);
 
   useEffect(() => {
     if (ctx.authLoading) return;
