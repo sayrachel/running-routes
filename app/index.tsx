@@ -25,7 +25,7 @@ import { RouteMap } from '@/components/RouteMap';
 import { ProfileDrawer } from '@/components/ProfileDrawer';
 import { useAppContext, type RouteStyle, type RunPreferences } from '@/lib/AppContext';
 import { distanceUnit } from '@/lib/units';
-import { generateOSRMRoutes } from '@/lib/osrm';
+import { generateOSRMRoutes, prewarmOSRMConnection } from '@/lib/osrm';
 import { prefetchGreenSpacesAndHighways } from '@/lib/overpass';
 import { accuracyToStrength } from '@/lib/useLocationTracking';
 import { BottomTabBar } from '@/components/BottomTabBar';
@@ -257,14 +257,18 @@ export default function SetupScreen() {
     }
   }, [ctx.isLoggedIn]);
 
-  // Prefetch the Overpass green-space + highway data for the user's center.
-  // The user typically spends several seconds adjusting distance / route
-  // type before tapping Generate, so kicking the network request off here
-  // hides the ~1-3s Overpass round trip behind UI navigation. Cached at
-  // max radius so any subsequent Generate at this location reuses it
-  // regardless of selected distance.
+  // Prefetch the Overpass green-space + highway data for the user's center
+  // and pre-warm the OSRM TLS connection. The user typically spends several
+  // seconds adjusting distance / route type before tapping Generate, so
+  // hiding both network round trips behind UI navigation removes them from
+  // the perceived loading time. Overpass is cached at max radius so any
+  // subsequent Generate at this location reuses it regardless of distance;
+  // the OSRM warmup just keeps the socket open for the first real call.
   useEffect(() => {
-    if (ctx.center) prefetchGreenSpacesAndHighways(ctx.center);
+    if (ctx.center) {
+      prefetchGreenSpacesAndHighways(ctx.center);
+      prewarmOSRMConnection(ctx.center);
+    }
   }, [ctx.center]);
 
   // Real GPS strength from location accuracy

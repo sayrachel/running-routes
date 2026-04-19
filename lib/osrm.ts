@@ -1213,9 +1213,12 @@ function selectWaypoint(
   };
 }
 
-// Public OSRM endpoint (router.project-osrm.org) is often slow; 3s caused
-// most retries to abort, preventing fetchOSRMRouteAdjusted from converging.
-const OSRM_TIMEOUT_MS = 8000;
+// Public OSRM endpoint (router.project-osrm.org) typically responds in
+// 200-700ms; 1-2s when busy. 5s is a generous cap that still cuts the
+// worst-case stall when a single call hangs — the parallel candidate
+// pool's wall-clock floor is the SLOWEST chain, so capping any single
+// call at 5s materially helps the long tail. Was 8s.
+const OSRM_TIMEOUT_MS = 5000;
 
 /** Retry wrapper for fetch with timeout */
 async function fetchWithRetry(url: string, retries = 1): Promise<Response> {
@@ -1489,6 +1492,24 @@ export function setOSRMCacheMax(n: number): void { osrmCacheMax = n; }
  *  in deterministic mode so cross-fixture cache hits don't make results
  *  depend on which fixtures preceded the current one. */
 export function clearOSRMCache(): void { osrmRouteCache.clear(); }
+
+/**
+ * Pre-warm the TCP+TLS connection to the OSRM endpoint by firing a trivial
+ * routing request and discarding the result. Saves ~100-300ms of handshake
+ * latency on the first real route call. Pair with prefetch from the route
+ * screen so the first user-visible Generate hits warm sockets.
+ */
+export function prewarmOSRMConnection(center: RoutePoint): void {
+  // Tiny ~110m route (1° lat ≈ 111km, so 0.001° ≈ 110m) — minimal OSRM
+  // compute, just enough to establish the connection. Skip when mocked.
+  if (osrmMockEnabled) return;
+  const wp1 = `${center.lng},${center.lat}`;
+  const wp2 = `${center.lng},${center.lat + 0.001}`;
+  const url = `${osrmBase}/${wp1};${wp2}?overview=false`;
+  fetch(url).catch(() => {
+    // Fire-and-forget; the real route call surfaces any endpoint errors.
+  });
+}
 
 /**
  * Snapshot the OSRM cache for record-and-replay testing — same pattern as
