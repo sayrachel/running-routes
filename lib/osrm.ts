@@ -1306,15 +1306,19 @@ async function fetchOSRMRouteAdjusted(
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const route = await fetchOSRMRoute(currentWaypoints);
     if (!route) {
+      traceEmit('adjust-no-route', { attempt });
       if (best) return { route: best.route, waypoints: best.waypoints };
       return { route: null, waypoints: currentWaypoints };
     }
 
     const routeDistKm = route.distance / 1000;
     const ratio = routeDistKm / targetDistanceKm;
+    traceEmit('adjust-attempt', { attempt, distKm: routeDistKm, ratio, target: targetDistanceKm });
 
     // Track best-so-far by closeness to ratio = 1.
-    if (!best || Math.abs(1 - ratio) < Math.abs(1 - best.ratio)) {
+    const prevBestErr = best ? Math.abs(1 - best.ratio) : Infinity;
+    const thisErr = Math.abs(1 - ratio);
+    if (!best || thisErr < prevBestErr) {
       best = { route, waypoints: currentWaypoints, ratio };
     }
 
@@ -1324,18 +1328,34 @@ async function fetchOSRMRouteAdjusted(
       return { route, waypoints: currentWaypoints };
     }
 
+    // Divergence detection. Scaling waypoints across a hard barrier
+    // (river, large park, expressway) can flip the OSRM route from
+    // ~10km → ~28km in a single step (observed in Columbus 8mi). When the
+    // new attempt is dramatically WORSE than the best so far, further
+    // scaling will only oscillate — return the best.
+    if (attempt > 0 && thisErr > prevBestErr * 2.0) {
+      traceEmit('adjust-diverged', { ratio, prevBestRatio: best!.ratio });
+      return { route: best!.route, waypoints: best!.waypoints };
+    }
+
     // Out of retries — return the closest attempt rather than the latest.
     if (attempt === maxRetries) {
+      traceEmit('adjust-give-up', { bestRatio: best.ratio });
       return { route: best.route, waypoints: best.waypoints };
     }
 
-    // Scale waypoints toward/away from center. Lighter damping (0.85 vs 0.7)
-    // means each correction moves further; with a 3-retry budget this
-    // converges in ~2 iterations on most fixtures instead of getting stuck
-    // 20–30% off after the single under-corrected retry.
+    // Scale waypoints toward/away from center. Damped to prevent
+    // overcorrection, then HARD-CAPPED to [0.80, 1.25] per step so that
+    // a wildly-off ratio (e.g. 0.55 — usually means waypoint landed past
+    // a barrier and OSRM cut it short) can't fling waypoints into water on
+    // the next attempt. Trace data showed candidates oscillating
+    // 10km → 28km → 7km → 11km when an unbounded scale (1.8×) pushed
+    // waypoints across the East/Hudson rivers. Three capped retries can
+    // still cumulatively reach ~1.95× / 0.51× from the original.
     const scaleFactor = 1 / ratio;
-    const dampedScale = 1 + (scaleFactor - 1) * 0.85;
-    currentWaypoints = scaleWaypoints(currentWaypoints, center, dampedScale);
+    const dampedScale = 1 + (scaleFactor - 1) * 0.7;
+    const cappedScale = Math.max(0.80, Math.min(1.25, dampedScale));
+    currentWaypoints = scaleWaypoints(currentWaypoints, center, cappedScale);
   }
 
   return best
