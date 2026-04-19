@@ -16,7 +16,7 @@ export function setOSRMBase(url: string | null): void {
 // User-facing route count cap. The internal candidate pool is larger so
 // quality rejection has alternatives — see SAFETY_EXTRAS below.
 const MAX_CANDIDATE_COUNT = 3;
-const MAX_INTERNAL_CANDIDATES = 9;
+const MAX_INTERNAL_CANDIDATES = 12;
 
 /**
  * Road routing overhead factor.
@@ -1739,7 +1739,7 @@ export async function generateOSRMRoutes(
   // bigger pool we have a better chance of finding one with cleaner OSRM
   // geometry. SAFETY_EXTRAS = 6 makes the cost ~6 OSRM calls vs ~3 — still
   // well under any rate limit.
-  const SAFETY_EXTRAS = 6;
+  const SAFETY_EXTRAS = 9;
   const candidateCount = Math.min(MAX_INTERNAL_CANDIDATES, count + SAFETY_EXTRAS);
   const timeSeed = getSeed() % 100000;
   const candidates: { variant: number; waypoints: RoutePoint[]; anchors: GreenSpace[] }[] = [];
