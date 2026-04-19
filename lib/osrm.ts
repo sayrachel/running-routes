@@ -1854,10 +1854,19 @@ export async function generateOSRMRoutes(
     const osrmRoute = osrmResult.route;
     if (osrmRoute) {
       const rawPoints = osrmRoute.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }));
+      const rawDistKm = osrmRoute.distance / 1000;
       const skipLollipopRemoval = routeType === 'out-and-back' || osrmMockEnabled;
       const afterLollipop = skipLollipopRemoval
         ? rawPoints
         : removeSelfintersections(rawPoints);
+      let afterLollipopKm = rawDistKm;
+      if (afterLollipop !== rawPoints) {
+        afterLollipopKm = 0;
+        for (let k = 1; k < afterLollipop.length; k++) {
+          afterLollipopKm += haversineDistance(afterLollipop[k - 1], afterLollipop[k]);
+        }
+        traceEmit('post-process-trim', { i, stage: 'lollipop', before: rawDistKm, after: afterLollipopKm });
+      }
       // Always trim dead-end stubs. The user explicitly does not want any
       // visible stubs — even one ruins the "can the runner follow this as
       // a single path?" property. Out-and-back routes are exempt because
@@ -1865,6 +1874,13 @@ export async function generateOSRMRoutes(
       const points = routeType === 'out-and-back'
         ? afterLollipop
         : trimStubs(afterLollipop);
+      if (points !== afterLollipop) {
+        let stubKm = 0;
+        for (let k = 1; k < points.length; k++) {
+          stubKm += haversineDistance(points[k - 1], points[k]);
+        }
+        traceEmit('post-process-trim', { i, stage: 'stubs', before: afterLollipopKm, after: stubKm });
+      }
       // Recompute distance from the FINAL points (after both lollipop
       // removal and stub trimming) so the displayed mileage matches the
       // polyline drawn on the map.
@@ -1917,16 +1933,28 @@ export async function generateOSRMRoutes(
       const anchorBonus = candidates[i].anchors.length >= 2 ? 0.10
         : candidates[i].anchors.length === 1 ? 0.05
         : 0;
+      // Rounding penalty. The user-facing distance label rounds to the
+      // nearest mile, so a 4mi request returning a route that rounds to
+      // 3mi (or 5mi) feels broken even if the absolute error is small.
+      // 0.4 per mile of rounded delta — bigger than typical retrace deltas
+      // so a candidate that rounds correctly wins even if it's slightly
+      // dirtier than one that doesn't. Empirically lifted random-seed
+      // pass rate from ~5/15 to ~7/15 across the NYC harness fixtures.
+      const targetMi = distanceKm * 0.621371;
+      const actualMi = distKm * 0.621371;
+      const roundedDelta = Math.abs(Math.round(actualMi) - Math.round(targetMi));
+      const roundingPenalty = roundedDelta * 0.4;
       const qualityPenalty = Math.max(0,
         (isOutAndBack ? 0 : retraced) +
         (isOutAndBack ? 0 : overlap) +
         // Out-and-back routes have an intentional U-turn at the far end
         // which countStubs flags; don't penalize it.
         (isOutAndBack ? 0 : stubs * 0.20) +
-        Math.abs(1 - distRatio) * 1.0 -
+        Math.abs(1 - distRatio) * 1.0 +
+        roundingPenalty -
         anchorBonus
       );
-      traceEmit('candidate-evaluated', { i, distKm, distRatio, hwProximity, retraced, overlap, stubs, qualityPenalty });
+      traceEmit('candidate-evaluated', { i, distKm, distRatio, hwProximity, retraced, overlap, stubs, roundingPenalty, qualityPenalty });
       resolved.push({ index: i, variant: candidates[i].variant, points, distKm, estimatedTime, fromOSRM: true, anchors: candidates[i].anchors, qualityPenalty });
     } else {
       const wp = osrmResult.waypoints;
