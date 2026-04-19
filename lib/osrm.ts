@@ -1299,77 +1299,96 @@ async function fetchOSRMRouteAdjusted(
   waypoints: RoutePoint[],
   center: RoutePoint,
   targetDistanceKm: number,
-  // 2 retries (3 total attempts) is the sweet spot. With damping 0.7 + the
-  // [0.80, 1.25] cap, most candidates converge in attempt 1 — a 3rd retry
-  // mostly burned wall-clock without improving the chosen route. Halving
-  // the per-candidate wall-clock floor cuts perceived generation time by
-  // ~30-40% on slow public-OSRM connections.
+  // 2 retries means up to 2 sequential refinement passes after the initial
+  // hedged batch. With damping 0.7 + the [0.80, 1.25] cap, most candidates
+  // converge in the hedged batch — these retries only fire when none of
+  // the parallel scales landed in the accept window.
   maxRetries: number = 2
 ): Promise<{ route: OSRMRoute | null; waypoints: RoutePoint[] }> {
-  let currentWaypoints = waypoints;
-  // Track the best result we've seen across attempts so we don't accidentally
-  // return a worse-fitting later attempt just because it ran last.
-  let best: { route: OSRMRoute; waypoints: RoutePoint[]; ratio: number } | null = null;
+  // HEDGED FIRST PASS: dense urban grids systematically undershoot the
+  // straight-line ROUTING_OVERHEAD assumption (observed iter-0 ratios
+  // cluster at 0.7-0.85 in NYC). Instead of waiting for attempt 0 then
+  // sequentially iterating, fire 3 scales in parallel — base, +biased
+  // toward undershoot correction, and a smaller fallback in case the
+  // initial waypoints overshot. Wall-clock per candidate goes from
+  // (1 + iterations) × OSRM_time → 1 × OSRM_time when any of the three
+  // hits the accept window. Cost is +2 OSRM calls per candidate, but
+  // they're parallel so they don't add wall-clock.
+  const HEDGE_SCALES = [1.0, 1.15, 0.88];
+  const hedgedAttempts = await Promise.all(
+    HEDGE_SCALES.map((scale) => {
+      const wps = scale === 1.0 ? waypoints : scaleWaypoints(waypoints, center, scale);
+      return fetchOSRMRoute(wps).then((route) => {
+        if (!route) return null;
+        const ratio = route.distance / 1000 / targetDistanceKm;
+        traceEmit('hedge-attempt', { scale, distKm: route.distance / 1000, ratio });
+        return { route, waypoints: wps, ratio };
+      });
+    }),
+  );
 
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+  // Pick the closest-to-target hedged attempt as our baseline.
+  let best: { route: OSRMRoute; waypoints: RoutePoint[]; ratio: number } | null = null;
+  for (const a of hedgedAttempts) {
+    if (!a) continue;
+    if (!best || Math.abs(1 - a.ratio) < Math.abs(1 - best.ratio)) best = a;
+  }
+
+  if (!best) {
+    traceEmit('adjust-no-route', { attempt: 0 });
+    return { route: null, waypoints };
+  }
+
+  // Accept immediately if any hedged scale landed in the window.
+  if (best.ratio >= 0.85 && best.ratio <= 1.15) {
+    return { route: best.route, waypoints: best.waypoints };
+  }
+
+  // SEQUENTIAL REFINEMENT: none of the 3 hedged scales hit the window.
+  // Iterate from the best-so-far. Same scaling math as before —
+  // damped 0.7, capped to [0.80, 1.25] per step, divergence detection
+  // to bail when scaling oversteps a barrier.
+  let currentWaypoints = best.waypoints;
+  let currentRatio = best.ratio;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const scaleFactor = 1 / currentRatio;
+    const dampedScale = 1 + (scaleFactor - 1) * 0.7;
+    const cappedScale = Math.max(0.80, Math.min(1.25, dampedScale));
+    currentWaypoints = scaleWaypoints(currentWaypoints, center, cappedScale);
+
     const route = await fetchOSRMRoute(currentWaypoints);
     if (!route) {
       traceEmit('adjust-no-route', { attempt });
-      if (best) return { route: best.route, waypoints: best.waypoints };
-      return { route: null, waypoints: currentWaypoints };
+      return { route: best.route, waypoints: best.waypoints };
     }
 
     const routeDistKm = route.distance / 1000;
     const ratio = routeDistKm / targetDistanceKm;
     traceEmit('adjust-attempt', { attempt, distKm: routeDistKm, ratio, target: targetDistanceKm });
 
-    // Track best-so-far by closeness to ratio = 1.
-    const prevBestErr = best ? Math.abs(1 - best.ratio) : Infinity;
+    const prevBestErr = Math.abs(1 - best.ratio);
     const thisErr = Math.abs(1 - ratio);
-    if (!best || thisErr < prevBestErr) {
-      best = { route, waypoints: currentWaypoints, ratio };
-    }
+    if (thisErr < prevBestErr) best = { route, waypoints: currentWaypoints, ratio };
 
-    // Accept window ±15%. Tighter (±7%) caused over-iteration and
-    // overshoot — routes ended up FARTHER from target after extra scaling.
     if (ratio >= 0.85 && ratio <= 1.15) {
       return { route, waypoints: currentWaypoints };
     }
 
-    // Divergence detection. Scaling waypoints across a hard barrier
-    // (river, large park, expressway) can flip the OSRM route from
-    // ~10km → ~28km in a single step (observed in Columbus 8mi). When the
-    // new attempt is dramatically WORSE than the best so far, further
-    // scaling will only oscillate — return the best.
-    if (attempt > 0 && thisErr > prevBestErr * 2.0) {
-      traceEmit('adjust-diverged', { ratio, prevBestRatio: best!.ratio });
-      return { route: best!.route, waypoints: best!.waypoints };
-    }
-
-    // Out of retries — return the closest attempt rather than the latest.
-    if (attempt === maxRetries) {
-      traceEmit('adjust-give-up', { bestRatio: best.ratio });
+    // Divergence detection: scaling sent us further from target (likely
+    // crossed a barrier). Bail to best-so-far.
+    if (thisErr > prevBestErr * 2.0) {
+      traceEmit('adjust-diverged', { ratio, prevBestRatio: best.ratio });
       return { route: best.route, waypoints: best.waypoints };
     }
 
-    // Scale waypoints toward/away from center. Damped to prevent
-    // overcorrection, then HARD-CAPPED to [0.80, 1.25] per step so that
-    // a wildly-off ratio (e.g. 0.55 — usually means waypoint landed past
-    // a barrier and OSRM cut it short) can't fling waypoints into water on
-    // the next attempt. Trace data showed candidates oscillating
-    // 10km → 28km → 7km → 11km when an unbounded scale (1.8×) pushed
-    // waypoints across the East/Hudson rivers. Three capped retries can
-    // still cumulatively reach ~1.95× / 0.51× from the original.
-    const scaleFactor = 1 / ratio;
-    const dampedScale = 1 + (scaleFactor - 1) * 0.7;
-    const cappedScale = Math.max(0.80, Math.min(1.25, dampedScale));
-    currentWaypoints = scaleWaypoints(currentWaypoints, center, cappedScale);
+    currentRatio = ratio;
   }
 
-  return best
-    ? { route: best.route, waypoints: best.waypoints }
-    : { route: null, waypoints: currentWaypoints };
+  traceEmit('adjust-give-up', { bestRatio: best.ratio });
+  return { route: best.route, waypoints: best.waypoints };
 }
+
 
 /**
  * Deterministic synthetic OSRM stand-in for the quality harness.
