@@ -1864,15 +1864,17 @@ export async function generateOSRMRoutes(
   // shrink/expand waypoints toward center and re-query (up to 2 retries).
   // Point-to-point routes skip adjustment since they must reach the destination.
   //
-  // PROGRESSIVE RESOLUTION: process results AS THEY ARRIVE rather than
-  // awaiting Promise.all. Public OSRM has high latency variance — the
-  // slowest candidate often takes 2-3× as long as the median. If a fast
-  // candidate already meets our quality bar, the slower ones rarely beat
-  // it enough to justify waiting. Early exit cuts perceived generation
-  // time from "max(latencies)" to roughly "median(latencies) + processing"
-  // on most calls, while preserving best-of-N quality on hard cases
-  // (clustered green spaces, water-bounded grids) where no candidate
-  // reaches the early-exit bar and we naturally wait for all to finish.
+  // PROGRESSIVE RESOLUTION: process results AS THEY ARRIVE so the scorer
+  // can see them in completion order rather than blocking on Promise.all.
+  // No early exit — we always wait for all candidates so the final pick is
+  // the best of N, not just the first that crosses some quality threshold.
+  // An earlier early-exit experiment (Build 22) shipped routes that scored
+  // well numerically (low retrace, on-target distance, anchored) but had
+  // visually bad shape — multiple disconnected sub-loops, two-axis
+  // out-and-backs — because the quality scorer doesn't currently penalize
+  // shape complexity. Waiting for all candidates lets the best-of-N
+  // property mask those scorer blind spots until we can address them
+  // properly.
   const useAdjustment = routeType !== 'point-to-point';
   type Tagged = { idx: number; result: { route: OSRMRoute | null; waypoints: RoutePoint[] } };
   const pending = new Map<number, Promise<Tagged>>();
@@ -1884,15 +1886,6 @@ export async function generateOSRMRoutes(
     ).then((result) => ({ idx, result }));
     pending.set(idx, p);
   }
-
-  // Quality threshold below which we stop waiting for additional candidates.
-  // A perfect route scores ≤0.05; 0.20 means "well-shaped, on-target,
-  // anchored to a named green space" — empirically rare to be beaten by
-  // waiting for the rest. The threshold is intentionally strict so that
-  // hitting it is a strong signal we've found a great route, not just an
-  // OK one. On hard cases (clustered green spaces, water-bounded grids)
-  // no candidate reaches this bar and we wait for all to finish.
-  const EARLY_EXIT_QUALITY = 0.20;
 
   // Build resolved candidates. NEW BEHAVIOR: don't hard-reject candidates
   // that fail strict thresholds — KEEP them with a quality score so we can
@@ -2015,19 +2008,6 @@ export async function generateOSRMRoutes(
       );
       traceEmit('candidate-evaluated', { i, distKm, distRatio, hwProximity, retraced, overlap, stubs, roundingPenalty, qualityPenalty });
       resolved.push({ index: i, variant: candidates[i].variant, points, distKm, estimatedTime, fromOSRM: true, anchors: candidates[i].anchors, qualityPenalty });
-
-      // Early exit: a confidently-good candidate just arrived; don't
-      // keep waiting on the remaining OSRM calls. They'll finish in the
-      // background and be GC'd; no cancellation needed since the network
-      // cost is already incurred.
-      if (qualityPenalty < EARLY_EXIT_QUALITY) {
-        traceEmit('early-exit', {
-          afterCount: resolved.length,
-          bestQuality: qualityPenalty,
-          remaining: pending.size,
-        });
-        break;
-      }
     } else {
       // OSRM returned nothing — likely network failure, timeout, or no route
       // exists for these waypoints. Skip the candidate entirely. Older code
