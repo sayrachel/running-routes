@@ -28,6 +28,7 @@ import { distanceUnit } from '@/lib/units';
 import { generateOSRMRoutes, prewarmOSRMConnection } from '@/lib/osrm';
 import { prefetchGreenSpacesAndHighways } from '@/lib/overpass';
 import { persistOverpassCache } from '@/lib/overpass-persist';
+import { persistOSRMCache } from '@/lib/osrm-persist';
 import { accuracyToStrength } from '@/lib/useLocationTracking';
 import { BottomTabBar } from '@/components/BottomTabBar';
 import { Colors, Fonts } from '@/lib/theme';
@@ -604,10 +605,12 @@ export default function SetupScreen() {
       ctx.setRoutes(newRoutes);
       ctx.setSelectedRoute(newRoutes[0] || null);
       ctx.setIsGenerating(false);
-      // Persist the Overpass cache after a successful generation. The
-      // network round trip just paid for fresh data — checkpointing it now
-      // means the next cold app launch from the same area skips Overpass.
+      // Persist the Overpass + OSRM caches after a successful generation.
+      // The network round trips just paid for fresh data — checkpointing
+      // now means the next cold app launch from the same area skips both
+      // the green-space fetch and any repeated waypoint OSRM calls.
       persistOverpassCache();
+      persistOSRMCache();
     } catch (err: any) {
       console.warn('Route generation failed:', err);
       ctx.setIsGenerating(false);

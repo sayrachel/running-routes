@@ -1214,11 +1214,12 @@ function selectWaypoint(
 }
 
 // Public OSRM endpoint (router.project-osrm.org) typically responds in
-// 200-700ms; 1-2s when busy. 5s is a generous cap that still cuts the
-// worst-case stall when a single call hangs — the parallel candidate
-// pool's wall-clock floor is the SLOWEST chain, so capping any single
-// call at 5s materially helps the long tail. Was 8s.
-const OSRM_TIMEOUT_MS = 5000;
+// 200-700ms; 1-2s when busy, occasionally 3-5s under load. 8s leaves
+// headroom for the long tail without letting one stuck call dominate.
+// Tighter limits (5s) caused legitimate slow responses to abort and
+// fall through to the no-route path, which surfaced as straight-line
+// triangles in the UI.
+const OSRM_TIMEOUT_MS = 8000;
 
 /** Retry wrapper for fetch with timeout */
 async function fetchWithRetry(url: string, retries = 1): Promise<Response> {
@@ -1299,94 +1300,79 @@ async function fetchOSRMRouteAdjusted(
   waypoints: RoutePoint[],
   center: RoutePoint,
   targetDistanceKm: number,
-  // 2 retries means up to 2 sequential refinement passes after the initial
-  // hedged batch. With damping 0.7 + the [0.80, 1.25] cap, most candidates
-  // converge in the hedged batch — these retries only fire when none of
-  // the parallel scales landed in the accept window.
+  // 2 retries (3 total attempts) is the sweet spot. With damping 0.7 + the
+  // [0.80, 1.25] cap, most candidates converge in attempt 1 — a 3rd retry
+  // mostly burned wall-clock without improving the chosen route.
   maxRetries: number = 2
 ): Promise<{ route: OSRMRoute | null; waypoints: RoutePoint[] }> {
-  // HEDGED FIRST PASS: dense urban grids systematically undershoot the
-  // straight-line ROUTING_OVERHEAD assumption (observed iter-0 ratios
-  // cluster at 0.7-0.85 in NYC). Instead of waiting for attempt 0 then
-  // sequentially iterating, fire 3 scales in parallel — base, +biased
-  // toward undershoot correction, and a smaller fallback in case the
-  // initial waypoints overshot. Wall-clock per candidate goes from
-  // (1 + iterations) × OSRM_time → 1 × OSRM_time when any of the three
-  // hits the accept window. Cost is +2 OSRM calls per candidate, but
-  // they're parallel so they don't add wall-clock.
-  const HEDGE_SCALES = [1.0, 1.15, 0.88];
-  const hedgedAttempts = await Promise.all(
-    HEDGE_SCALES.map((scale) => {
-      const wps = scale === 1.0 ? waypoints : scaleWaypoints(waypoints, center, scale);
-      return fetchOSRMRoute(wps).then((route) => {
-        if (!route) return null;
-        const ratio = route.distance / 1000 / targetDistanceKm;
-        traceEmit('hedge-attempt', { scale, distKm: route.distance / 1000, ratio });
-        return { route, waypoints: wps, ratio };
-      });
-    }),
-  );
-
-  // Pick the closest-to-target hedged attempt as our baseline.
+  // Sequential first attempt + iterative refinement. A previous experiment
+  // hedged 3 parallel scales upfront for wall-clock wins, but tripled the
+  // request volume to public OSRM which then rate-limited the burst — many
+  // candidates resolved to null and the algorithm displayed raw waypoints
+  // as straight-line "routes" through buildings and across rivers. Sticking
+  // to one call per attempt keeps total in-flight requests = candidate count.
+  let currentWaypoints = waypoints;
+  // Track the best result we've seen across attempts so we don't accidentally
+  // return a worse-fitting later attempt just because it ran last.
   let best: { route: OSRMRoute; waypoints: RoutePoint[]; ratio: number } | null = null;
-  for (const a of hedgedAttempts) {
-    if (!a) continue;
-    if (!best || Math.abs(1 - a.ratio) < Math.abs(1 - best.ratio)) best = a;
-  }
 
-  if (!best) {
-    traceEmit('adjust-no-route', { attempt: 0 });
-    return { route: null, waypoints };
-  }
-
-  // Accept immediately if any hedged scale landed in the window.
-  if (best.ratio >= 0.85 && best.ratio <= 1.15) {
-    return { route: best.route, waypoints: best.waypoints };
-  }
-
-  // SEQUENTIAL REFINEMENT: none of the 3 hedged scales hit the window.
-  // Iterate from the best-so-far. Same scaling math as before —
-  // damped 0.7, capped to [0.80, 1.25] per step, divergence detection
-  // to bail when scaling oversteps a barrier.
-  let currentWaypoints = best.waypoints;
-  let currentRatio = best.ratio;
-
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    const scaleFactor = 1 / currentRatio;
-    const dampedScale = 1 + (scaleFactor - 1) * 0.7;
-    const cappedScale = Math.max(0.80, Math.min(1.25, dampedScale));
-    currentWaypoints = scaleWaypoints(currentWaypoints, center, cappedScale);
-
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const route = await fetchOSRMRoute(currentWaypoints);
     if (!route) {
       traceEmit('adjust-no-route', { attempt });
-      return { route: best.route, waypoints: best.waypoints };
+      if (best) return { route: best.route, waypoints: best.waypoints };
+      return { route: null, waypoints: currentWaypoints };
     }
 
     const routeDistKm = route.distance / 1000;
     const ratio = routeDistKm / targetDistanceKm;
     traceEmit('adjust-attempt', { attempt, distKm: routeDistKm, ratio, target: targetDistanceKm });
 
-    const prevBestErr = Math.abs(1 - best.ratio);
+    // Track best-so-far by closeness to ratio = 1.
+    const prevBestErr = best ? Math.abs(1 - best.ratio) : Infinity;
     const thisErr = Math.abs(1 - ratio);
-    if (thisErr < prevBestErr) best = { route, waypoints: currentWaypoints, ratio };
+    if (!best || thisErr < prevBestErr) {
+      best = { route, waypoints: currentWaypoints, ratio };
+    }
 
+    // Accept window ±15%. Tighter (±7%) caused over-iteration and
+    // overshoot — routes ended up FARTHER from target after extra scaling.
     if (ratio >= 0.85 && ratio <= 1.15) {
       return { route, waypoints: currentWaypoints };
     }
 
-    // Divergence detection: scaling sent us further from target (likely
-    // crossed a barrier). Bail to best-so-far.
-    if (thisErr > prevBestErr * 2.0) {
-      traceEmit('adjust-diverged', { ratio, prevBestRatio: best.ratio });
+    // Divergence detection. Scaling waypoints across a hard barrier
+    // (river, large park, expressway) can flip the OSRM route from
+    // ~10km → ~28km in a single step (observed in Columbus 8mi). When the
+    // new attempt is dramatically WORSE than the best so far, further
+    // scaling will only oscillate — return the best.
+    if (attempt > 0 && thisErr > prevBestErr * 2.0) {
+      traceEmit('adjust-diverged', { ratio, prevBestRatio: best!.ratio });
+      return { route: best!.route, waypoints: best!.waypoints };
+    }
+
+    // Out of retries — return the closest attempt rather than the latest.
+    if (attempt === maxRetries) {
+      traceEmit('adjust-give-up', { bestRatio: best.ratio });
       return { route: best.route, waypoints: best.waypoints };
     }
 
-    currentRatio = ratio;
+    // Scale waypoints toward/away from center. Damped to prevent
+    // overcorrection, then HARD-CAPPED to [0.80, 1.25] per step so that
+    // a wildly-off ratio (e.g. 0.55 — usually means waypoint landed past
+    // a barrier and OSRM cut it short) can't fling waypoints into water on
+    // the next attempt. Trace data showed candidates oscillating
+    // 10km → 28km → 7km → 11km when an unbounded scale (1.8×) pushed
+    // waypoints across the East/Hudson rivers.
+    const scaleFactor = 1 / ratio;
+    const dampedScale = 1 + (scaleFactor - 1) * 0.7;
+    const cappedScale = Math.max(0.80, Math.min(1.25, dampedScale));
+    currentWaypoints = scaleWaypoints(currentWaypoints, center, cappedScale);
   }
 
-  traceEmit('adjust-give-up', { bestRatio: best.ratio });
-  return { route: best.route, waypoints: best.waypoints };
+  return best
+    ? { route: best.route, waypoints: best.waypoints }
+    : { route: null, waypoints: currentWaypoints };
 }
 
 
@@ -1503,9 +1489,12 @@ function getSeed(): number {
  */
 const osrmRouteCache = new Map<string, OSRMRoute>();
 // Mutable so the test harness can raise the cap before recording a snapshot
-// (a single harness run can fire 100+ OSRM calls; the production default of
-// 50 would silently evict half of them, breaking deterministic replay).
-let osrmCacheMax = 50;
+// (a single harness run can fire 100+ OSRM calls; the production default
+// would silently evict half of them, breaking deterministic replay).
+// Production: 200 covers ~30 prior generations worth of waypoint hits and
+// is small enough that the AsyncStorage JSON blob stays under ~500KB even
+// with full-geometry geojson polylines.
+let osrmCacheMax = 200;
 export function setOSRMCacheMax(n: number): void { osrmCacheMax = n; }
 /** Clear the in-memory OSRM cache. The harness calls this between fixtures
  *  in deterministic mode so cross-fixture cache hits don't make results
@@ -1874,14 +1863,36 @@ export async function generateOSRMRoutes(
   // adjustment. If a candidate's OSRM distance is too far from the target,
   // shrink/expand waypoints toward center and re-query (up to 2 retries).
   // Point-to-point routes skip adjustment since they must reach the destination.
+  //
+  // PROGRESSIVE RESOLUTION: process results AS THEY ARRIVE rather than
+  // awaiting Promise.all. Public OSRM has high latency variance — the
+  // slowest candidate often takes 2-3× as long as the median. If a fast
+  // candidate already meets our quality bar, the slower ones rarely beat
+  // it enough to justify waiting. Early exit cuts perceived generation
+  // time from "max(latencies)" to roughly "median(latencies) + processing"
+  // on most calls, while preserving best-of-N quality on hard cases
+  // (clustered green spaces, water-bounded grids) where no candidate
+  // reaches the early-exit bar and we naturally wait for all to finish.
   const useAdjustment = routeType !== 'point-to-point';
-  const osrmResults = await Promise.all(
-    candidates.map((c) =>
-      useAdjustment
-        ? fetchOSRMRouteAdjusted(c.waypoints, center, distanceKm)
-        : fetchOSRMRoute(c.waypoints).then((route) => ({ route, waypoints: c.waypoints }))
-    )
-  );
+  type Tagged = { idx: number; result: { route: OSRMRoute | null; waypoints: RoutePoint[] } };
+  const pending = new Map<number, Promise<Tagged>>();
+  for (let idx = 0; idx < candidates.length; idx++) {
+    const c = candidates[idx];
+    const p = (useAdjustment
+      ? fetchOSRMRouteAdjusted(c.waypoints, center, distanceKm)
+      : fetchOSRMRoute(c.waypoints).then((route) => ({ route, waypoints: c.waypoints }))
+    ).then((result) => ({ idx, result }));
+    pending.set(idx, p);
+  }
+
+  // Quality threshold below which we stop waiting for additional candidates.
+  // A perfect route scores ≤0.05; 0.20 means "well-shaped, on-target,
+  // anchored to a named green space" — empirically rare to be beaten by
+  // waiting for the rest. The threshold is intentionally strict so that
+  // hitting it is a strong signal we've found a great route, not just an
+  // OK one. On hard cases (clustered green spaces, water-bounded grids)
+  // no candidate reaches this bar and we wait for all to finish.
+  const EARLY_EXIT_QUALITY = 0.20;
 
   // Build resolved candidates. NEW BEHAVIOR: don't hard-reject candidates
   // that fail strict thresholds — KEEP them with a quality score so we can
@@ -1894,8 +1905,11 @@ export async function generateOSRMRoutes(
   // crosses a clear barrier, or routes along highways. Soft thresholds on
   // retrace/overlap/stubs feed into a quality score; the worst-quality
   // candidates lose to better ones but still beat the geometric fallback.
-  for (let i = 0; i < candidates.length; i++) {
-    const osrmResult = osrmResults[i];
+  while (pending.size > 0) {
+    const winner = await Promise.race(pending.values());
+    pending.delete(winner.idx);
+    const i = winner.idx;
+    const osrmResult = winner.result;
     const osrmRoute = osrmResult.route;
     if (osrmRoute) {
       const rawPoints = osrmRoute.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }));
@@ -2001,31 +2015,27 @@ export async function generateOSRMRoutes(
       );
       traceEmit('candidate-evaluated', { i, distKm, distRatio, hwProximity, retraced, overlap, stubs, roundingPenalty, qualityPenalty });
       resolved.push({ index: i, variant: candidates[i].variant, points, distKm, estimatedTime, fromOSRM: true, anchors: candidates[i].anchors, qualityPenalty });
-    } else {
-      const wp = osrmResult.waypoints;
-      const totalDist = wp.reduce((sum, p, j) => {
-        if (j === 0) return 0;
-        return sum + haversineDistance(wp[j - 1], p);
-      }, 0);
-      const fallbackRatio = distanceKm > 0 ? totalDist / distanceKm : 1;
-      const maxFallbackRatio = routeType === 'point-to-point' ? 3.0 : 1.3;
-      const minFallbackRatio = routeType === 'point-to-point' ? 0.2 : 0.5;
-      if (fallbackRatio > maxFallbackRatio || fallbackRatio < minFallbackRatio) {
-        console.log(`[RouteScoring] Rejecting fallback ${i}: dist=${totalDist.toFixed(2)}km (ratio=${fallbackRatio.toFixed(2)})`);
-        continue;
+
+      // Early exit: a confidently-good candidate just arrived; don't
+      // keep waiting on the remaining OSRM calls. They'll finish in the
+      // background and be GC'd; no cancellation needed since the network
+      // cost is already incurred.
+      if (qualityPenalty < EARLY_EXIT_QUALITY) {
+        traceEmit('early-exit', {
+          afterCount: resolved.length,
+          bestQuality: qualityPenalty,
+          remaining: pending.size,
+        });
+        break;
       }
-      // Non-OSRM fallback gets a high quality penalty so any real OSRM
-      // candidate beats it.
-      resolved.push({
-        index: i,
-        variant: candidates[i].variant,
-        points: wp,
-        distKm: totalDist,
-        estimatedTime: Math.round(totalDist * 6),
-        fromOSRM: false,
-        anchors: candidates[i].anchors,
-        qualityPenalty: 1.0,
-      });
+    } else {
+      // OSRM returned nothing — likely network failure, timeout, or no route
+      // exists for these waypoints. Skip the candidate entirely. Older code
+      // displayed the raw straight-line waypoints here as a "fallback" route,
+      // which surfaced as triangles cutting through buildings and across
+      // rivers when public OSRM was rate-limited. Better to drop and let
+      // either another candidate or step-3.5 fill in.
+      traceEmit('candidate-rejected', { i, reason: 'osrm-null' });
     }
   }
 
@@ -2114,23 +2124,10 @@ export async function generateOSRMRoutes(
         anchors: [],
         qualityPenalty: 0.5, // step-3.5 emergency fallback — no anchors, but real OSRM geometry
       });
-    } else {
-      // Use raw waypoints as last resort
-      let totalDist = 0;
-      for (let j = 1; j < chosen.waypoints.length; j++) {
-        totalDist += haversineDistance(chosen.waypoints[j - 1], chosen.waypoints[j]);
-      }
-      resolved.push({
-        index: 0,
-        variant: 0,
-        points: chosen.waypoints,
-        distKm: totalDist,
-        estimatedTime: Math.round(totalDist * 6),
-        fromOSRM: false,
-        qualityPenalty: 2.0, // raw waypoints, no real routing — last resort
-        anchors: [],
-      });
     }
+    // If even the bearing-trial fallback came back with no OSRM route,
+    // resolved stays empty — the caller surfaces "no routes found" rather
+    // than displaying raw straight-line waypoints over the map.
   }
 
   // Step 4: Score each candidate using locally-computable metrics only.
