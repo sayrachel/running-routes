@@ -164,6 +164,37 @@ export const SYNTHETIC_GREEN_SPACES: Record<string, GreenSpace[]> = {
     { point: { lat: 40.6972, lng: -73.9858 }, tier: 1, kind: 'park',       name: 'Cadman Plaza Park',         areaSize: 0.040 },
     { point: { lat: 40.7010, lng: -73.9933 }, tier: 1, kind: 'waterfront', name: 'Empire Fulton Ferry',       areaSize: 0     },
   ],
+
+  // NYC Central Park interior — start somewhere on the loop road. Park is
+  // 3.4km², runners are typically already inside. The algorithm should
+  // route within the park (not detour to streets).
+  '40.783,-73.965': [
+    { point: { lat: 40.7829, lng: -73.9654 }, tier: 1, kind: 'park',       name: 'Central Park',              areaSize: 3.41  },
+    { point: { lat: 40.7950, lng: -73.9580 }, tier: 1, kind: 'park',       name: 'Central Park North',        areaSize: 0.30  },
+    { point: { lat: 40.7710, lng: -73.9740 }, tier: 1, kind: 'park',       name: 'Sheep Meadow',              areaSize: 0.06  },
+    { point: { lat: 40.7745, lng: -73.9750 }, tier: 1, kind: 'park',       name: 'The Mall',                  areaSize: 0.025 },
+    { point: { lat: 40.7910, lng: -73.9760 }, tier: 1, kind: 'park',       name: 'Riverside Park',            areaSize: 1.30  },
+  ],
+
+  // NYC Hudson River Greenway — the Hudson waterfront path, popular runner
+  // corridor. Out-and-back along the river is the canonical case.
+  '40.772,-73.993': [
+    { point: { lat: 40.7720, lng: -73.9930 }, tier: 1, kind: 'waterfront', name: 'Hudson River Greenway',     areaSize: 0     },
+    { point: { lat: 40.7910, lng: -73.9760 }, tier: 1, kind: 'park',       name: 'Riverside Park',            areaSize: 1.30  },
+    { point: { lat: 40.7830, lng: -73.9854 }, tier: 1, kind: 'park',       name: 'DeWitt Clinton Park',       areaSize: 0.020 },
+    { point: { lat: 40.7660, lng: -73.9920 }, tier: 1, kind: 'waterfront', name: 'Hudson River Park',         areaSize: 0     },
+    { point: { lat: 40.7677, lng: -73.9870 }, tier: 2, kind: 'park',       name: "Hell's Kitchen Park",       areaSize: 0.005 },
+  ],
+
+  // NYC Prospect Park (Brooklyn) — second-most popular running park.
+  // Start on the loop drive.
+  '40.660,-73.969': [
+    { point: { lat: 40.6602, lng: -73.9690 }, tier: 1, kind: 'park',       name: 'Prospect Park',             areaSize: 2.13  },
+    { point: { lat: 40.6710, lng: -73.9710 }, tier: 1, kind: 'park',       name: 'Long Meadow',               areaSize: 0.30  },
+    { point: { lat: 40.6710, lng: -73.9626 }, tier: 1, kind: 'park',       name: 'Brooklyn Botanic Garden',   areaSize: 0.21  },
+    { point: { lat: 40.6677, lng: -73.9716 }, tier: 1, kind: 'park',       name: 'The Nethermead',            areaSize: 0.08  },
+    { point: { lat: 40.6549, lng: -73.9700 }, tier: 1, kind: 'park',       name: 'Prospect Park Lake',        areaSize: 0.24  },
+  ],
 };
 
 /** Lookup by fixture center coords. Returns undefined if no synthetic data exists. */

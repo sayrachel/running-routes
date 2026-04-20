@@ -2015,11 +2015,13 @@ export async function generateOSRMRoutes(
       // doublebacks, and other "visibly broken" patterns that aren't a clean
       // U-turn but still register as 30%+ retrace + overlap. Out-and-back
       // routes exempt — their retrace IS the route.
-      // Threshold tuned at retrace+overlap > 0.50 (combined). Per-metric
+      // Threshold tuned at retrace+overlap > 0.35 (combined). Per-metric
       // thresholds (>0.25 each) caused regressions in areas where ALL
-      // candidates had moderate retrace (no clean option), while the
-      // combined threshold only fires when BOTH metrics are very high.
-      if (routeType !== 'out-and-back' && (retraced + overlap) > 0.50) {
+      // candidates had moderate retrace (no clean option). Initial combined
+      // threshold of 0.50 only fired on the most extreme cases; tightening
+      // to 0.35 catches the columbus-7mi and east-village-5mi-out class
+      // (visible 21%/19% backtracking that the user can plainly see).
+      if (routeType !== 'out-and-back' && (retraced + overlap) > 0.35) {
         traceEmit('candidate-rejected', { i, reason: 'backtrack', retraced, overlap });
         continue;
       }

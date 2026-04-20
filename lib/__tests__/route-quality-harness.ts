@@ -67,6 +67,21 @@ const FIXTURES: Fixture[] = [
   { name: 'nyc-greenpoint-4mi-out',     center: { lat: 40.718,  lng: -73.961  }, distanceMi: 4, routeType: 'out-and-back', prefs: { lowTraffic: true  } },
   { name: 'nyc-uws-5mi-out',            center: { lat: 40.7850, lng: -73.9750 }, distanceMi: 5, routeType: 'out-and-back', prefs: { lowTraffic: false } },
 
+  // Popular runner starts — INSIDE Central Park, on Hudson Greenway, etc.
+  // Production users overwhelmingly start from these locations; absence of
+  // coverage hid the dense-park-interior cases.
+  { name: 'nyc-central-park-3mi-loop',  center: { lat: 40.7829, lng: -73.9654 }, distanceMi: 3, routeType: 'loop',         prefs: { lowTraffic: false } },
+  { name: 'nyc-central-park-6mi-loop',  center: { lat: 40.7829, lng: -73.9654 }, distanceMi: 6, routeType: 'loop',         prefs: { lowTraffic: false } },
+  { name: 'nyc-hudson-greenway-5mi',    center: { lat: 40.7720, lng: -73.9930 }, distanceMi: 5, routeType: 'out-and-back', prefs: { lowTraffic: false } },
+  { name: 'nyc-prospect-park-4mi-loop', center: { lat: 40.6602, lng: -73.9690 }, distanceMi: 4, routeType: 'loop',         prefs: { lowTraffic: false } },
+
+  // Edge distances — half-miles and 7mi (the harness only had whole miles
+  // 1-6,8,10). These uncover cases where the geometric scaling lands at
+  // an awkward intermediate radius.
+  { name: 'nyc-east-village-1_5mi-loop', center: { lat: 40.7280, lng: -73.9920 }, distanceMi: 1.5, routeType: 'loop', prefs: { lowTraffic: true } },
+  { name: 'nyc-greenpoint-2_5mi-loop',   center: { lat: 40.718,  lng: -73.961  }, distanceMi: 2.5, routeType: 'loop', prefs: { lowTraffic: true } },
+  { name: 'nyc-columbus-7mi-loop',       center: { lat: 40.768,  lng: -73.982  }, distanceMi: 7,   routeType: 'loop', prefs: { lowTraffic: false } },
+
   // SF — hills + waterfront
   { name: 'sf-embarcadero-4mi-loop',    center: { lat: 37.795, lng: -122.394 }, distanceMi: 4, routeType: 'loop',         prefs: { lowTraffic: false } },
   { name: 'sf-embarcadero-3mi-out',     center: { lat: 37.795, lng: -122.394 }, distanceMi: 3, routeType: 'out-and-back', prefs: { lowTraffic: true } },
@@ -185,13 +200,18 @@ function applyThresholds(f: Fixture, m: RouteMetrics): string[] {
   // the UI, the user thinks they got the wrong route. Stricter than the ±20%
   // distanceErrorPct check (which is a coarse guard against catastrophic
   // failures like the pre-fix 1.95mi-for-4mi-target bug).
-  const rounded = Math.round(m.distanceMi);
-  if (rounded !== f.distanceMi) {
-    failures.push(
-      `rounds to ${rounded}mi, not requested ${f.distanceMi}mi ` +
-      `(actual ${m.distanceMi.toFixed(2)}mi — needs to be ` +
-      `[${(f.distanceMi - 0.5).toFixed(1)}, ${(f.distanceMi + 0.5).toFixed(1)}))`
-    );
+  // Skipped for non-integer distances (1.5mi, 2.5mi etc) — those are
+  // exploratory fixtures probing edge-distance behavior; the round check
+  // only applies to whole-mile requests where the UI shows "X mi".
+  if (Number.isInteger(f.distanceMi)) {
+    const rounded = Math.round(m.distanceMi);
+    if (rounded !== f.distanceMi) {
+      failures.push(
+        `rounds to ${rounded}mi, not requested ${f.distanceMi}mi ` +
+        `(actual ${m.distanceMi.toFixed(2)}mi — needs to be ` +
+        `[${(f.distanceMi - 0.5).toFixed(1)}, ${(f.distanceMi + 0.5).toFixed(1)}))`
+      );
+    }
   }
 
   if (m.distanceErrorPct > t.maxDistanceErrorPct) {
