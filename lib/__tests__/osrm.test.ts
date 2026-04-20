@@ -10,6 +10,7 @@ import {
   scoreGreenSpace,
   estimateCircuitDistance,
   countStubs,
+  trimStubs,
 } from '../osrm';
 import type { CandidateStrategy } from '../osrm';
 import type { RoutePoint } from '../route-generator';
@@ -330,5 +331,99 @@ describe('countStubs', () => {
 
   it('returns 0 for routes shorter than 4 points', () => {
     expect(countStubs([{ lat: 0, lng: 0 }, { lat: 0.1, lng: 0 }, { lat: 0.2, lng: 0 }])).toBe(0);
+  });
+
+  // Build 23 user-reported regression: a route with a 280m peninsula stub
+  // (e.g. shooting out to a waterfront strip and U-turning back) was visible
+  // to the user but slipped past detection because the original 150m default
+  // skipped any stub with out-leg > 150m. Both detection AND trimming need
+  // the wider window.
+  function makeMidsizedStubRoute(outLegM: number, backLegM: number): RoutePoint[] {
+    const start = { lat: 40.7, lng: -74.0 };
+    const points: RoutePoint[] = [start];
+    // East 'outLegM' in 25m steps — the kind of multi-segment out-leg that
+    // OSRM emits when the runner leaves the main path through a few
+    // consecutive intersections.
+    const outSteps = Math.max(1, Math.round(outLegM / 25));
+    for (let i = 1; i <= outSteps; i++) {
+      points.push(destinationPoint(start, 90, (outLegM / 1000) * (i / outSteps)));
+    }
+    const stubTip = points[points.length - 1];
+    // U-turn — back 'backLegM' (also in 25m steps), then resume original
+    // direction.
+    const backSteps = Math.max(1, Math.round(backLegM / 25));
+    for (let i = 1; i <= backSteps; i++) {
+      points.push(destinationPoint(stubTip, 270, (backLegM / 1000) * (i / backSteps)));
+    }
+    const stubBack = points[points.length - 1];
+    // Continue south 500m so the route resumes after the stub (gives
+    // findStubBackEnd a clean "resumed" signal).
+    for (let i = 1; i <= 20; i++) {
+      points.push(destinationPoint(stubBack, 180, 0.025 * i));
+    }
+    return points;
+  }
+
+  it('detects a 280m out / 280m back peninsula stub at the default threshold', () => {
+    // Matches the user's Build 23 N. Williamsburg screenshot pattern.
+    expect(countStubs(makeMidsizedStubRoute(280, 280))).toBe(1);
+  });
+
+  it('does not double-count a stub when out-leg is just under threshold', () => {
+    // 290m out, 290m back — within the 300m default but only just; should
+    // still count exactly once.
+    expect(countStubs(makeMidsizedStubRoute(290, 290))).toBe(1);
+  });
+});
+
+describe('trimStubs', () => {
+  function destinationPointHelper(p: RoutePoint, bearing: number, distKm: number): RoutePoint {
+    return destinationPoint(p, bearing, distKm);
+  }
+
+  function buildStubbyRoute(outLegM: number, backLegM: number): RoutePoint[] {
+    const start = { lat: 40.7, lng: -74.0 };
+    const points: RoutePoint[] = [start];
+    const outSteps = Math.max(1, Math.round(outLegM / 25));
+    for (let i = 1; i <= outSteps; i++) {
+      points.push(destinationPointHelper(start, 90, (outLegM / 1000) * (i / outSteps)));
+    }
+    const stubTip = points[points.length - 1];
+    const backSteps = Math.max(1, Math.round(backLegM / 25));
+    for (let i = 1; i <= backSteps; i++) {
+      points.push(destinationPointHelper(stubTip, 270, (backLegM / 1000) * (i / backSteps)));
+    }
+    const stubBack = points[points.length - 1];
+    for (let i = 1; i <= 20; i++) {
+      points.push(destinationPointHelper(stubBack, 180, 0.025 * i));
+    }
+    return points;
+  }
+
+  it('trims a 280m peninsula stub at the default 300m threshold', () => {
+    // The user's Build 23 spur was ~280m each way. With the old 150m
+    // default, trimStubs left the stub untouched and the user saw it on
+    // the map. The 300m default trims it.
+    const stubby = buildStubbyRoute(280, 280);
+    const trimmed = trimStubs(stubby);
+    expect(trimmed.length).toBeLessThan(stubby.length);
+    // Trimmed route should have NO countable stubs left.
+    expect(countStubs(trimmed)).toBe(0);
+  });
+
+  it('still trims a 100m stub (regression: short stubs already worked)', () => {
+    const stubby = buildStubbyRoute(100, 100);
+    const trimmed = trimStubs(stubby);
+    expect(countStubs(trimmed)).toBe(0);
+  });
+
+  it('does not trim a 500m stub (above the default threshold)', () => {
+    // 500m peninsulas might be intentional — leave them alone unless the
+    // caller passes a wider maxStubLenKm. This is the safety boundary that
+    // prevents over-aggressive trimming on legitimate long detours.
+    const stubby = buildStubbyRoute(500, 500);
+    const trimmed = trimStubs(stubby);
+    // Polyline should be unchanged — same point count (no trim happened).
+    expect(trimmed.length).toBe(stubby.length);
   });
 });

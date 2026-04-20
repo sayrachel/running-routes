@@ -7,6 +7,15 @@ const OVERPASS_URLS = [
 const TIMEOUT_MS = 8000;
 const BBOX_BUFFER_DEG = 0.002; // ~200m buffer in degrees
 
+/**
+ * Maximum search radius — `calculateSearchRadius` clamps to 10km, so all
+ * route requests at a given location can be served from a single Overpass
+ * fetch at this radius. Smaller-radius callers get the same data filtered
+ * in-memory. Declared at module top so prefillOverpassCaches (used by the
+ * harness) can reference it before the function definitions appear below.
+ */
+const MAX_OVERPASS_RADIUS_KM = 10;
+
 /** Enriched green space with metadata for waypoint selection */
 export interface GreenSpace {
   point: RoutePoint;
@@ -56,15 +65,21 @@ export function loadOverpassCaches(snapshot: Partial<OverpassSnapshot>): void {
  * Seed the caches for a (center, radiusKm) under the correct internal key.
  * Used by the test harness to inject synthetic green-space fixtures so the
  * green-space-first algorithm can be exercised when Overpass is unavailable.
+ *
+ * IMPORTANT: must match the key the production code reads from. The combined
+ * `fetchGreenSpacesAndHighways` always queries at MAX_OVERPASS_RADIUS_KM and
+ * filters in-memory, so we cache under that same key — otherwise the prefill
+ * silently misses and the algorithm runs against an empty cache (geometric
+ * fallback), which is NOT the path production users hit.
  */
 export function prefillOverpassCaches(
   center: RoutePoint,
-  radiusKm: number,
+  _radiusKm: number,
   greenSpaces: GreenSpace[],
   highwayPoints: RoutePoint[],
 ): void {
-  enrichedGreenSpaceCache.set(locationKey('enriched', center, radiusKm), greenSpaces);
-  highwayCache.set(locationKey('highway', center, radiusKm), highwayPoints);
+  enrichedGreenSpaceCache.set(locationKey('enriched', center, MAX_OVERPASS_RADIUS_KM), greenSpaces);
+  highwayCache.set(locationKey('highway', center, MAX_OVERPASS_RADIUS_KM), highwayPoints);
 }
 
 /**
@@ -522,14 +537,6 @@ export async function fetchHighwaySegments(
     return [];
   }
 }
-
-/**
- * Maximum search radius — `calculateSearchRadius` clamps to 10km, so all
- * route requests at a given location can be served from a single Overpass
- * fetch at this radius. Smaller-radius callers get the same data filtered
- * in-memory.
- */
-const MAX_OVERPASS_RADIUS_KM = 10;
 
 /**
  * Fetch enriched green spaces and major-highway centers in a single Overpass

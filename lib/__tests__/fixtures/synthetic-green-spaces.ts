@@ -56,6 +56,21 @@ export const SYNTHETIC_GREEN_SPACES: Record<string, GreenSpace[]> = {
     { point: { lat: 40.7100, lng: -73.9695 }, tier: 2, kind: 'park',       name: 'Grand Ferry Park',          areaSize: 0.012 },
   ],
 
+  // NYC N. Williamsburg / Greenpoint border — matches the user's Build 23
+  // screenshot start (N 4th & Wythe area). Parks include McCarren (north),
+  // Bushwick Inlet (NW waterfront), Marsha P. Johnson State Park (further
+  // west on the waterfront — note this is a thin riverfront strip with only
+  // one road in/out, exactly the geometry that triggers stub-detour spurs).
+  '40.718,-73.961': [
+    { point: { lat: 40.7203, lng: -73.9525 }, tier: 1, kind: 'park',       name: 'McCarren Park',             areaSize: 0.14  },
+    { point: { lat: 40.7220, lng: -73.9613 }, tier: 1, kind: 'park',       name: 'Bushwick Inlet Park',       areaSize: 0.045 },
+    { point: { lat: 40.7240, lng: -73.9617 }, tier: 1, kind: 'park',       name: 'East River State Park',     areaSize: 0.055 },
+    { point: { lat: 40.7280, lng: -73.9655 }, tier: 1, kind: 'park',       name: 'Marsha P. Johnson State Park', areaSize: 0.022 },
+    { point: { lat: 40.7144, lng: -73.9685 }, tier: 1, kind: 'waterfront', name: 'Domino Park',               areaSize: 0.024 },
+    { point: { lat: 40.7295, lng: -73.9590 }, tier: 1, kind: 'waterfront', name: 'WNYC Transmitter Park',     areaSize: 0.012 },
+    { point: { lat: 40.7325, lng: -73.9590 }, tier: 1, kind: 'park',       name: 'Msgr. McGolrick Park',      areaSize: 0.025 },
+  ],
+
   // SF Embarcadero — water on the east; green spaces hug the shoreline + west.
   '37.795,-122.394': [
     { point: { lat: 37.7956, lng: -122.3932 }, tier: 1, kind: 'waterfront', name: 'Embarcadero Promenade',    areaSize: 0     },
@@ -91,6 +106,63 @@ export const SYNTHETIC_GREEN_SPACES: Record<string, GreenSpace[]> = {
     { point: { lat: 42.3550, lng: -71.0816 }, tier: 1, kind: 'waterfront', name: 'Charles River Esplanade',   areaSize: 0     },
     { point: { lat: 42.3500, lng: -71.0850 }, tier: 1, kind: 'park',       name: 'Commonwealth Avenue Mall',  areaSize: 0.025 },
     { point: { lat: 42.3500, lng: -71.0760 }, tier: 2, kind: 'park',       name: 'Copley Square',             areaSize: 0.012 },
+  ],
+
+  // NYC Tribeca / FiDi — water on three sides (Hudson W, East River E, harbor S).
+  '40.717,-74.008': [
+    { point: { lat: 40.7115, lng: -74.0150 }, tier: 1, kind: 'park',       name: 'Battery Park City',         areaSize: 0.12  },
+    { point: { lat: 40.7039, lng: -74.0170 }, tier: 1, kind: 'park',       name: 'The Battery',               areaSize: 0.10  },
+    { point: { lat: 40.7196, lng: -74.0090 }, tier: 1, kind: 'park',       name: 'Washington Market Park',    areaSize: 0.012 },
+    { point: { lat: 40.7172, lng: -74.0140 }, tier: 1, kind: 'waterfront', name: 'Hudson River Greenway',     areaSize: 0     },
+    { point: { lat: 40.7090, lng: -74.0035 }, tier: 1, kind: 'park',       name: 'City Hall Park',            areaSize: 0.025 },
+    { point: { lat: 40.7234, lng: -74.0090 }, tier: 2, kind: 'park',       name: 'Duarte Square',             areaSize: 0.005 },
+    { point: { lat: 40.7188, lng: -74.0050 }, tier: 2, kind: 'park',       name: 'Tribeca Park',              areaSize: 0.004 },
+  ],
+
+  // NYC Upper West Side — Central Park to the east, Riverside Park along Hudson.
+  '40.785,-73.975': [
+    { point: { lat: 40.7829, lng: -73.9654 }, tier: 1, kind: 'park',       name: 'Central Park',              areaSize: 3.41  },
+    { point: { lat: 40.7910, lng: -73.9760 }, tier: 1, kind: 'park',       name: 'Riverside Park',            areaSize: 1.30  },
+    { point: { lat: 40.7912, lng: -73.9737 }, tier: 1, kind: 'park',       name: 'Joan of Arc Park',          areaSize: 0.005 },
+    { point: { lat: 40.7787, lng: -73.9853 }, tier: 1, kind: 'waterfront', name: 'Hudson River Greenway',     areaSize: 0     },
+    { point: { lat: 40.7920, lng: -73.9670 }, tier: 1, kind: 'park',       name: 'Theodore Roosevelt Park',   areaSize: 0.075 },
+  ],
+
+  // NYC Upper East Side — Central Park west, East River + Carl Schurz east.
+  '40.777,-73.958': [
+    { point: { lat: 40.7794, lng: -73.9632 }, tier: 1, kind: 'park',       name: 'Central Park',              areaSize: 3.41  },
+    { point: { lat: 40.7773, lng: -73.9442 }, tier: 1, kind: 'park',       name: 'Carl Schurz Park',          areaSize: 0.060 },
+    { point: { lat: 40.7706, lng: -73.9512 }, tier: 1, kind: 'park',       name: 'John Jay Park',             areaSize: 0.014 },
+    { point: { lat: 40.7773, lng: -73.9437 }, tier: 1, kind: 'waterfront', name: 'East River Esplanade',      areaSize: 0     },
+    { point: { lat: 40.7784, lng: -73.9618 }, tier: 1, kind: 'park',       name: 'Engineers Gate',            areaSize: 0     },
+  ],
+
+  // NYC Chelsea — Hudson River Park to west, High Line cuts through, Madison Sq south.
+  '40.747,-74.002': [
+    { point: { lat: 40.7480, lng: -74.0086 }, tier: 1, kind: 'waterfront', name: 'Hudson River Park',         areaSize: 0     },
+    { point: { lat: 40.7480, lng: -74.0048 }, tier: 1, kind: 'route',      name: 'High Line',                 areaSize: 0     },
+    { point: { lat: 40.7423, lng: -73.9881 }, tier: 1, kind: 'park',       name: 'Madison Square Park',       areaSize: 0.027 },
+    { point: { lat: 40.7505, lng: -74.0020 }, tier: 1, kind: 'park',       name: 'Chelsea Park',              areaSize: 0.012 },
+    { point: { lat: 40.7398, lng: -73.9960 }, tier: 1, kind: 'park',       name: 'Union Square Park',         areaSize: 0.024 },
+    { point: { lat: 40.7536, lng: -74.0040 }, tier: 2, kind: 'park',       name: 'Chelsea Waterside Park',    areaSize: 0.014 },
+  ],
+
+  // NYC Brooklyn Heights — narrow grid + Brooklyn Bridge Park along East River.
+  '40.696,-73.994': [
+    { point: { lat: 40.7008, lng: -73.9966 }, tier: 1, kind: 'waterfront', name: 'Brooklyn Bridge Park',      areaSize: 0.34  },
+    { point: { lat: 40.6952, lng: -73.9937 }, tier: 1, kind: 'park',       name: 'Brooklyn Heights Promenade', areaSize: 0.014 },
+    { point: { lat: 40.6920, lng: -73.9906 }, tier: 1, kind: 'park',       name: 'Cadman Plaza Park',         areaSize: 0.040 },
+    { point: { lat: 40.6900, lng: -73.9810 }, tier: 1, kind: 'park',       name: 'Fort Greene Park',          areaSize: 0.120 },
+    { point: { lat: 40.6905, lng: -73.9871 }, tier: 2, kind: 'park',       name: 'Walt Whitman Park',         areaSize: 0.008 },
+  ],
+
+  // NYC DUMBO — pocket between bridges, water-bounded.
+  '40.703,-73.989': [
+    { point: { lat: 40.7027, lng: -73.9922 }, tier: 1, kind: 'waterfront', name: 'Brooklyn Bridge Park',      areaSize: 0.34  },
+    { point: { lat: 40.7019, lng: -73.9890 }, tier: 1, kind: 'park',       name: 'Pearl Street Triangle',     areaSize: 0.001 },
+    { point: { lat: 40.7045, lng: -73.9870 }, tier: 1, kind: 'park',       name: 'Main Street Park',          areaSize: 0.008 },
+    { point: { lat: 40.6972, lng: -73.9858 }, tier: 1, kind: 'park',       name: 'Cadman Plaza Park',         areaSize: 0.040 },
+    { point: { lat: 40.7010, lng: -73.9933 }, tier: 1, kind: 'waterfront', name: 'Empire Fulton Ferry',       areaSize: 0     },
   ],
 };
 

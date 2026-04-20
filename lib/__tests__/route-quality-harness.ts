@@ -13,7 +13,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { generateOSRMRoutes, retraceRatio, overlapSegmentRatio, haversineDistance, calculateSearchRadius, dumpOSRMCache, loadOSRMCache, setOSRMCacheMax, setOSRMMock, setDeterministicSeed, countStubs, setOSRMBase } from '../osrm';
+import { generateOSRMRoutes, retraceRatio, overlapSegmentRatio, haversineDistance, calculateSearchRadius, dumpOSRMCache, loadOSRMCache, setOSRMCacheMax, setOSRMMock, setDeterministicSeed, countStubs, setOSRMBase, clearOSRMCache } from '../osrm';
 import { fetchGreenSpacesAndHighways, dumpOverpassCaches, loadOverpassCaches, prefillOverpassCaches } from '../overpass';
 import { computeGreenSpaceProximity } from '../route-scoring';
 import type { RoutePoint, RoutePreferences } from '../route-generator';
@@ -52,6 +52,20 @@ const FIXTURES: Fixture[] = [
   { name: 'nyc-les-3mi-out-quiet',      center: { lat: 40.715, lng: -73.985 }, distanceMi: 3, routeType: 'out-and-back', prefs: { lowTraffic: true } },
   { name: 'nyc-columbus-5mi-loop',      center: { lat: 40.768, lng: -73.982 }, distanceMi: 5, routeType: 'loop',         prefs: { lowTraffic: false } },
   { name: 'nyc-williamsburg-4mi-loop',  center: { lat: 40.714, lng: -73.961 }, distanceMi: 4, routeType: 'loop',         prefs: { lowTraffic: true } },
+  // N. Williamsburg / Greenpoint — Build 23 user-reported spur (small westward
+  // detour to Marsha P. Johnson State Park strip). Start matches actual
+  // production blue-dot location, not the existing south-Williamsburg fixture.
+  { name: 'nyc-greenpoint-4mi-loop-quiet', center: { lat: 40.718, lng: -73.961 }, distanceMi: 4, routeType: 'loop',     prefs: { lowTraffic: true } },
+  { name: 'nyc-greenpoint-3mi-loop-quiet', center: { lat: 40.718, lng: -73.961 }, distanceMi: 3, routeType: 'loop',     prefs: { lowTraffic: true } },
+  { name: 'nyc-greenpoint-5mi-loop-quiet', center: { lat: 40.718, lng: -73.961 }, distanceMi: 5, routeType: 'loop',     prefs: { lowTraffic: true } },
+
+  // More out-and-back coverage — only one before this. OAB routes have
+  // distinct algorithm path (skip lollipop, exempt retrace/overlap/stubs)
+  // so under-coverage means OAB regressions hide.
+  { name: 'nyc-east-village-3mi-out',   center: { lat: 40.7280, lng: -73.9920 }, distanceMi: 3, routeType: 'out-and-back', prefs: { lowTraffic: false } },
+  { name: 'nyc-east-village-5mi-out',   center: { lat: 40.7280, lng: -73.9920 }, distanceMi: 5, routeType: 'out-and-back', prefs: { lowTraffic: true  } },
+  { name: 'nyc-greenpoint-4mi-out',     center: { lat: 40.718,  lng: -73.961  }, distanceMi: 4, routeType: 'out-and-back', prefs: { lowTraffic: true  } },
+  { name: 'nyc-uws-5mi-out',            center: { lat: 40.7850, lng: -73.9750 }, distanceMi: 5, routeType: 'out-and-back', prefs: { lowTraffic: false } },
 
   // SF — hills + waterfront
   { name: 'sf-embarcadero-4mi-loop',    center: { lat: 37.795, lng: -122.394 }, distanceMi: 4, routeType: 'loop',         prefs: { lowTraffic: false } },
@@ -237,6 +251,12 @@ async function runFixture(f: Fixture, captureTrace: boolean, useSynthetic: boole
   const distKm = f.distanceMi * KM_PER_MI;
   if (captureTrace) enableTrace();
   if (deterministic) setDeterministicSeed(fixtureSeed(f.name));
+  // Clear OSRM cache between fixtures in deterministic mode. Otherwise an
+  // earlier fixture's cached route at the same waypoints (e.g. a popular
+  // intersection in the city grid) leaks into a later fixture's resolution
+  // and the harness becomes order-dependent — a single-fixture run produces
+  // different outputs than the same fixture in a full sweep.
+  if (deterministic) clearOSRMCache();
 
   // In synthetic mode, seed the Overpass caches with hand-crafted green
   // spaces for this location BEFORE the algorithm runs. Lets us exercise the
@@ -416,12 +436,16 @@ async function main() {
   }
   const noMockOsrm = argv.includes('--no-mock-osrm') || osrmBase !== null;
   const mockOsrm = !noMockOsrm && (argv.includes('--mock-osrm') || useSynthetic);
-  // Deterministic seeding: when mocking OSRM, default-on so results are
-  // byte-identical across runs and you can tell whether an algorithm change
-  // helped vs. just shifted the RNG. Production (real OSRM) keeps random
-  // seeding so users get fresh routes on refresh.
+  // Deterministic seeding: default-on for any harness backend that's itself
+  // deterministic (mocked OSRM OR a local OSRM via --osrm-base OR synthetic
+  // green spaces). Without this, getSeed() falls back to Date.now() and
+  // back-to-back harness runs picked completely different candidates — the
+  // pre-Build-23 harness was silently non-deterministic and obscured whether
+  // a change moved pass rate or just shifted the RNG. Production (no
+  // --osrm-base, no --synthetic) keeps random seeding so users see fresh
+  // routes on refresh.
   const noDeterministic = argv.includes('--no-deterministic');
-  const deterministic = !noDeterministic && (argv.includes('--deterministic') || mockOsrm);
+  const deterministic = !noDeterministic && (argv.includes('--deterministic') || mockOsrm || useSynthetic || osrmBase !== null);
   const dumpIdx = argv.indexOf('--dump');
   let dumpPath: string | null = null;
   if (dumpIdx >= 0) {

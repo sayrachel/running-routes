@@ -129,7 +129,7 @@ export function retraceRatio(points: RoutePoint[]): number {
 }
 
 /**
- * Trim dead-end stubs out of a route. A stub is a "go out 50-150m, U-turn,
+ * Trim dead-end stubs out of a route. A stub is a "go out 50-300m, U-turn,
  * come back" pattern that visibly juts off the main path. Trimming replaces
  * the [out-leg, U-turn, back-leg] sequence with a direct connection — the
  * runner just doesn't take the detour. The trimmed polyline is shorter and
@@ -137,8 +137,16 @@ export function retraceRatio(points: RoutePoint[]): number {
  * is identical.
  *
  * Iterates until no more stubs are found (some routes have multiple).
+ *
+ * Default `maxStubLenKm` raised from 0.15 to 0.30 after Build 23: the user
+ * reported a visible spur in N. Williamsburg/Greenpoint where the route
+ * shot ~280m west to a waterfront strip (Marsha P. Johnson State Park area),
+ * U-turned 180°, and came back. The previous 150m cap left this kind of
+ * "peninsula visit" untrimmed because both legs exceeded 150m. The 150°
+ * U-turn requirement is the safety net — only true dead-end visits get
+ * collapsed; a 280m segment that turns 60° (a normal corner) is unaffected.
  */
-export function trimStubs(points: RoutePoint[], maxStubLenKm: number = 0.15): RoutePoint[] {
+export function trimStubs(points: RoutePoint[], maxStubLenKm: number = 0.30): RoutePoint[] {
   if (points.length < 4) return points;
 
   const MAX_PASSES = 6;
@@ -150,6 +158,7 @@ export function trimStubs(points: RoutePoint[], maxStubLenKm: number = 0.15): Ro
   }
   return current;
 }
+
 
 /** Walk backwards from index i through segments aligned with bearing b1,
  *  returning the index where the out-leg starts. */
@@ -222,7 +231,7 @@ function trimOneStub(points: RoutePoint[], maxStubLenKm: number): RoutePoint[] {
  *
  * Returns the count of stubs found.
  */
-export function countStubs(points: RoutePoint[], maxStubLenKm: number = 0.15): number {
+export function countStubs(points: RoutePoint[], maxStubLenKm: number = 0.30): number {
   if (points.length < 4) return 0;
 
   let stubCount = 0;
@@ -1923,9 +1932,28 @@ export async function generateOSRMRoutes(
       // visible stubs — even one ruins the "can the runner follow this as
       // a single path?" property. Out-and-back routes are exempt because
       // their U-turn at the far end is the intended pattern, not a stub.
+      //
+      // Stub threshold scales with target distance, capped at 300m. For long
+      // routes (4mi+) we want the full 300m to catch peninsula visits like
+      // the user's Build 23 N. Williamsburg spur. For short routes (1-2mi)
+      // a 300m "stub" is 20-40% of the route — trimming it would gut the
+      // geometry, producing a 0.7mi route from a 1mi request. Cap at 8% of
+      // target so a 1mi route caps stub trimming at ~130m (no false trims
+      // of natural triangle legs).
+      const stubThresholdKm = Math.min(0.30, distanceKm * 0.08);
       const points = routeType === 'out-and-back'
         ? afterLollipop
-        : trimStubs(afterLollipop);
+        : trimStubs(afterLollipop, stubThresholdKm);
+      // NOTE: an earlier experiment added a "side-trip detector" via
+      // trimDetours() to catch 500m+ peninsula visits with intermediate
+      // turns (which trimStubs misses). It chopped 50%+ off legitimate
+      // loop routes because in a loop, the start and end region naturally
+      // has spatially-close points across a large path span — the
+      // detector flagged loop closure itself as a detour. The hard-reject
+      // (retraced + overlap > 0.50) covers the truly egregious cases;
+      // borderline visible spurs that aren't clean U-turns remain a known
+      // gap. Don't reintroduce trimDetours without solving the loop-
+      // closure false positive.
       if (points !== afterLollipop) {
         let stubKm = 0;
         for (let k = 1; k < points.length; k++) {
@@ -1972,7 +2000,29 @@ export async function generateOSRMRoutes(
       // 50%-retrace step-3.5 fallback.
       const retraced = retraceRatio(points);
       const overlap = overlapSegmentRatio(points);
-      const stubs = countStubs(points);
+      // Match the threshold used by trimStubs above so the count agrees with
+      // what we actually trimmed — otherwise short routes would report
+      // stubs=0 (because countStubs's wider default catches nothing) while
+      // longer routes use the full 300m window.
+      const stubs = countStubs(points, stubThresholdKm);
+      // HARD REJECT: visibly bad backtracking. The user-reported Build 23
+      // spur in N. Williamsburg slipped through because the chooser picked
+      // a candidate with retrace 22%, overlap 13% over rounding-wrong
+      // alternatives — even though the route had a clear out-and-back
+      // peninsula visit. The trimStubs threshold bump (150m → 300m) handles
+      // the truly stub-shaped cases. This belt-and-suspenders threshold
+      // catches what trim missed: rectangular detours, parallel-street
+      // doublebacks, and other "visibly broken" patterns that aren't a clean
+      // U-turn but still register as 30%+ retrace + overlap. Out-and-back
+      // routes exempt — their retrace IS the route.
+      // Threshold tuned at retrace+overlap > 0.50 (combined). Per-metric
+      // thresholds (>0.25 each) caused regressions in areas where ALL
+      // candidates had moderate retrace (no clean option), while the
+      // combined threshold only fires when BOTH metrics are very high.
+      if (routeType !== 'out-and-back' && (retraced + overlap) > 0.50) {
+        traceEmit('candidate-rejected', { i, reason: 'backtrack', retraced, overlap });
+        continue;
+      }
       // Quality score: 0 = perfect, higher = worse. Out-and-back is exempt
       // from retrace/overlap. Components:
       //   retrace + overlap: visible polyline ugliness

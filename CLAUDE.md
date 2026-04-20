@@ -84,3 +84,103 @@ Speed wins kept in Build 22:
 - OSRM cache persisted to AsyncStorage (`lib/osrm-persist.ts`) — repeat generations from the same start hit cache on the recurring green-space anchors.
 - Overpass cache persistence (already shipped Build 21, kept).
 - OSRM connection prewarm on `ctx.center` becoming available (already shipped Build 21, kept).
+
+### Build 23 spur regression (Apr 2026)
+
+User reported a visible westward spur on a 4mi N. Williamsburg / Greenpoint quiet
+loop — the route shot ~280m out toward the Marsha P. Johnson State Park
+waterfront strip, U-turned 180°, came back, and continued. This kind of
+"peninsula visit" was technically a stub but slipped past every detector.
+
+Root causes:
+16. **`trimStubs` `maxStubLenKm` was 150m by default.** The user's spur had
+   ~280m out and ~280m back, so `findStubOutStart` saw out.len > maxLen and
+   skipped trimming. Spurs from 150m–500m sailed through. Fix: bump default
+   to 300m. Catches the common 200–300m peninsula stubs without trimming
+   genuine 500m+ peninsulas (those might be intentional).
+17. **The chooser preferred candidates with visible backtracking over
+   alternatives that just rounded to the wrong mile.** A candidate with
+   retrace 22% / overlap 13% (clearly broken-looking) won at quality
+   penalty 0.45 because alternatives carried a 0.4 rounding penalty (e.g.
+   "rounds to 3mi when you asked for 4mi"). Fix: hard-reject any candidate
+   where `retrace + overlap > 0.50` — only fires on truly egregious cases,
+   doesn't regress areas where ALL candidates are moderately retrace-y.
+
+Harness gaps that hid this from CI:
+18. **`prefillOverpassCaches` keyed at the per-fixture radius, but
+   `fetchGreenSpacesAndHighways` always reads at `MAX_OVERPASS_RADIUS_KM`
+   (10km).** The keys never matched, so synthetic green spaces silently
+   never loaded. Every `--synthetic` harness run was actually testing the
+   geometric-fallback path, NOT the green-space-first algorithm production
+   users actually hit. Fix: prefill at `MAX_OVERPASS_RADIUS_KM` to match.
+19. **`--osrm-base` disabled deterministic seeding.** The flag set
+   `mockOsrm = false`, which gated `deterministic` to off, which left
+   `getSeed()` falling back to `Date.now()`. Variants differed across runs,
+   so the same fixture produced different routes and the harness was
+   effectively non-deterministic — making it impossible to tell whether a
+   change moved pass rate or just shifted the RNG. Fix: any harness backend
+   that's itself deterministic (mock OSRM, local OSRM via --osrm-base, or
+   --synthetic) implies deterministic seeding.
+20. **No fixture matched the user's actual start.** The closest fixture
+   was `nyc-williamsburg-4mi-loop` at (40.714, -73.961), but the user's
+   blue dot was at ~(40.718, -73.961) — the N. Williamsburg / Greenpoint
+   border, near McCarren Park, with the Marsha P. Johnson waterfront strip
+   pulling waypoints west. Fix: added `nyc-greenpoint-{3,4,5}mi-loop-quiet`
+   fixtures with synthetic green spaces matching the actual neighborhood.
+21. **Harness OSRM cache state from earlier fixtures contaminated later
+   ones.** A single-fixture run produced different output than the same
+   fixture in a full sweep. Fix: `clearOSRMCache()` at the start of each
+   fixture in deterministic mode.
+
+Additional improvements after the spur fix:
+
+22. **`trimStubs` now scales the threshold with target distance.** Default
+   300m is right for 4mi+ routes, but on a 1mi route a 300m "stub" is 20-40%
+   of the route — trimStubs gutted geometry, producing a 0.7mi route from
+   a 1mi request. Fix in `generateOSRMRoutes`:
+   `stubThresholdKm = Math.min(0.30, distanceKm * 0.08)`. So a 1mi route
+   caps stub trims at 130m; a 4mi+ route gets the full 300m. `countStubs`
+   uses the same threshold so the metric agrees with what was trimmed.
+23. **Synthetic green spaces added for Tribeca, UWS, UES, Chelsea, Brooklyn
+   Heights, DUMBO.** Without them these fixtures hit the geometric-fallback
+   path (`[fb]` tag) — the harness reported PASS but wasn't exercising the
+   green-space-first algorithm production users hit. Now they do.
+24. **Tried and reverted: spatial-revisit `trimDetours` detector.** Built
+   to catch 500m+ peninsula visits with intermediate turns (which trimStubs
+   misses because there's no single 150° reversal). The detector flagged
+   loop closure itself as a "detour" — for any loop, the start and end are
+   spatially close with the entire route between them, and various points
+   in the loop pass close to each other naturally. Cut 50%+ off legitimate
+   routes. Don't reintroduce without solving the loop-closure false
+   positive. Borderline cases (the LES 3mi-relaxed 564m peninsula) remain
+   a known gap; the hard-reject covers truly egregious cases (>0.50
+   combined retrace+overlap).
+
+Pre-flight checklist for any future "the harness passes but I see X on the
+map" report:
+- Verify the harness fixture's center matches the user's actual start.
+  If they're 0.5km+ apart, OSRM may pick entirely different streets.
+- Verify `--synthetic` runs are exercising the green-space-first path,
+  not silently falling through to `[fb]` (look for the `[fb]` tag).
+- Verify the harness is deterministic (run the same single-fixture command
+  3x; output should be byte-identical). `--osrm-base`, `--synthetic`, and
+  `--mock-osrm` all imply deterministic seeding now.
+- Pull the chosen route's geometry and run a U-turn detector with a
+  threshold matching what's visible on the map. The current `countStubs`
+  default (300m, scaled to 8% of target) is the floor; visible spurs
+  longer than that won't show in `stubs=N` but will inflate `retr=`
+  and `over=`.
+
+Current real-OSRM pass rates (deterministic, with --synthetic green spaces
+covering 14 of 28 NYC fixtures, all locations):
+- 16/28 pass — the user's reported Greenpoint 4mi spur is fixed.
+- Remaining 12 failures are dominated by:
+  - Distance rounding in dense areas where adjustment loop converges
+    to short routes (chelsea, ues, tribeca, williamsburg).
+  - Inherent location limits — LES 6mi can't fit a clean loop because
+    LES is <1.5km wide N-S between Hudson and East River; LES 1mi is
+    too tight a target for the candidate pool to land on.
+  - Borderline retrace (10-14%) in water-bounded areas (DUMBO 3mi, UWS
+    6mi). Not visibly broken, just over the strict 8% harness threshold.
+- Greenpoint fixtures (3, 4, 5mi) all pass cleanly — the user's exact
+  scenario is covered.
