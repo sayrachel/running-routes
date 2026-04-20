@@ -25,6 +25,9 @@ import { saveRunRecord, addPendingRun, getCachedRunHistory } from '@/lib/firesto
 import { buildGoogleMapsUrl } from '@/lib/route-export';
 import { BottomTabBar } from '@/components/BottomTabBar';
 import { Colors, Fonts } from '@/lib/theme';
+import { generateOSRMRoutes } from '@/lib/osrm';
+import { persistOverpassCache } from '@/lib/overpass-persist';
+import { persistOSRMCache } from '@/lib/osrm-persist';
 
 function formatTime(seconds: number): string {
   const h = Math.floor(seconds / 3600);
@@ -236,6 +239,52 @@ export default function RunScreen() {
     }
   }, [routeIndex, ctx]);
 
+  // Regenerate the current route with the same parameters. Production seeds
+  // candidate variants with Date.now() so each call produces different
+  // waypoints — the user sees a fresh route, not a cache replay.
+  // The OSRM cache itself is keyed by exact waypoint coords, so cache hits
+  // happen only if the new variant lands on identical waypoints (rare).
+  const handleRefresh = useCallback(async () => {
+    if (ctx.isGenerating || hasStarted) return;
+
+    const distanceKm = ctx.prefs.units === 'metric'
+      ? ctx.distance
+      : ctx.distance * 1.60934;
+
+    ctx.setRoutes([]);
+    ctx.setSelectedRoute(null);
+    ctx.setIsGenerating(true);
+    setRouteIndex(0);
+
+    try {
+      const newRoutes = await generateOSRMRoutes(
+        ctx.center,
+        distanceKm,
+        ctx.routeStyle === 'point-to-point' ? 'point-to-point'
+          : ctx.routeStyle === 'out-and-back' ? 'out-and-back'
+          : 'loop',
+        1,
+        ctx.prefs,
+        ctx.endLocation,
+      );
+      if (newRoutes.length === 0) {
+        // Don't strand the user on a blank screen — bounce back to plan.
+        ctx.setIsGenerating(false);
+        router.replace('/');
+        return;
+      }
+      ctx.setRoutes(newRoutes);
+      ctx.setSelectedRoute(newRoutes[0]);
+      ctx.setIsGenerating(false);
+      persistOverpassCache();
+      persistOSRMCache();
+    } catch (err) {
+      console.warn('Route refresh failed:', err);
+      ctx.setIsGenerating(false);
+      router.replace('/');
+    }
+  }, [ctx, hasStarted, router]);
+
   // Real GPS-derived stats
   const { totalDistanceKm, elapsedSeconds, currentPace, avgPace, splits, coordinates, currentPosition } = tracking.stats;
   const isMetric = ctx.prefs.units === 'metric';
@@ -326,9 +375,20 @@ export default function RunScreen() {
           <View style={[styles.headerSide, { alignItems: 'flex-end' }]}>
             <View style={styles.headerActions}>
               {ctx.selectedRoute && !hasStarted && !isFinished && (
-                <Pressable onPress={handleOpenGoogleMaps} style={styles.headerIconBtn}>
-                  <Ionicons name="open-outline" size={16} color={Colors.mutedForeground} />
-                </Pressable>
+                <>
+                  <Pressable
+                    onPress={handleRefresh}
+                    disabled={ctx.isGenerating}
+                    style={[styles.headerIconBtn, ctx.isGenerating && { opacity: 0.4 }]}
+                    hitSlop={8}
+                    accessibilityLabel="Generate a different route"
+                  >
+                    <Ionicons name="refresh" size={16} color={Colors.mutedForeground} />
+                  </Pressable>
+                  <Pressable onPress={handleOpenGoogleMaps} style={styles.headerIconBtn}>
+                    <Ionicons name="open-outline" size={16} color={Colors.mutedForeground} />
+                  </Pressable>
+                </>
               )}
             </View>
           </View>
