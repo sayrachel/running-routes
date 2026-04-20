@@ -375,20 +375,9 @@ export default function RunScreen() {
           <View style={[styles.headerSide, { alignItems: 'flex-end' }]}>
             <View style={styles.headerActions}>
               {ctx.selectedRoute && !hasStarted && !isFinished && (
-                <>
-                  <Pressable
-                    onPress={handleRefresh}
-                    disabled={ctx.isGenerating}
-                    style={[styles.headerIconBtn, ctx.isGenerating && { opacity: 0.4 }]}
-                    hitSlop={8}
-                    accessibilityLabel="Generate a different route"
-                  >
-                    <Ionicons name="refresh" size={16} color={Colors.mutedForeground} />
-                  </Pressable>
-                  <Pressable onPress={handleOpenGoogleMaps} style={styles.headerIconBtn}>
-                    <Ionicons name="open-outline" size={16} color={Colors.mutedForeground} />
-                  </Pressable>
-                </>
+                <Pressable onPress={handleOpenGoogleMaps} style={styles.headerIconBtn}>
+                  <Ionicons name="open-outline" size={16} color={Colors.mutedForeground} />
+                </Pressable>
               )}
             </View>
           </View>
@@ -425,19 +414,30 @@ export default function RunScreen() {
             </View>
           ) : (
           <>
-          {/* Favorite button */}
+          {/* Favorite + refresh actions */}
           {ctx.routes.length >= 1 && !hasStarted && (
             <View style={styles.routeSelector}>
               <Text style={styles.routeCounter}>
                 {ctx.selectedRoute?.name || 'Route'}
               </Text>
-              <Pressable onPress={handleToggleFavorite} hitSlop={8} style={styles.routeFavBtn}>
-                <Ionicons
-                  name={isFavorited ? 'heart' : 'heart-outline'}
-                  size={18}
-                  color={isFavorited ? Colors.destructive : Colors.mutedForeground}
-                />
-              </Pressable>
+              <View style={styles.routeActions}>
+                <Pressable
+                  onPress={handleRefresh}
+                  disabled={ctx.isGenerating}
+                  hitSlop={8}
+                  style={[styles.routeActionBtn, ctx.isGenerating && { opacity: 0.4 }]}
+                  accessibilityLabel="Generate a different route"
+                >
+                  <Ionicons name="refresh" size={18} color={Colors.mutedForeground} />
+                </Pressable>
+                <Pressable onPress={handleToggleFavorite} hitSlop={8} style={styles.routeActionBtn}>
+                  <Ionicons
+                    name={isFavorited ? 'heart' : 'heart-outline'}
+                    size={18}
+                    color={isFavorited ? Colors.destructive : Colors.mutedForeground}
+                  />
+                </Pressable>
+              </View>
             </View>
           )}
 
@@ -623,9 +623,14 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: Colors.mutedForeground,
   },
-  routeFavBtn: {
+  routeActions: {
     position: 'absolute',
     right: 0,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+  },
+  routeActionBtn: {
     width: 32,
     height: 32,
     borderRadius: 16,
