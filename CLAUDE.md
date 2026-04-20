@@ -7,6 +7,21 @@
 - Build command: `eas build --platform ios --profile production --non-interactive` (uses global `eas` at `/opt/homebrew/bin/eas`)
 - Submit command: `eas submit --platform ios --latest` — **must be run by the user in a separate terminal** (requires interactive Apple authentication, cannot run non-interactively)
 
+## Production OSRM Constraints — READ BEFORE TOUCHING `lib/osrm.ts`
+
+Production hits the **free public** `router.project-osrm.org` endpoint. It is rate-limited and tail-latency-prone. Concrete lessons from past regressions:
+
+- **Total simultaneous request count matters more than per-candidate math.** A change that "only adds 2 parallel calls per candidate" with 7 candidates = 21 simultaneous requests. The endpoint will throttle that burst and return nulls. Keep the steady-state in-flight count ≤ candidate count (currently 7).
+- **The harness does NOT validate against the public endpoint.** `--synthetic` uses mock OSRM (zero latency, zero failure rate). Local OSRM (`--osrm-base http://localhost:5000/...`) has no rate limits. **Neither environment can detect a regression that only manifests under public-OSRM rate limiting.** A "quality bumped X/N → Y/N" number from the harness is a claim about algorithm correctness, NOT about endpoint behavior.
+- **Tail latency on public OSRM is real.** Typical 200-700ms, busy 1-2s, occasional 3-5s spikes. `OSRM_TIMEOUT_MS` is currently 8s. Don't tighten it without a way to measure the resulting null-rate against real users.
+- **NEVER let the algorithm display non-OSRM geometry as a route.** The straight-line-waypoints-as-route bug (Build 21) happened because a fallback branch pushed raw input waypoints when OSRM returned null. If OSRM fails for a candidate: reject it. If all candidates fail: surface "No routes found" rather than draw lines through buildings.
+
+### Pre-flight checklist for any change that touches OSRM call patterns (volume, timeout, hedging, caching)
+
+1. Run `npm test` and `npm run quality -- --synthetic`. Baselines: 268/268 unit tests, 32/33 synthetic harness.
+2. **Manually generate ≥5 routes against public OSRM** from the actual app (or a dev build) before committing the change. Cover: a quick repeat (cache hit case), a fresh location (cold case), and a hard case (water-bounded grid like LES or DUMBO). If any route renders as straight lines or obviously degenerate triangles — STOP and investigate; the harness will not catch this.
+3. Don't ship a perf claim ("X% faster", "wall-clock from A to B") that wasn't measured against the production endpoint. Local/mock numbers are NOT a proxy.
+
 ## Key Files
 
 - `app.json` — Expo config (build number, permissions, plugins)
@@ -54,3 +69,18 @@ Current real-OSRM pass rates (geometric-fallback, no Overpass — production has
 - With `--synthetic` (simulating production Overpass): 15-16/25
 
 Inherent limits — water-bounded tight grids (LES 4-6mi, DUMBO, Brooklyn Heights) can't get clean target-distance loops without retrace. Algorithm makes the best of bad options; harness fails them as designed.
+
+### Build 21 quality regression (Apr 2026, fixed in Build 22)
+
+Three speed-focused commits compounded into a serious regression: short loops rendered as long parallel out-and-backs, triangle "fallbacks" cut through buildings and across the East River as straight lines.
+
+Root causes:
+13. **Hedging tripled OSRM request volume** (1 call per candidate → 3 parallel scaled attempts). With 7 candidates, that's ~21 simultaneous calls hitting public OSRM → rate limiting → many nulls. Harness measured "11/25 → 13/25" because local OSRM has no rate limits. Fix: removed hedging entirely; restored sequential first attempt + iterative refinement.
+14. **5s OSRM timeout was too aggressive** for the public endpoint's tail latency (occasional 3-5s legitimate responses became nulls). Fix: restored 8s.
+15. **Latent bug: when OSRM returned null, the algorithm pushed RAW INPUT WAYPOINTS as the displayed route** (the `else` branch in step 3 of `generateOSRMRoutes`). This had been there since early development but rarely fired because OSRM rarely failed. Build 21's hedge made nulls common, exposing the bug as straight-line triangles through buildings. Fix: reject candidates with null OSRM routes; if all fail, surface "no routes found" instead of geometric noise.
+
+Speed wins kept in Build 22:
+- Progressive candidate resolution with early exit when `qualityPenalty < 0.20` (most generations exit before the slowest candidate finishes).
+- OSRM cache persisted to AsyncStorage (`lib/osrm-persist.ts`) — repeat generations from the same start hit cache on the recurring green-space anchors.
+- Overpass cache persistence (already shipped Build 21, kept).
+- OSRM connection prewarm on `ctx.center` becoming available (already shipped Build 21, kept).
