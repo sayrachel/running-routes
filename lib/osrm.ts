@@ -1484,6 +1484,18 @@ export function mockOSRMRoute(waypoints: RoutePoint[]): OSRMRoute {
     }
   }
 
+  // Retrace injection (test-only): mirror first `fraction*N` points onto the
+  // tail. The mirrored segment shares both endpoints (rounded to 4dp = ~10m)
+  // with the original, so retraceRatio counts each mirrored segment as
+  // retraced. Used by tests to simulate dense-grid retrace; production keeps
+  // mockOSRMRetraceFraction=0 so the mock route is the simple wobble.
+  if (mockOSRMRetraceFraction > 0 && coords.length > 4) {
+    const mirrorCount = Math.floor(coords.length * mockOSRMRetraceFraction);
+    for (let k = mirrorCount - 1; k >= 0; k--) {
+      coords.push([coords[k][0], coords[k][1]]);
+    }
+  }
+
   let distMeters = 0;
   for (let k = 1; k < coords.length; k++) {
     const p1 = { lat: coords[k - 1][1], lng: coords[k - 1][0] };
@@ -1551,15 +1563,24 @@ function getSeed(): number {
 let mockOSRMLatencyMs = 0;
 let mockOSRMFailureRate = 0;
 let mockOSRMTimeoutRate = 0;
+// Retrace injection: when > 0, mockOSRMRoute appends a mirror of the first
+// `fraction*N` points to the end, creating exact-coordinate retrace at that
+// fraction. Lets tests simulate dense Manhattan-grid behavior where real
+// OSRM produces ~20-40% retrace because one-way streets force backtracking.
+// The pure-wobble mock can't naturally produce this — without injection,
+// any test of "high-retrace candidate handling" would be a no-op.
+let mockOSRMRetraceFraction = 0;
 export function setMockOSRMLatency(ms: number): void { mockOSRMLatencyMs = Math.max(0, ms); }
 export function setMockOSRMFailureRate(rate: number): void { mockOSRMFailureRate = Math.max(0, Math.min(1, rate)); }
 export function setMockOSRMTimeoutRate(rate: number): void { mockOSRMTimeoutRate = Math.max(0, Math.min(1, rate)); }
+export function setMockOSRMRetraceFraction(fraction: number): void { mockOSRMRetraceFraction = Math.max(0, Math.min(0.9, fraction)); }
 /** Reset all mock knobs to zero. Call between fixtures so one fixture's
  *  degradation settings don't leak into the next. */
 export function resetMockOSRMFailures(): void {
   mockOSRMLatencyMs = 0;
   mockOSRMFailureRate = 0;
   mockOSRMTimeoutRate = 0;
+  mockOSRMRetraceFraction = 0;
 }
 
 /** Simple LCG so failure rolls are deterministic when the harness sets a
@@ -2153,13 +2174,20 @@ export async function generateOSRMRoutes(
       // doublebacks, and other "visibly broken" patterns that aren't a clean
       // U-turn but still register as 30%+ retrace + overlap. Out-and-back
       // routes exempt — their retrace IS the route.
-      // Threshold tuned at retrace+overlap > 0.35 (combined). Per-metric
-      // thresholds (>0.25 each) caused regressions in areas where ALL
-      // candidates had moderate retrace (no clean option). Initial combined
-      // threshold of 0.50 only fired on the most extreme cases; tightening
-      // to 0.35 catches the columbus-7mi and east-village-5mi-out class
-      // (visible 21%/19% backtracking that the user can plainly see).
-      if (routeType !== 'out-and-back' && (retraced + overlap) > 0.35) {
+      // Threshold at retrace+overlap > 0.50. Originally 0.50 (d433ea7), then
+      // tightened to 0.35 in ca8dc56 to catch a columbus-7mi case — but in
+      // dense Manhattan grids (East Village, LES, Gramercy) every anchored
+      // candidate routinely lands at 0.35-0.45 because the grid forces some
+      // backtracking around Tompkins/East River Park. With 0.35 the chooser
+      // rejected ALL anchored candidates → step 3.5 fired → user got an
+      // anchorless geometric rectangle with the SAME or worse shape. Reverted
+      // to 0.50: still catches truly broken cases while letting the scorer
+      // (which already adds retrace+overlap to qualityPenalty linearly) pick
+      // the cleanest of moderately-retracey candidates over the geometric
+      // fallback. The columbus-7mi case is now handled by candidate scoring,
+      // not hard-reject — anchored candidates with retr=0.21+over=0.19 score
+      // ~0.30 vs step-3.5's 0.50, so the reject was the wrong tool anyway.
+      if (routeType !== 'out-and-back' && (retraced + overlap) > 0.50) {
         qualityRejectCount++;
         traceEmit('candidate-rejected', { i, reason: 'backtrack', retraced, overlap });
         continue;

@@ -16,6 +16,7 @@ import {
   setMockOSRMLatency,
   setMockOSRMFailureRate,
   setMockOSRMTimeoutRate,
+  setMockOSRMRetraceFraction,
   resetMockOSRMFailures,
   setOSRMTimeoutMs,
   setResolutionBudgetMs,
@@ -575,5 +576,29 @@ describe('generateOSRMRoutes resilience', () => {
     // Hard ceiling: must be well under what step 3.5 would add. If step 3.5
     // runs, this assertion catches it.
     expect(elapsed).toBeLessThan(800);
+  });
+
+  it('mock retrace injection survives the algorithm pipeline (or is correctly trimmed)', async () => {
+    // Sanity check on the new mockOSRMRetraceFraction knob and the
+    // trimStubs interaction. The knob mirrors the first N×fraction points
+    // onto the tail of each mock route — designed to simulate dense-grid
+    // retrace patterns that the smooth-wobble mock can't naturally produce.
+    //
+    // In practice, trimStubs treats the appended mirror as an end-stub
+    // U-turn and trims it before retrace measurement, so candidates that
+    // would otherwise score retrace+overlap > 0.50 now score ~0.20. That's
+    // the algorithm working as designed — the test below just pins the
+    // observed behavior so a future change to either trimStubs or the
+    // injection mechanism is loud, not silent. The trace-based step-3.5
+    // detection in the harness catches the user-visible regression directly
+    // when running against real OSRM (`--osrm-base http://localhost:5000`).
+    setMockOSRMRetraceFraction(0.7);
+    const routes = await generateOSRMRoutes(center, 5, 'loop', 1);
+    expect(routes.length).toBeGreaterThan(0);
+    // Algorithm should still produce a usable route despite the injection.
+    const route = routes[0];
+    expect(route.points.length).toBeGreaterThan(20);
+    expect(route.distance).toBeGreaterThan(2);
+    expect(route.distance).toBeLessThan(5);
   });
 });

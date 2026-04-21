@@ -175,6 +175,18 @@ interface RouteMetrics {
   /** Count of dead-end stubs (visible "small jutting line" pattern). >0 means
    *  the route forces the runner into a dead-end and back. */
   stubs: number;
+  /** True if the algorithm fell through to step 3.5 (geometric bearing-trial
+   *  fallback) instead of selecting an OSRM-routed anchored candidate. This
+   *  is a strong negative signal whenever Overpass returned green spaces:
+   *  step 3.5 produces anchorless geometric routes that are strictly worse
+   *  than even moderately-retracey anchored alternatives. Catches the East
+   *  Village 4mi class of regression where the hard-reject was tightened
+   *  enough to kill all anchored candidates. */
+  chosenFromFallback: boolean;
+  /** Per-reason count of how many candidates were rejected during step 3.
+   *  A high `backtrack` count combined with `chosenFromFallback=true` is
+   *  the smoking gun for "hard-reject too aggressive for this area". */
+  rejectionCounts: { distance: number; barrier: number; highway: number; backtrack: number; osrmNull: number };
 }
 
 interface FixtureResult {
@@ -240,6 +252,20 @@ function applyThresholds(f: Fixture, m: RouteMetrics): string[] {
       `${m.stubs} dead-end stubs (max ${t.maxStubs}) — runner can't follow as one path`
     );
   }
+  // Step-3.5-fired-when-anchored check. The classic mode of regression that
+  // pure metric thresholds miss: the chosen route's distance/retrace/stubs
+  // can all look fine on their own, but it came from the geometric bearing-
+  // trial fallback because every anchored candidate was rejected. The user
+  // sees an anchorless "Sidestreet Shuffle" rectangle in an area with parks
+  // 200m away. Only fail when Overpass actually returned data — fixtures in
+  // green-space-poor areas legitimately use the fallback.
+  if (m.chosenFromFallback && m.hasOverpassData) {
+    const breakdown = `backtrack=${m.rejectionCounts.backtrack}, distance=${m.rejectionCounts.distance}, ` +
+      `barrier=${m.rejectionCounts.barrier}, highway=${m.rejectionCounts.highway}, osrm-null=${m.rejectionCounts.osrmNull}`;
+    failures.push(
+      `step-3.5 fallback fired despite Overpass data — anchored candidates rejected (${breakdown})`
+    );
+  }
   return failures;
 }
 
@@ -269,7 +295,10 @@ function fixtureSeed(name: string): number {
 
 async function runFixture(f: Fixture, captureTrace: boolean, useSynthetic: boolean, mockOsrm: boolean, deterministic: boolean): Promise<FixtureResult> {
   const distKm = f.distanceMi * KM_PER_MI;
-  if (captureTrace) enableTrace();
+  // Always enable trace — `chosenFromFallback` and rejection counts feed pass
+  // criteria, not just the optional --dump output. The trace buffer is small
+  // (~12 events per fixture) so the cost is negligible.
+  enableTrace();
   if (deterministic) setDeterministicSeed(fixtureSeed(f.name));
   // Clear OSRM cache between fixtures in deterministic mode. Otherwise an
   // earlier fixture's cached route at the same waypoints (e.g. a popular
@@ -299,10 +328,11 @@ async function runFixture(f: Fixture, captureTrace: boolean, useSynthetic: boole
     const hasOverpassData = op.greenSpaces.length > 0 || op.highwayPoints.length > 0;
 
     const routes = await generateOSRMRoutes(f.center, distKm, f.routeType, 1, f.prefs, f.end);
+    const trace = flushTrace();
     if (routes.length === 0) {
       return {
         fixture: f, pass: false, failures: ['no routes generated'], metrics: null,
-        trace: captureTrace ? flushTrace() : undefined,
+        trace: captureTrace ? trace : undefined,
       };
     }
     const r = routes[0];
@@ -320,7 +350,7 @@ async function runFixture(f: Fixture, captureTrace: boolean, useSynthetic: boole
         fixture: f, pass: true, skipped: true,
         failures: [`SKIP: OSRM has no coverage for this region (${points.length} pts, ${actualKm.toFixed(2)}km)`],
         metrics: null,
-        trace: captureTrace ? flushTrace() : undefined,
+        trace: captureTrace ? trace : undefined,
       };
     }
     // Anchor count inferred from the route name. The named-route formats are
@@ -328,6 +358,24 @@ async function runFixture(f: Fixture, captureTrace: boolean, useSynthetic: boole
     // name routes are "City Loop" / "Quiet Lanes" etc. (geometric fallback).
     const isGenericName = /^(City Loop|Urban Circuit|Downtown Explorer|Coastal Breeze Route|Bridge Connector|Meadow Circuit|Backstreet Run|Quiet Lanes|Residential Circuit|Sidestreet Shuffle|Neighborhood Loop|Peaceful Path)$/i.test(r.name);
     const anchorCount = isGenericName ? 0 : (/\s&\s|\sto\s/.test(r.name) ? 2 : 1);
+    // Walk the trace once to derive `chosenFromFallback` and rejection
+    // breakdown. `fallback-start` fires inside step 3.5 — its presence means
+    // the algorithm dropped to geometric bearing-trial routing because every
+    // step-3 candidate was rejected. That's the "Sidestreet Shuffle" anchorless
+    // rectangle pattern in the East Village 4mi screenshot.
+    const rejectionCounts = { distance: 0, barrier: 0, highway: 0, backtrack: 0, osrmNull: 0 };
+    let chosenFromFallback = false;
+    for (const e of trace) {
+      if (e.event === 'fallback-start') chosenFromFallback = true;
+      if (e.event === 'candidate-rejected') {
+        const reason = (e.data as { reason?: string })?.reason;
+        if (reason === 'distance') rejectionCounts.distance++;
+        else if (reason === 'barrier') rejectionCounts.barrier++;
+        else if (reason === 'highway') rejectionCounts.highway++;
+        else if (reason === 'backtrack') rejectionCounts.backtrack++;
+        else if (reason === 'osrm-null') rejectionCounts.osrmNull++;
+      }
+    }
     const metrics: RouteMetrics = {
       distanceMi: actualMi,
       distanceErrorPct: Math.abs(actualMi - f.distanceMi) / f.distanceMi,
@@ -339,11 +387,13 @@ async function runFixture(f: Fixture, captureTrace: boolean, useSynthetic: boole
       greenProximity: computeGreenSpaceProximity(points, op.greenSpaces),
       anchorCount,
       stubs: countStubs(points),
+      chosenFromFallback,
+      rejectionCounts,
     };
     const failures = applyThresholds(f, metrics);
     return {
       fixture: f, pass: failures.length === 0, failures, metrics,
-      trace: captureTrace ? flushTrace() : undefined,
+      trace: captureTrace ? trace : undefined,
       routePoints: captureTrace ? points : undefined,
     };
   } catch (err: any) {
@@ -366,7 +416,13 @@ function fmtRow(r: FixtureResult): string {
   // whether you're looking at real-algorithm output or a degraded path.
   // [mock] = synthetic OSRM stand-in (algorithm exercised, geometry fake)
   // [fb]   = geometric fallback (Overpass returned no green spaces)
-  const dataTag = !m.hasOverpassData ? '[fb]  ' : m.osrmMocked ? '[mock]' : '      ';
+  // [s3.5] = step 3.5 bearing-trial fallback fired (anchored candidates
+  //         rejected — strongest signal that a hard-reject threshold is
+  //         too aggressive for this area).
+  const dataTag = m.chosenFromFallback ? '[s3.5]'
+    : !m.hasOverpassData ? '[fb]  '
+    : m.osrmMocked ? '[mock]'
+    : '      ';
   const summary =
     `dist=${m.distanceMi.toFixed(2)}mi(${(m.distanceErrorPct * 100).toFixed(0)}%)  ` +
     `retr=${(m.retraceRatio * 100).toFixed(0)}%  ` +
@@ -375,8 +431,15 @@ function fmtRow(r: FixtureResult): string {
     `green=${(m.greenProximity * 100).toFixed(0)}%  ` +
     `anch=${m.anchorCount}  ` +
     `pts=${m.pointCount}`;
+  // Show per-reason rejection breakdown only when something interesting
+  // happened — otherwise it's noise on every clean PASS row.
+  const rc = m.rejectionCounts;
+  const totalRejects = rc.distance + rc.barrier + rc.highway + rc.backtrack + rc.osrmNull;
+  const rejectStr = totalRejects > 0
+    ? `  rej={bt=${rc.backtrack},d=${rc.distance},h=${rc.highway},b=${rc.barrier},n=${rc.osrmNull}}`
+    : '';
   const tail = r.failures.length ? `  -- ${r.failures.join('; ')}` : '';
-  return `${tag}  ${dataTag}${pad(r.fixture.name, 32)}  ${summary}${tail}`;
+  return `${tag}  ${dataTag}${pad(r.fixture.name, 32)}  ${summary}${rejectStr}${tail}`;
 }
 
 interface SnapshotCounts { enriched: number; highway: number; osrm: number }
