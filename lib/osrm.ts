@@ -19,6 +19,20 @@ const MAX_CANDIDATE_COUNT = 3;
 const MAX_INTERNAL_CANDIDATES = 7;
 
 /**
+ * Thrown by `generateOSRMRoutes` when route generation failed because the
+ * OSRM endpoint was unreachable or unresponsive (timeouts, 5xx, or the
+ * overall resolution budget expired before any candidate finished). Lets
+ * the caller distinguish "OSRM is down — show retry" from "OSRM responded
+ * but no usable route exists for this area" (which surfaces as `[]`).
+ */
+export class OSRMUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'OSRMUnavailableError';
+  }
+}
+
+/**
  * Road routing overhead factor.
  * Roads are typically 1.3–1.5x longer than straight-line distance due to
  * the road network geometry (grid patterns, curves, one-way streets, etc).
@@ -1227,10 +1241,25 @@ function selectWaypoint(
 // headroom for the long tail without letting one stuck call dominate.
 // Tighter limits (5s) caused legitimate slow responses to abort and
 // fall through to the no-route path, which surfaced as straight-line
-// triangles in the UI.
-const OSRM_TIMEOUT_MS = 8000;
+// triangles in the UI. Mutable so resilience tests can use a small
+// timeout (e.g. 100ms) without sitting 8s per fixture.
+let OSRM_TIMEOUT_MS = 8000;
+export function setOSRMTimeoutMs(ms: number): void { OSRM_TIMEOUT_MS = Math.max(1, ms); }
 
-/** Retry wrapper for fetch with timeout */
+// Overall wall-clock budget for the candidate-resolution loop in
+// generateOSRMRoutes. Mutable so tests can dial it down. Production
+// default of 18s leaves comfortable headroom for healthy public OSRM
+// (~5s end-to-end) while bounding the worst case the user sees.
+let RESOLUTION_BUDGET_MS = 18000;
+export function setResolutionBudgetMs(ms: number): void { RESOLUTION_BUDGET_MS = Math.max(1, ms); }
+
+/** Retry wrapper for fetch with timeout.
+ *
+ * Retries are skipped for AbortError (timeout) — a request that already took
+ * 8s will almost always time out again on the same slow endpoint, doubling
+ * the wall-clock for no benefit. Real network errors (DNS, connection reset)
+ * still get one retry since those can be transient.
+ */
 async function fetchWithRetry(url: string, retries = 1): Promise<Response> {
   for (let i = 0; i <= retries; i++) {
     try {
@@ -1243,7 +1272,8 @@ async function fetchWithRetry(url: string, retries = 1): Promise<Response> {
         clearTimeout(timeout);
       }
       if (i < retries) await new Promise((r) => setTimeout(r, 300 * (i + 1)));
-    } catch (err) {
+    } catch (err: any) {
+      if (err?.name === 'AbortError') throw err;
       if (i === retries) throw err;
       await new Promise((r) => setTimeout(r, 300 * (i + 1)));
     }
@@ -1309,9 +1339,13 @@ async function fetchOSRMRouteAdjusted(
   waypoints: RoutePoint[],
   center: RoutePoint,
   targetDistanceKm: number,
-  // 2 retries (3 total attempts) is the sweet spot. With damping 0.7 + the
-  // [0.80, 1.25] cap, most candidates converge in attempt 1 — a 3rd retry
-  // mostly burned wall-clock without improving the chosen route.
+  // 2 retries (3 total attempts). Combined with fetchWithRetry no longer
+  // double-retrying on AbortError and the new RESOLUTION_BUDGET_MS ceiling
+  // at the candidate-loop level, per-candidate worst case is bounded at
+  // ~24s and the total user-visible spinner duration is bounded at the
+  // budget regardless. Keeping 3 attempts (vs 2) is what gives the
+  // distance-refinement loop room to converge — dropping to 2 caused
+  // out-and-back fixtures to undershoot target by ~25%.
   maxRetries: number = 2
 ): Promise<{ route: OSRMRoute | null; waypoints: RoutePoint[] }> {
   // Sequential first attempt + iterative refinement. A previous experiment
@@ -1484,9 +1518,60 @@ export function isOSRMMockEnabled(): boolean { return osrmMockEnabled; }
  * waypoints. Production leaves this null so each user request shuffles.
  */
 let deterministicSeed: number | null = null;
-export function setDeterministicSeed(seed: number | null): void { deterministicSeed = seed; }
+export function setDeterministicSeed(seed: number | null): void {
+  deterministicSeed = seed;
+  // Reset the LCG state so failure rolls are reproducible across runs even
+  // when no fixture explicitly resets between iterations.
+  mockFailureRollState = (seed ?? 0) | 0;
+}
 function getSeed(): number {
   return deterministicSeed !== null ? deterministicSeed : Date.now();
+}
+
+/**
+ * Failure-injection knobs for the mock. All zero by default — mock returns
+ * instantly with success, matching the legacy behavior that callers rely on.
+ *
+ * The harness uses these to simulate degraded public-OSRM conditions that
+ * the perfect-network mock would otherwise hide. Past bugs (Build 21
+ * straight-line triangles, the 60s spinner hang) only manifest when the
+ * network is slow or rate-limiting; without injection the harness cannot
+ * prove the algorithm degrades gracefully under those conditions.
+ *
+ * latencyMs: each mock call sleeps this long before returning (or timing
+ *   out / failing). Models tail latency on public OSRM (typical 200-700ms,
+ *   busy 1-2s, occasional 3-5s spikes per CLAUDE.md).
+ * failureRate: 0..1 probability that the call returns null (modeling 5xx
+ *   or "no route found" responses).
+ * timeoutRate: 0..1 probability that the call rejects with an AbortError
+ *   AFTER waiting OSRM_TIMEOUT_MS (modeling a request that hits the
+ *   client-side timeout). Sleeps the full timeout so wall-clock measurements
+ *   include the slow-then-fail path that real OSRM exhibits.
+ */
+let mockOSRMLatencyMs = 0;
+let mockOSRMFailureRate = 0;
+let mockOSRMTimeoutRate = 0;
+export function setMockOSRMLatency(ms: number): void { mockOSRMLatencyMs = Math.max(0, ms); }
+export function setMockOSRMFailureRate(rate: number): void { mockOSRMFailureRate = Math.max(0, Math.min(1, rate)); }
+export function setMockOSRMTimeoutRate(rate: number): void { mockOSRMTimeoutRate = Math.max(0, Math.min(1, rate)); }
+/** Reset all mock knobs to zero. Call between fixtures so one fixture's
+ *  degradation settings don't leak into the next. */
+export function resetMockOSRMFailures(): void {
+  mockOSRMLatencyMs = 0;
+  mockOSRMFailureRate = 0;
+  mockOSRMTimeoutRate = 0;
+}
+
+/** Simple LCG so failure rolls are deterministic when the harness sets a
+ *  deterministic seed. Math.random() would make resilience-fixture results
+ *  jitter run-to-run, defeating the point of pinned thresholds. */
+let mockFailureRollState = 0;
+function mockFailureRoll(): number {
+  if (deterministicSeed !== null) {
+    mockFailureRollState = (mockFailureRollState * 1103515245 + 12345) & 0x7fffffff;
+    return mockFailureRollState / 0x7fffffff;
+  }
+  return Math.random();
 }
 
 /**
@@ -1553,8 +1638,24 @@ export function loadOSRMCache(snapshot: Partial<OSRMSnapshot>): void {
 async function fetchOSRMRoute(waypoints: RoutePoint[]): Promise<OSRMRoute | null> {
   // Mock short-circuit — bypasses cache, network, and retry. Used only
   // by the quality harness to keep algorithm QA decoupled from OSRM quota.
+  // Failure-injection knobs simulate degraded public-OSRM conditions
+  // (latency, 5xx, client-timeout) that perfect-mock would otherwise hide.
   if (osrmMockEnabled) {
     if (waypoints.length < 2) return null;
+
+    // Apply latency BEFORE the failure roll. Real OSRM that returns a 5xx
+    // still costs the full request RTT — the algorithm's wall-clock
+    // sensitivity needs to see that cost in the mock too. For the timeout
+    // case, sleep the full OSRM_TIMEOUT_MS so resilience tests measure the
+    // same waterfall the user actually sits through.
+    const willTimeout = mockOSRMTimeoutRate > 0 && mockFailureRoll() < mockOSRMTimeoutRate;
+    const willFail = !willTimeout && mockOSRMFailureRate > 0 && mockFailureRoll() < mockOSRMFailureRate;
+    const sleepMs = willTimeout ? OSRM_TIMEOUT_MS : mockOSRMLatencyMs;
+    if (sleepMs > 0) await new Promise((r) => setTimeout(r, sleepMs));
+    // Both timeout and 5xx surface to upstream as null — matching real
+    // fetchOSRMRoute behavior where the outer catch converts AbortError
+    // to null. The wall-clock cost is what differentiates them.
+    if (willTimeout || willFail) return null;
     return mockOSRMRoute(waypoints);
   }
 
@@ -1896,19 +1997,53 @@ export async function generateOSRMRoutes(
     pending.set(idx, p);
   }
 
+  // Overall wall-clock budget (set via setResolutionBudgetMs, default 18s).
+  // Healthy public OSRM resolves all 7 candidates in ~5s end-to-end; the
+  // budget leaves headroom for the long tail without letting the user sit
+  // on the spinner for ~60s when the endpoint is degraded (the documented
+  // bug). On budget expiry we take whatever candidates have already
+  // resolved and pick the best — preserves the best-of-N property when the
+  // network is fast, degrades to best-of-what-finished when it's not. Step
+  // 3.5 is suppressed in that case (it would only add another ~50s to wait
+  // on the same slow endpoint).
+  const resolveStartMs = Date.now();
+  let budgetExpired = false;
+  const budgetSentinel: Promise<'__budget'> = new Promise((resolve) => {
+    setTimeout(() => {
+      budgetExpired = true;
+      resolve('__budget');
+    }, RESOLUTION_BUDGET_MS);
+  });
+
   // Build resolved candidates. NEW BEHAVIOR: don't hard-reject candidates
   // that fail strict thresholds — KEEP them with a quality score so we can
   // pick the least-bad survivor instead of falling through to the geometric
   // step-3.5 fallback (which often produces *worse* routes than the
   // candidates we'd otherwise discard). Step-3.5 only fires now when the
-  // OSRM call itself returned nothing.
+  // OSRM call itself returned nothing AND we have budget left AND at least
+  // one rejection was for QUALITY (not network — if it was all network,
+  // step 3.5 will also fail and just burn more user time).
   const resolved: ResolvedCandidate[] = [];
+  // Track WHY candidates fell out so step 3.5 can decide whether to even try.
+  let osrmNullCount = 0;
+  let qualityRejectCount = 0;
   // Hard rejection only for "completely unusable" cases: distance way off,
   // crosses a clear barrier, or routes along highways. Soft thresholds on
   // retrace/overlap/stubs feed into a quality score; the worst-quality
   // candidates lose to better ones but still beat the geometric fallback.
   while (pending.size > 0) {
-    const winner = await Promise.race(pending.values());
+    const winner = await Promise.race<Tagged | '__budget'>([
+      ...pending.values(),
+      budgetSentinel,
+    ]);
+    if (winner === '__budget') {
+      traceEmit('resolution-budget-expired', {
+        elapsedMs: Date.now() - resolveStartMs,
+        unresolvedCount: pending.size,
+        resolvedSoFar: resolved.length,
+      });
+      break;
+    }
     pending.delete(winner.idx);
     const i = winner.idx;
     const osrmResult = winner.result;
@@ -1979,17 +2114,20 @@ export async function generateOSRMRoutes(
       const maxRatio = routeType === 'point-to-point' ? 3.0 : 1.3;
       const minRatio = routeType === 'point-to-point' ? 0.2 : 0.5;
       if (distRatio > maxRatio || distRatio < minRatio) {
+        qualityRejectCount++;
         traceEmit('candidate-rejected', { i, reason: 'distance', distKm, distRatio, target: distanceKm });
         continue;
       }
       // HARD REJECT: route crosses a clear barrier (tunnel, bridge, water)
       if (routeType !== 'point-to-point' && hasRoutedBarrierCrossing(points, greenSpaces, center, distanceKm)) {
+        qualityRejectCount++;
         traceEmit('candidate-rejected', { i, reason: 'barrier', distKm });
         continue;
       }
       const hwProximity = computeHighwayProximity(points, highwayPoints);
       // HARD REJECT: route runs alongside major highways
       if (hwProximity > 0.15) {
+        qualityRejectCount++;
         traceEmit('candidate-rejected', { i, reason: 'highway', hwProximity });
         continue;
       }
@@ -2022,6 +2160,7 @@ export async function generateOSRMRoutes(
       // to 0.35 catches the columbus-7mi and east-village-5mi-out class
       // (visible 21%/19% backtracking that the user can plainly see).
       if (routeType !== 'out-and-back' && (retraced + overlap) > 0.35) {
+        qualityRejectCount++;
         traceEmit('candidate-rejected', { i, reason: 'backtrack', retraced, overlap });
         continue;
       }
@@ -2067,13 +2206,23 @@ export async function generateOSRMRoutes(
       // which surfaced as triangles cutting through buildings and across
       // rivers when public OSRM was rate-limited. Better to drop and let
       // either another candidate or step-3.5 fill in.
+      osrmNullCount++;
       traceEmit('candidate-rejected', { i, reason: 'osrm-null' });
     }
   }
 
-  // Step 3.5: If all candidates were rejected, fall back to a direct route
-  // Use iterative distance adjustment to ensure fallback also hits target distance
-  if (resolved.length === 0) {
+  // Step 3.5: If all candidates were rejected, fall back to a direct route.
+  // SKIP the fallback when:
+  //   1. The resolution budget expired (we've already kept the user waiting
+  //      ~18s — don't add another ~50s of sequential bearing trials).
+  //   2. ALL drops were osrm-null with zero quality rejections (the network
+  //      is the problem, step 3.5 will hit the same dead endpoint and just
+  //      compound the wait before returning the same empty result).
+  // Otherwise (mixed quality rejects + nulls, or pure quality rejects)
+  // step 3.5 has a real shot at producing a usable direct-bearing route.
+  const networkOnlyFailure = osrmNullCount > 0 && qualityRejectCount === 0;
+  const skipFallback = budgetExpired || networkOnlyFailure;
+  if (resolved.length === 0 && !skipFallback) {
     console.log('[RouteScoring] All candidates rejected — generating direct fallback');
     traceEmit('fallback-start', { routeType, distanceKm });
 
@@ -2160,6 +2309,21 @@ export async function generateOSRMRoutes(
     // If even the bearing-trial fallback came back with no OSRM route,
     // resolved stays empty — the caller surfaces "no routes found" rather
     // than displaying raw straight-line waypoints over the map.
+  } else if (resolved.length === 0 && skipFallback) {
+    traceEmit('fallback-skipped', {
+      reason: budgetExpired ? 'budget-expired' : 'network-only-failure',
+      osrmNullCount,
+      qualityRejectCount,
+      elapsedMs: Date.now() - resolveStartMs,
+    });
+    // Distinguish "OSRM is down" from "no routes for this area" so the
+    // caller can show an honest message. Empty return is reserved for
+    // the latter (some OSRM responses came back, just none usable).
+    throw new OSRMUnavailableError(
+      budgetExpired
+        ? `OSRM resolution budget expired after ${Date.now() - resolveStartMs}ms with ${osrmNullCount} nulls`
+        : `OSRM unreachable: all ${osrmNullCount} candidates returned null`
+    );
   }
 
   // Step 4: Score each candidate using locally-computable metrics only.

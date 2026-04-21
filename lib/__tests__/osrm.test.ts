@@ -11,10 +11,22 @@ import {
   estimateCircuitDistance,
   countStubs,
   trimStubs,
+  generateOSRMRoutes,
+  setOSRMMock,
+  setMockOSRMLatency,
+  setMockOSRMFailureRate,
+  setMockOSRMTimeoutRate,
+  resetMockOSRMFailures,
+  setOSRMTimeoutMs,
+  setResolutionBudgetMs,
+  setDeterministicSeed,
+  clearOSRMCache,
+  OSRMUnavailableError,
 } from '../osrm';
 import type { CandidateStrategy } from '../osrm';
 import type { RoutePoint } from '../route-generator';
 import type { GreenSpace } from '../overpass';
+import { prefillOverpassCaches } from '../overpass';
 
 describe('haversineDistance', () => {
   it('returns 0 for the same point', () => {
@@ -425,5 +437,143 @@ describe('trimStubs', () => {
     const trimmed = trimStubs(stubby);
     // Polyline should be unchanged — same point count (no trim happened).
     expect(trimmed.length).toBe(stubby.length);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Resilience: budget timer + degraded-network behavior
+// ---------------------------------------------------------------------------
+//
+// These tests exercise the structural property that previously let
+// `generateOSRMRoutes` hang for ~60s when the public OSRM endpoint was
+// slow or rate-limiting. The mock's failure-injection knobs simulate the
+// degraded conditions; small OSRM_TIMEOUT_MS and RESOLUTION_BUDGET_MS
+// values let the assertions fire in <1s of real time.
+//
+// What the harness alone could NOT catch (and these tests do):
+//   1. All-candidates-timeout MUST throw OSRMUnavailableError, not return
+//      [] (so the caller can show "service slow" not "no routes for area").
+//   2. Resolution MUST complete within budget regardless of how many
+//      candidates are stuck — no waterfall that compounds per-candidate
+//      timeouts into 60s of user-visible spinner.
+//   3. Step 3.5 fallback MUST be skipped when network is the failure mode
+//      (it would re-hit the same dead endpoint and double the wait).
+describe('generateOSRMRoutes resilience', () => {
+  // NYC center for all tests — far from water-bound edges so the geometric
+  // fallback waypoints don't accidentally land in barriers.
+  const center = { lat: 40.7589, lng: -73.9851 };
+
+  beforeEach(() => {
+    setOSRMMock(true);
+    setDeterministicSeed(42); // pin failure rolls
+    clearOSRMCache();
+    resetMockOSRMFailures();
+    // Seed empty Overpass caches so generateOSRMRoutes doesn't try to hit
+    // the real endpoint. Empty green-spaces is fine — the resilience tests
+    // care about how OSRM failures propagate, not about route quality.
+    prefillOverpassCaches(center, 10, [], []);
+  });
+
+  afterEach(() => {
+    setOSRMMock(false);
+    setDeterministicSeed(null);
+    resetMockOSRMFailures();
+    setOSRMTimeoutMs(8000); // restore production defaults
+    setResolutionBudgetMs(18000);
+  });
+
+  it('throws OSRMUnavailableError when all candidates time out', async () => {
+    // Per-call timeout 100ms → ~7 candidates each "time out" in 100ms wall
+    // clock (parallel). Budget 2s gives generous headroom; the test should
+    // exit well under it because all candidates resolve to null fast.
+    setOSRMTimeoutMs(100);
+    setResolutionBudgetMs(2000);
+    setMockOSRMTimeoutRate(1.0);
+
+    const start = Date.now();
+    let caught: any = null;
+    try {
+      await generateOSRMRoutes(center, 5, 'loop', 1);
+    } catch (err) {
+      caught = err;
+    }
+    const elapsed = Date.now() - start;
+
+    expect(caught).toBeInstanceOf(OSRMUnavailableError);
+    // ~100ms per candidate (parallel) + small overhead. Anything over 1s
+    // means we're hitting the old waterfall behavior.
+    expect(elapsed).toBeLessThan(1000);
+  });
+
+  it('respects the resolution budget when candidates are merely slow', async () => {
+    // Each candidate succeeds, but takes longer than the budget. Without
+    // the budget, the function would wait for all 7 to finish (~3s in
+    // parallel). With the budget at 200ms, it must give up sooner.
+    setOSRMTimeoutMs(10000); // not the limit here
+    setResolutionBudgetMs(200);
+    setMockOSRMLatency(500); // each candidate takes 500ms
+
+    const start = Date.now();
+    let result: any = null;
+    let caught: any = null;
+    try {
+      result = await generateOSRMRoutes(center, 5, 'loop', 1);
+    } catch (err) {
+      caught = err;
+    }
+    const elapsed = Date.now() - start;
+
+    // Either we got nothing (budget fired before any candidate) → throws,
+    // or budget fired between resolutions and we got partial results. In
+    // both cases the function MUST return within budget + small slack.
+    expect(elapsed).toBeLessThan(800);
+    if (caught) {
+      expect(caught).toBeInstanceOf(OSRMUnavailableError);
+    } else {
+      expect(Array.isArray(result)).toBe(true);
+    }
+  });
+
+  it('returns successfully when mock has no failures (regression baseline)', async () => {
+    // Sanity: with all knobs zeroed, the mock behaves like the legacy
+    // synchronous version. Any resilience test that breaks this baseline
+    // is a sign the fix introduced a behavior change in the happy path.
+    setOSRMTimeoutMs(8000);
+    setResolutionBudgetMs(18000);
+
+    const start = Date.now();
+    const routes = await generateOSRMRoutes(center, 5, 'loop', 1);
+    const elapsed = Date.now() - start;
+
+    expect(routes.length).toBeGreaterThan(0);
+    // Mock is synchronous-equivalent — total wall-clock should be tiny.
+    expect(elapsed).toBeLessThan(1000);
+  });
+
+  it('skips step 3.5 fallback when failures are network-only', async () => {
+    // All-null without quality-rejects = network failure mode. The function
+    // must throw OSRMUnavailableError quickly rather than running step 3.5
+    // (which would just hit the same dead endpoint for another waterfall).
+    //
+    // We measure this by latency: if step 3.5 fired, it would do 4 sequential
+    // bearing trials, each potentially timing out. With per-call timeout 100ms
+    // × 4 trials × up to 4 attempts each = ~1.6s. Skipping = ~100ms total.
+    setOSRMTimeoutMs(100);
+    setResolutionBudgetMs(5000);
+    setMockOSRMTimeoutRate(1.0);
+
+    const start = Date.now();
+    let caught: any = null;
+    try {
+      await generateOSRMRoutes(center, 5, 'loop', 1);
+    } catch (err) {
+      caught = err;
+    }
+    const elapsed = Date.now() - start;
+
+    expect(caught).toBeInstanceOf(OSRMUnavailableError);
+    // Hard ceiling: must be well under what step 3.5 would add. If step 3.5
+    // runs, this assertion catches it.
+    expect(elapsed).toBeLessThan(800);
   });
 });

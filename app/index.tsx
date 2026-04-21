@@ -25,7 +25,7 @@ import { RouteMap } from '@/components/RouteMap';
 import { ProfileDrawer } from '@/components/ProfileDrawer';
 import { useAppContext, type RouteStyle, type RunPreferences } from '@/lib/AppContext';
 import { distanceUnit } from '@/lib/units';
-import { generateOSRMRoutes, prewarmOSRMConnection } from '@/lib/osrm';
+import { generateOSRMRoutes, prewarmOSRMConnection, OSRMUnavailableError } from '@/lib/osrm';
 import { prefetchGreenSpacesAndHighways } from '@/lib/overpass';
 import { persistOverpassCache } from '@/lib/overpass-persist';
 import { persistOSRMCache } from '@/lib/osrm-persist';
@@ -615,7 +615,13 @@ export default function SetupScreen() {
       console.warn('Route generation failed:', err);
       ctx.setIsGenerating(false);
       router.replace('/');
-      setTimeout(() => setGenerateError("Couldn't generate a route. Check your connection and try again."), 100);
+      // OSRMUnavailableError = endpoint timeout/5xx/budget. Generic catch =
+      // anything else (geocoding, JSON parse, etc.). Different message for
+      // each so the user knows whether to retry now or wait/move locations.
+      const msg = err instanceof OSRMUnavailableError
+        ? "Routing service is slow or unavailable. Please try again in a moment."
+        : "Couldn't generate a route. Check your connection and try again.";
+      setTimeout(() => setGenerateError(msg), 100);
     }
   }, [ctx, localRouteStyle, localPrefs, hasEndLocation, p2pDistance, router, startAddressText, endAddressText]);
 
