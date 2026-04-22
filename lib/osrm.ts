@@ -1877,14 +1877,40 @@ export async function generateOSRMRoutes(
   routeType: 'loop' | 'out-and-back' | 'point-to-point',
   count: number = 1,
   prefs: RoutePreferences = { lowTraffic: false },
-  end?: RoutePoint | null
+  end?: RoutePoint | null,
+  excludeAnchors?: RoutePoint[] | null,
 ): Promise<GeneratedRoute[]> {
   traceEmit('generate-start', { center, distanceKm, routeType, count, prefs, end: end ?? null });
 
   // Step 1: Fetch enriched green spaces and highway segments in a single
   // Overpass round trip (shared across all candidates).
   const radiusKm = calculateSearchRadius(routeType, distanceKm, center, end);
-  const { greenSpaces, highwayPoints } = await fetchGreenSpacesAndHighways(center, radiusKm);
+  const { greenSpaces: rawGreenSpaces, highwayPoints } = await fetchGreenSpacesAndHighways(center, radiusKm);
+  // Refresh exclusion: drop green spaces within 0.5km of any anchor used by
+  // the previously-shown route. Forces the sectoring/scoring to pick a
+  // different park set, which in turn produces different waypoints, which
+  // bypasses the OSRM cache (keyed by exact waypoint coords). Without this,
+  // dense urban areas with few high-scoring parks deterministically replay
+  // the same top picks every refresh — same waypoints, same OSRM result,
+  // same route. Match the 0.5km threshold used by the per-candidate
+  // diversity filter below for consistency.
+  // Skip when the exclusion would leave fewer than 2 waypoint-eligible
+  // greens — better to repeat than to force a geometric fallback in a
+  // genuinely park-poor area.
+  const WAYPOINT_KINDS = new Set(['park', 'garden', 'nature', 'waterfront']);
+  let greenSpaces = rawGreenSpaces;
+  if (excludeAnchors && excludeAnchors.length > 0) {
+    const filtered = rawGreenSpaces.filter((gs) =>
+      !excludeAnchors.some((ex) => haversineDistance(ex, gs.point) < 0.5)
+    );
+    const eligibleAfter = filtered.filter((gs) => WAYPOINT_KINDS.has(gs.kind)).length;
+    if (eligibleAfter >= 2) {
+      greenSpaces = filtered;
+      traceEmit('refresh-exclude', { excluded: rawGreenSpaces.length - filtered.length, remainingEligible: eligibleAfter });
+    } else {
+      traceEmit('refresh-exclude-skipped', { reason: 'insufficient-remaining', eligibleAfter });
+    }
+  }
   traceEmit('overpass-result', {
     radiusKm,
     greenSpaceCount: greenSpaces.length,
@@ -2419,6 +2445,7 @@ export async function generateOSRMRoutes(
       elevationGain,
       terrain,
       difficulty,
+      anchorPoints: candidate.anchors.map((a) => a.point),
     };
   });
 }

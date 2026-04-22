@@ -12,6 +12,10 @@ export interface GeneratedRoute {
   elevationGain: number // in meters
   terrain: string
   difficulty: "easy" | "moderate" | "hard"
+  // Green-space anchor points used to build this route. Carried through so a
+  // subsequent refresh can exclude the same parks and produce a genuinely
+  // different route — the OSRM cache otherwise replays identical waypoints.
+  anchorPoints?: RoutePoint[]
 }
 
 function toRad(deg: number): number {

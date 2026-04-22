@@ -239,11 +239,18 @@ export default function RunScreen() {
     }
   }, [routeIndex, ctx]);
 
-  // Regenerate the current route with the same parameters. Production seeds
-  // candidate variants with Date.now() so each call produces different
-  // waypoints — the user sees a fresh route, not a cache replay.
-  // The OSRM cache itself is keyed by exact waypoint coords, so cache hits
-  // happen only if the new variant lands on identical waypoints (rare).
+  // Regenerate the current route with the same parameters. Two behaviors that
+  // matter here:
+  //   1. We pass the previous route's anchorPoints as `excludeAnchors` so
+  //      generateOSRMRoutes drops those parks from the candidate pool. Without
+  //      this, dense urban areas with few high-scoring parks deterministically
+  //      replay the same top picks → identical waypoints → OSRM cache hit →
+  //      same route. The seed-based variant shuffling alone isn't enough.
+  //   2. We do NOT clear ctx.routes/selectedRoute synchronously here. Doing
+  //      so forced the MapView to re-render with an empty polyline mid-press,
+  //      which intermittently crashed the app on iOS. Instead we just flip
+  //      isGenerating — the bottom sheet swaps to the spinner while the old
+  //      route stays visible on the map until the new one swaps in atomically.
   const handleRefresh = useCallback(async () => {
     if (ctx.isGenerating || hasStarted) return;
 
@@ -251,8 +258,8 @@ export default function RunScreen() {
       ? ctx.distance
       : ctx.distance * 1.60934;
 
-    ctx.setRoutes([]);
-    ctx.setSelectedRoute(null);
+    const previousAnchors = ctx.selectedRoute?.anchorPoints ?? null;
+
     ctx.setIsGenerating(true);
     setRouteIndex(0);
 
@@ -266,6 +273,7 @@ export default function RunScreen() {
         1,
         ctx.prefs,
         ctx.endLocation,
+        previousAnchors,
       );
       if (newRoutes.length === 0) {
         // Don't strand the user on a blank screen — bounce back to plan.
