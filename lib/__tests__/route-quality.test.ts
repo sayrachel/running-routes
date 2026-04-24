@@ -16,7 +16,7 @@ import {
   estimateCircuitDistance,
   scoreGreenSpace,
 } from '../osrm';
-import { computeHighwayProximity, computeWaterfrontProximity, computeGreenSpaceProximity, computeRunPathProximity, scoreRoute } from '../route-scoring';
+import { computeHighwayProximity, computeWaterfrontProximity, computeGreenSpaceProximity, computeRunPathProximity, scoreRoute, countStartPasses, reversalCount } from '../route-scoring';
 import type { RoutePoint } from '../route-generator';
 import type { GreenSpace } from '../overpass';
 
@@ -1385,5 +1385,86 @@ describe('expandParkWaypoints', () => {
     const waypoints = [center, wp, center];
     const result = expandParkWaypoints(waypoints, []);
     expect(result).toEqual(waypoints);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Topology metrics: countStartPasses + reversalCount
+// ---------------------------------------------------------------------------
+
+describe('countStartPasses', () => {
+  it('returns 0 for a clean circular loop', () => {
+    const loop = makeCircle(NYC, 0.5, 50);
+    expect(countStartPasses(loop)).toBe(0);
+  });
+
+  it('returns 0 for a triangle that never re-enters the start neighborhood', () => {
+    const a = destinationPoint(NYC, 90, 1.0);
+    const b = destinationPoint(NYC, 0, 1.0);
+    const route = [
+      ...makeStraightLine(NYC, a, 30),
+      ...makeStraightLine(a, b, 30).slice(1),
+      ...makeStraightLine(b, NYC, 30).slice(1),
+    ];
+    expect(countStartPasses(route)).toBe(0);
+  });
+
+  it('returns 1 for a barbell route that passes through start between lobes', () => {
+    const start = NYC;
+    const eTip = destinationPoint(start, 90, 1.0);
+    const wTip = destinationPoint(start, 270, 1.0);
+    const route = [
+      ...makeStraightLine(start, eTip, 30),
+      ...makeStraightLine(eTip, start, 30).slice(1),
+      ...makeStraightLine(start, wTip, 30).slice(1),
+      ...makeStraightLine(wTip, start, 30).slice(1),
+    ];
+    expect(countStartPasses(route)).toBe(1);
+  });
+
+  it('returns 0 for a route shorter than 3 points', () => {
+    expect(countStartPasses([NYC, destinationPoint(NYC, 0, 0.5)])).toBe(0);
+  });
+});
+
+describe('reversalCount', () => {
+  it('returns 0 for a clean circular loop with smooth turning', () => {
+    const loop = makeCircle(NYC, 0.5, 50);
+    expect(reversalCount(loop)).toBe(0);
+  });
+
+  it('returns 0 for an L-shaped 90° corner — turns are not reversals', () => {
+    const a = destinationPoint(NYC, 90, 0.5);
+    const b = destinationPoint(a, 0, 0.5);
+    const route = [
+      ...makeStraightLine(NYC, a, 30),
+      ...makeStraightLine(a, b, 30).slice(1),
+    ];
+    expect(reversalCount(route)).toBe(0);
+  });
+
+  it('returns 1 for an out-and-back with a single far-end U-turn', () => {
+    const tip = destinationPoint(NYC, 90, 1.0);
+    const out = makeStraightLine(NYC, tip, 30);
+    const back = makeStraightLine(tip, NYC, 30).slice(1);
+    expect(reversalCount([...out, ...back])).toBe(1);
+  });
+
+  it('returns ≥2 for a barbell with U-turns at both lobe tips', () => {
+    const start = NYC;
+    const eTip = destinationPoint(start, 90, 1.0);
+    const nTip = destinationPoint(start, 0, 1.0);
+    const route = [
+      ...makeStraightLine(start, eTip, 30),
+      ...makeStraightLine(eTip, start, 30).slice(1),
+      ...makeStraightLine(start, nTip, 30).slice(1),
+      ...makeStraightLine(nTip, start, 30).slice(1),
+    ];
+    expect(reversalCount(route)).toBeGreaterThanOrEqual(2);
+  });
+
+  it('returns 0 for a route too short to evaluate', () => {
+    const tip = destinationPoint(NYC, 90, 0.05);
+    expect(reversalCount(makeStraightLine(NYC, tip, 5))).toBe(0);
   });
 });

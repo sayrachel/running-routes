@@ -1,7 +1,7 @@
 import type { RoutePoint, GeneratedRoute, RoutePreferences } from './route-generator';
 import { fetchGreenSpacesAndHighways } from './overpass';
 import type { GreenSpace } from './overpass';
-import { scoreRoute, computeGreenSpaceProximity, computeRunPathProximity, computeHighwayProximity, computeWaterfrontProximity } from './route-scoring';
+import { scoreRoute, computeGreenSpaceProximity, computeRunPathProximity, computeHighwayProximity, computeWaterfrontProximity, countStartPasses, reversalCount } from './route-scoring';
 import { emit as traceEmit } from './debug-trace';
 import { isPopularRunningPark } from './popular-running-parks';
 
@@ -2241,6 +2241,12 @@ export async function generateOSRMRoutes(
       const actualMi = distKm * 0.621371;
       const roundedDelta = Math.abs(Math.round(actualMi) - Math.round(targetMi));
       const roundingPenalty = roundedDelta * 0.4;
+      // Topology penalties: discourage barbells (multi-lobe routes joined
+      // through start) and chronic U-turns. Both exempt for out-and-back —
+      // its return leg passes through start by design and its far end IS
+      // a U-turn.
+      const startPasses = isOutAndBack ? 0 : countStartPasses(points);
+      const reversalsPerKm = isOutAndBack || distKm < 0.1 ? 0 : reversalCount(points) / distKm;
       const qualityPenalty = Math.max(0,
         (isOutAndBack ? 0 : retraced) +
         (isOutAndBack ? 0 : overlap) +
@@ -2248,10 +2254,16 @@ export async function generateOSRMRoutes(
         // which countStubs flags; don't penalize it.
         (isOutAndBack ? 0 : stubs * 0.20) +
         Math.abs(1 - distRatio) * 1.0 +
-        roundingPenalty -
+        roundingPenalty +
+        // ~1 stub's worth per extra start-pass; modest enough to lose to
+        // a clean candidate but not to override distance/anchoring.
+        startPasses * 0.15 +
+        // Per-km so longer routes aren't penalized for proportionally
+        // more turns. ~0.05 per U-turn per km.
+        reversalsPerKm * 0.05 -
         anchorBonus
       );
-      traceEmit('candidate-evaluated', { i, distKm, distRatio, hwProximity, retraced, overlap, stubs, roundingPenalty, qualityPenalty });
+      traceEmit('candidate-evaluated', { i, distKm, distRatio, hwProximity, retraced, overlap, stubs, startPasses, reversalsPerKm, roundingPenalty, qualityPenalty });
       resolved.push({ index: i, variant: candidates[i].variant, points, distKm, estimatedTime, fromOSRM: true, anchors: candidates[i].anchors, qualityPenalty });
     } else {
       // OSRM returned nothing — likely network failure, timeout, or no route

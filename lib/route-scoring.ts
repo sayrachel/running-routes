@@ -110,6 +110,116 @@ function proximityFraction(
   return nearCount / samples.length;
 }
 
+// ---------------------------------------------------------------------------
+// Topology metrics: catch "barbell" routes (multiple disjoint lobes joined
+// at start) and routes with chronic U-turns. Distinct from countStubs
+// (short dead-end juts) and retraceRatio (same-segment back-and-forth) —
+// these target route SHAPE: how many lobes, how many sharp reversals.
+// ---------------------------------------------------------------------------
+
+/** Initial bearing from p1 → p2 in degrees [0, 360). */
+function bearingFrom(p1: RoutePoint, p2: RoutePoint): number {
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const dLng = toRad(p2.lng - p1.lng);
+  const lat1 = toRad(p1.lat);
+  const lat2 = toRad(p2.lat);
+  const y = Math.sin(dLng) * Math.cos(lat2);
+  const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLng);
+  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+}
+
+/** Smallest unsigned angle between two bearings (0–180°). */
+function angleDiff(a: number, b: number): number {
+  let d = Math.abs(a - b) % 360;
+  if (d > 180) d = 360 - d;
+  return d;
+}
+
+/**
+ * Count how many times the route re-enters a small circle around the
+ * start point mid-route. A clean loop returns 0 (we leave once, never
+ * come back until the closing segment, which we exclude). A "barbell"
+ * route — two lobes connected through start — returns 1+ because the
+ * runner passes through start between lobes.
+ *
+ * 100m radius is small enough that legitimate near-passes on tight loops
+ * don't trip it, but generous enough to catch a barbell whose connector
+ * doesn't land exactly on points[0].
+ *
+ * Out-and-back routes are NOT exempted here — the caller should skip this
+ * metric for them, since their return leg ends at start by design.
+ */
+export function countStartPasses(points: RoutePoint[], radiusKm: number = 0.1): number {
+  if (points.length < 3) return 0;
+  let inside = true;
+  let entries = 0;
+  for (let i = 1; i < points.length; i++) {
+    const nowInside = haversineDistance(points[0], points[i]) <= radiusKm;
+    if (nowInside && !inside) entries++;
+    inside = nowInside;
+  }
+  // Subtract 1 for the closing approach — every loop legitimately re-enters
+  // the start circle once at the end. Anything beyond that is a barbell joint.
+  return Math.max(0, entries - 1);
+}
+
+/**
+ * Count near-U-turns (heading changes ≥150°) along the route. Sampled
+ * roughly every 50m using a 150m lookback/lookahead window, so:
+ *   - 90° street corners DO NOT count (well below threshold)
+ *   - 120° "cut diagonally to the next street" DOES NOT count
+ *   - Only true reversals (entering a peninsula and U-turning back) count
+ *
+ * A clean loop returns 0; a lollipop returns ~1; an out-and-back returns
+ * 1; a barbell with two distinct lobes returns 2+. After detecting a
+ * reversal we skip ahead by `lookbackKm` so the same U-turn isn't counted
+ * from adjacent sample windows.
+ *
+ * Out-and-back routes are NOT exempted here — the caller should skip this
+ * metric for them, since their far-end U-turn is the entire point.
+ */
+export function reversalCount(
+  points: RoutePoint[],
+  lookbackKm: number = 0.15,
+  thresholdDeg: number = 150
+): number {
+  if (points.length < 4) return 0;
+
+  const cum: number[] = new Array(points.length);
+  cum[0] = 0;
+  for (let i = 1; i < points.length; i++) {
+    cum[i] = cum[i - 1] + haversineDistance(points[i - 1], points[i]);
+  }
+  const total = cum[points.length - 1];
+  if (total < lookbackKm * 2.5) return 0;
+
+  const SAMPLE_KM = 0.05;
+  let reversals = 0;
+  let nextSample = lookbackKm;
+
+  for (let i = 1; i < points.length - 1; i++) {
+    if (cum[i] < nextSample) continue;
+    if (cum[i] > total - lookbackKm) break;
+
+    let iBack = i;
+    while (iBack > 0 && cum[i] - cum[iBack] < lookbackKm) iBack--;
+    let iFwd = i;
+    while (iFwd < points.length - 1 && cum[iFwd] - cum[i] < lookbackKm) iFwd++;
+
+    if (iBack < i && iFwd > i) {
+      const bBack = bearingFrom(points[iBack], points[i]);
+      const bFwd = bearingFrom(points[i], points[iFwd]);
+      if (angleDiff(bBack, bFwd) >= thresholdDeg) {
+        reversals++;
+        nextSample = cum[i] + lookbackKm;
+        continue;
+      }
+    }
+    nextSample = cum[i] + SAMPLE_KM;
+  }
+  return reversals;
+}
+
 /**
  * Compute what fraction of route points are within proximity of a green space.
  * Samples every ~20th point to avoid expensive computation on dense routes.
