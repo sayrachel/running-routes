@@ -221,6 +221,69 @@ export function reversalCount(
 }
 
 /**
+ * Count "real" turns the runner has to make. A turn is a heading change of
+ * ≥`thresholdDeg` over a short window (default 25m back, 25m forward — about
+ * one short city block on each side). Sampled every 20m, with a `minSpacingKm`
+ * dedupe ahead after each counted turn so a single intersection doesn't get
+ * counted twice from adjacent sample windows.
+ *
+ * Default 45° threshold catches every real intersection turn (90° corners,
+ * diagonal jogs, soft "bear left" turns) without being tripped by polyline
+ * curvature noise from OSRM. Smooth circular paths register near zero.
+ *
+ * Why this is distinct from reversalCount: reversalCount uses a 150° threshold
+ * over a 150m window, which is tuned for U-turns (peninsula visits, lollipops).
+ * That misses the kind of turn density that makes a route exhausting to
+ * actually run — zigzag/staircase patterns where every block forces a
+ * "do I turn here?" decision but no individual turn is a reversal.
+ *
+ * Caller divides by route length to get turns/km — useful as a per-km signal
+ * since longer routes naturally have more total turns.
+ */
+export function turnCount(
+  points: RoutePoint[],
+  lookbackKm: number = 0.025,
+  thresholdDeg: number = 45,
+  minSpacingKm: number = 0.04
+): number {
+  if (points.length < 4) return 0;
+
+  const cum: number[] = new Array(points.length);
+  cum[0] = 0;
+  for (let i = 1; i < points.length; i++) {
+    cum[i] = cum[i - 1] + haversineDistance(points[i - 1], points[i]);
+  }
+  const total = cum[points.length - 1];
+  if (total < lookbackKm * 2.5) return 0;
+
+  const SAMPLE_KM = 0.02;
+  let turns = 0;
+  let nextSample = lookbackKm;
+
+  for (let i = 1; i < points.length - 1; i++) {
+    if (cum[i] < nextSample) continue;
+    if (cum[i] > total - lookbackKm) break;
+
+    let iBack = i;
+    while (iBack > 0 && cum[i] - cum[iBack] < lookbackKm) iBack--;
+    let iFwd = i;
+    while (iFwd < points.length - 1 && cum[iFwd] - cum[i] < lookbackKm) iFwd++;
+
+    if (iBack < i && iFwd > i) {
+      const bBack = bearingFrom(points[iBack], points[i]);
+      const bFwd = bearingFrom(points[i], points[iFwd]);
+      if (angleDiff(bBack, bFwd) >= thresholdDeg) {
+        turns++;
+        nextSample = cum[i] + minSpacingKm;
+        continue;
+      }
+    }
+    nextSample = cum[i] + SAMPLE_KM;
+  }
+  return turns;
+}
+
+/**
  * Compute what fraction of route points are within proximity of a green space.
  * Samples every ~20th point to avoid expensive computation on dense routes.
  *

@@ -16,7 +16,7 @@ import {
   estimateCircuitDistance,
   scoreGreenSpace,
 } from '../osrm';
-import { computeHighwayProximity, computeWaterfrontProximity, computeGreenSpaceProximity, computeRunPathProximity, scoreRoute, countStartPasses, reversalCount } from '../route-scoring';
+import { computeHighwayProximity, computeWaterfrontProximity, computeGreenSpaceProximity, computeRunPathProximity, scoreRoute, countStartPasses, reversalCount, turnCount } from '../route-scoring';
 import type { RoutePoint } from '../route-generator';
 import type { GreenSpace } from '../overpass';
 
@@ -1466,5 +1466,78 @@ describe('reversalCount', () => {
   it('returns 0 for a route too short to evaluate', () => {
     const tip = destinationPoint(NYC, 90, 0.05);
     expect(reversalCount(makeStraightLine(NYC, tip, 5))).toBe(0);
+  });
+});
+
+describe('turnCount', () => {
+  it('returns 0 for a straight line — no turns at all', () => {
+    const tip = destinationPoint(NYC, 90, 1.0);
+    expect(turnCount(makeStraightLine(NYC, tip, 50))).toBe(0);
+  });
+
+  it('returns 0 for a smooth circular loop — curvature is below threshold', () => {
+    // 80-point circle: each interior angle is 360/80 = 4.5°, well under the
+    // 45° default threshold even when accumulated over a 25m window.
+    const loop = makeCircle(NYC, 0.5, 80);
+    expect(turnCount(loop)).toBe(0);
+  });
+
+  it('returns 1 for a single 90° corner (L-shape)', () => {
+    const a = destinationPoint(NYC, 90, 0.5);
+    const b = destinationPoint(a, 0, 0.5);
+    const route = [
+      ...makeStraightLine(NYC, a, 30),
+      ...makeStraightLine(a, b, 30).slice(1),
+    ];
+    expect(turnCount(route)).toBe(1);
+  });
+
+  it('counts 3 of 4 corners on a 500m square loop (4th falls in trailing exclusion)', () => {
+    // 500m square. The closing corner at the start/end point falls inside
+    // the `lookbackKm` trailing exclusion zone — same behavior as
+    // reversalCount, and it's the right behavior for a closed loop where
+    // the start/end corner isn't a meaningful "decision" mid-run.
+    const a = destinationPoint(NYC, 90, 0.5);
+    const b = destinationPoint(a, 0, 0.5);
+    const c = destinationPoint(b, 270, 0.5);
+    const route = [
+      ...makeStraightLine(NYC, a, 30),
+      ...makeStraightLine(a, b, 30).slice(1),
+      ...makeStraightLine(b, c, 30).slice(1),
+      ...makeStraightLine(c, NYC, 30).slice(1),
+    ];
+    expect(turnCount(route)).toBe(3);
+  });
+
+  it('counts a zigzag staircase pattern as many turns', () => {
+    // Six 90° turns alternating E/N/E/N/E/N over ~500m total. This is the
+    // shape pattern in the user's "Backstreet Run" screenshot — short
+    // perpendicular segments forcing constant decisions.
+    const STEP = 0.08; // 80m per leg
+    let cur = NYC;
+    const legs: RoutePoint[] = [cur];
+    for (let i = 0; i < 6; i++) {
+      const bearing = i % 2 === 0 ? 90 : 0;
+      const next = destinationPoint(cur, bearing, STEP);
+      legs.push(...makeStraightLine(cur, next, 8).slice(1));
+      cur = next;
+    }
+    // 5 interior corners (1st leg has no preceding turn). All 90°.
+    expect(turnCount(legs)).toBeGreaterThanOrEqual(5);
+  });
+
+  it('does NOT count a 30° gentle bend (below default threshold)', () => {
+    const a = destinationPoint(NYC, 90, 0.5);
+    const b = destinationPoint(a, 60, 0.5); // bend of 30°
+    const route = [
+      ...makeStraightLine(NYC, a, 30),
+      ...makeStraightLine(a, b, 30).slice(1),
+    ];
+    expect(turnCount(route)).toBe(0);
+  });
+
+  it('returns 0 for a route too short to evaluate', () => {
+    const tip = destinationPoint(NYC, 90, 0.03);
+    expect(turnCount(makeStraightLine(NYC, tip, 5))).toBe(0);
   });
 });

@@ -15,7 +15,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { generateOSRMRoutes, retraceRatio, overlapSegmentRatio, haversineDistance, calculateSearchRadius, dumpOSRMCache, loadOSRMCache, setOSRMCacheMax, setOSRMMock, setDeterministicSeed, countStubs, setOSRMBase, clearOSRMCache } from '../osrm';
 import { fetchGreenSpacesAndHighways, dumpOverpassCaches, loadOverpassCaches, prefillOverpassCaches } from '../overpass';
-import { computeGreenSpaceProximity } from '../route-scoring';
+import { computeGreenSpaceProximity, turnCount } from '../route-scoring';
 import type { RoutePoint, RoutePreferences } from '../route-generator';
 import { enableTrace, flushTrace, type TraceEvent } from '../debug-trace';
 import { syntheticForCenter } from './fixtures/synthetic-green-spaces';
@@ -187,6 +187,11 @@ interface RouteMetrics {
    *  A high `backtrack` count combined with `chosenFromFallback=true` is
    *  the smoking gun for "hard-reject too aggressive for this area". */
   rejectionCounts: { distance: number; barrier: number; highway: number; backtrack: number; osrmNull: number };
+  /** Turns per km — number of ≥45° heading changes per route km. Reported
+   *  for measurement only (no threshold yet); tracking turn density to size
+   *  a future scoring penalty for zigzag/staircase routes that pass distance
+   *  + retrace + overlap thresholds but are exhausting to actually run. */
+  turnsPerKm: number;
 }
 
 interface FixtureResult {
@@ -389,6 +394,7 @@ async function runFixture(f: Fixture, captureTrace: boolean, useSynthetic: boole
       stubs: countStubs(points),
       chosenFromFallback,
       rejectionCounts,
+      turnsPerKm: actualKm > 0 ? turnCount(points) / actualKm : 0,
     };
     const failures = applyThresholds(f, metrics);
     return {
@@ -428,6 +434,7 @@ function fmtRow(r: FixtureResult): string {
     `retr=${(m.retraceRatio * 100).toFixed(0)}%  ` +
     `over=${(m.overlapRatio * 100).toFixed(0)}%  ` +
     `stubs=${m.stubs}  ` +
+    `t/km=${m.turnsPerKm.toFixed(1)}  ` +
     `green=${(m.greenProximity * 100).toFixed(0)}%  ` +
     `anch=${m.anchorCount}  ` +
     `pts=${m.pointCount}`;

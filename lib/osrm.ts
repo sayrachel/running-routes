@@ -1,7 +1,7 @@
 import type { RoutePoint, GeneratedRoute, RoutePreferences } from './route-generator';
 import { fetchGreenSpacesAndHighways } from './overpass';
 import type { GreenSpace } from './overpass';
-import { scoreRoute, computeGreenSpaceProximity, computeRunPathProximity, computeHighwayProximity, computeWaterfrontProximity, countStartPasses, reversalCount } from './route-scoring';
+import { scoreRoute, computeGreenSpaceProximity, computeRunPathProximity, computeHighwayProximity, computeWaterfrontProximity, countStartPasses, reversalCount, turnCount } from './route-scoring';
 import { emit as traceEmit } from './debug-trace';
 import { isPopularRunningPark } from './popular-running-parks';
 
@@ -2247,23 +2247,53 @@ export async function generateOSRMRoutes(
       // a U-turn.
       const startPasses = isOutAndBack ? 0 : countStartPasses(points);
       const reversalsPerKm = isOutAndBack || distKm < 0.1 ? 0 : reversalCount(points) / distKm;
+      // Turn density: penalize zigzag/staircase routes that pass retrace +
+      // overlap + stubs cleanly but force a turn every block. The user
+      // complaint pattern (May 2026) was 4mi East Village routes at ~5
+      // turns/km — visibly fine on every other metric, exhausting to run.
+      // Floor scales inversely with target distance: a closed loop has a
+      // baseline minimum turn count (~4 for any rectangle), so t/km is
+      // mathematically higher for short loops regardless of zigzag — 1mi
+      // loops can't get below ~5 t/km even when clean. Empirical floor:
+      // max(2.0, 6.0 / targetMi). Out-and-back exempt (its return leg
+      // doubles the turn count from the perspective of unique decisions).
+      const targetMiForFloor = distanceKm * 0.621371;
+      const turnFloor = Math.max(2.0, 6.0 / Math.max(0.5, targetMiForFloor));
+      const turnsPerKm = isOutAndBack || distKm < 0.1 ? 0 : turnCount(points) / distKm;
+      const excessTurns = Math.max(0, turnsPerKm - turnFloor);
+      // 0.10 per excess turn/km. Sized so a 4mi East Village at 5 t/km pays
+      // ~0.30 (loses to a cleaner candidate when one exists), but a clean
+      // 2.6 t/km route pays ~0.06 (effectively zero, doesn't override
+      // distance/anchoring). Out-and-back exempt.
+      const turnPenalty = isOutAndBack ? 0 : excessTurns * 0.10;
       const qualityPenalty = Math.max(0,
         (isOutAndBack ? 0 : retraced) +
         (isOutAndBack ? 0 : overlap) +
         // Out-and-back routes have an intentional U-turn at the far end
         // which countStubs flags; don't penalize it.
         (isOutAndBack ? 0 : stubs * 0.20) +
-        Math.abs(1 - distRatio) * 1.0 +
+        // Distance accuracy must dominate the scorer. Originally weighted
+        // 1.0×, but that left enough room for the anchor bonus (0.10) +
+        // turn-density delta to flip a 4%-off candidate against an 18%-off
+        // candidate. The user-reported regression: a 2mi East Village
+        // request returning 1.64mi instead of 2.09mi just because the
+        // shorter route had named anchors and slightly fewer turns. The
+        // right way to reduce turns is to pick a different shape at the
+        // requested distance — never to trade distance for a cleaner shape.
+        // 2.0× means a 10% miss costs 0.20 (twice the anchor bonus) and an
+        // 18% miss costs 0.36 (more than the typical turn-density delta).
+        Math.abs(1 - distRatio) * 2.0 +
         roundingPenalty +
         // ~1 stub's worth per extra start-pass; modest enough to lose to
         // a clean candidate but not to override distance/anchoring.
         startPasses * 0.15 +
         // Per-km so longer routes aren't penalized for proportionally
         // more turns. ~0.05 per U-turn per km.
-        reversalsPerKm * 0.05 -
+        reversalsPerKm * 0.05 +
+        turnPenalty -
         anchorBonus
       );
-      traceEmit('candidate-evaluated', { i, distKm, distRatio, hwProximity, retraced, overlap, stubs, startPasses, reversalsPerKm, roundingPenalty, qualityPenalty });
+      traceEmit('candidate-evaluated', { i, distKm, distRatio, hwProximity, retraced, overlap, stubs, startPasses, reversalsPerKm, turnsPerKm, turnPenalty, roundingPenalty, qualityPenalty });
       resolved.push({ index: i, variant: candidates[i].variant, points, distKm, estimatedTime, fromOSRM: true, anchors: candidates[i].anchors, qualityPenalty });
     } else {
       // OSRM returned nothing — likely network failure, timeout, or no route
