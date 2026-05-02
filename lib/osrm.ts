@@ -1486,12 +1486,25 @@ export function scaleWaypoints(
  *  `route.distance` field is the user-visible mile/km integer — if these
  *  don't match, the user reads the wrong number on the run screen even when
  *  the absolute error is small. */
-function roundedDisplayMatches(routeKm: number, targetKm: number, units: 'imperial' | 'metric'): boolean {
+export function roundedDisplayMatches(routeKm: number, targetKm: number, units: 'imperial' | 'metric'): boolean {
   if (units === 'metric') {
     return Math.round(routeKm) === Math.round(targetKm);
   }
   const MI_PER_KM = 0.621371;
   return Math.round(routeKm * MI_PER_KM) === Math.round(targetKm * MI_PER_KM);
+}
+
+/** Looser version of roundedDisplayMatches: rounded distance is within ±1 of
+ *  target. Used as a guardrail on the wrong-display fallback pool — without it,
+ *  the fallback could ship a 4mi route for a 7mi request (ratio 0.57 still
+ *  passes the [0.5, 1.3] candidate gate). User has explicitly accepted "off
+ *  by one mile" as fallback UX, but anything beyond that is read as broken. */
+export function nearDisplayMatches(routeKm: number, targetKm: number, units: 'imperial' | 'metric'): boolean {
+  if (units === 'metric') {
+    return Math.abs(Math.round(routeKm) - Math.round(targetKm)) <= 1;
+  }
+  const MI_PER_KM = 0.621371;
+  return Math.abs(Math.round(routeKm * MI_PER_KM) - Math.round(targetKm * MI_PER_KM)) <= 1;
 }
 
 async function fetchOSRMRouteAdjusted(
@@ -2800,13 +2813,31 @@ export async function generateOSRMRoutes(
   // refresh button can hunt for a better-fitting candidate. Logged so harness
   // can flag this as a known-imperfect case.
   if (resolved.length === 0 && wrongDisplayFallback.length > 0) {
-    const sortedFallback = [...wrongDisplayFallback].sort((a, b) => a.qualityPenalty - b.qualityPenalty);
-    traceEmit('wrong-display-fallback-used', {
-      candidateCount: wrongDisplayFallback.length,
-      bestDistKm: sortedFallback[0].distKm,
-      targetKm: distanceKm,
-    });
-    resolved.push(...sortedFallback);
+    // Guardrail: only promote fallbacks whose distance rounds to within ±1
+    // mile/km of target. The candidate distance gate is [0.5, 1.3] of target
+    // — wide enough that a 4mi route can pass it for a 7mi request, then ship
+    // as the cleanest wrong-display fallback. Off-by-one rounded display is
+    // the user's accepted compromise; off-by-three reads as a broken algo.
+    const fallbackUnits = useAdjustment ? adjustUnits : null;
+    const eligible = fallbackUnits
+      ? wrongDisplayFallback.filter((c) => nearDisplayMatches(c.distKm, distanceKm, fallbackUnits))
+      : wrongDisplayFallback;
+    if (eligible.length > 0) {
+      const sortedFallback = [...eligible].sort((a, b) => a.qualityPenalty - b.qualityPenalty);
+      traceEmit('wrong-display-fallback-used', {
+        candidateCount: eligible.length,
+        rejectedFarCount: wrongDisplayFallback.length - eligible.length,
+        bestDistKm: sortedFallback[0].distKm,
+        targetKm: distanceKm,
+      });
+      resolved.push(...sortedFallback);
+    } else {
+      traceEmit('wrong-display-fallback-rejected', {
+        candidateCount: wrongDisplayFallback.length,
+        targetKm: distanceKm,
+        reason: 'all-too-far-from-target',
+      });
+    }
   }
 
   // Step 4: Score each candidate using locally-computable metrics only.

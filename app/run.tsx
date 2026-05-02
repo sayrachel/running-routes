@@ -25,7 +25,7 @@ import { saveRunRecord, addPendingRun, getCachedRunHistory } from '@/lib/firesto
 import { buildGoogleMapsUrl } from '@/lib/route-export';
 import { BottomTabBar } from '@/components/BottomTabBar';
 import { Colors, Fonts } from '@/lib/theme';
-import { generateOSRMRoutes } from '@/lib/osrm';
+import { generateOSRMRoutes, OSRMUnavailableError } from '@/lib/osrm';
 import { persistOverpassCache } from '@/lib/overpass-persist';
 import { persistOSRMCache } from '@/lib/osrm-persist';
 
@@ -51,6 +51,16 @@ export default function RunScreen() {
   const [routeIndex, setRouteIndex] = useState(0);
   const [drawerVisible, setDrawerVisible] = useState(false);
   const [drawerInitialView, setDrawerInitialView] = useState<DrawerView>('profile');
+  // Banner shown when refresh produces no usable route. Keeps the current
+  // route visible (don't bounce to plan — the user loses context and gets
+  // stuck in a loop if generation keeps failing) and tells them what happened.
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+  const refreshErrorTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    return () => {
+      if (refreshErrorTimeout.current) clearTimeout(refreshErrorTimeout.current);
+    };
+  }, []);
   const runSessionId = useRef(`run-${Date.now()}`);
 
   const isRunning = runState === 'running';
@@ -251,6 +261,12 @@ export default function RunScreen() {
   //      which intermittently crashed the app on iOS. Instead we just flip
   //      isGenerating — the bottom sheet swaps to the spinner while the old
   //      route stays visible on the map until the new one swaps in atomically.
+  const showRefreshError = useCallback((msg: string) => {
+    setRefreshError(msg);
+    if (refreshErrorTimeout.current) clearTimeout(refreshErrorTimeout.current);
+    refreshErrorTimeout.current = setTimeout(() => setRefreshError(null), 5000);
+  }, []);
+
   const handleRefresh = useCallback(async () => {
     if (ctx.isGenerating || hasStarted) return;
 
@@ -262,6 +278,7 @@ export default function RunScreen() {
 
     ctx.setIsGenerating(true);
     setRouteIndex(0);
+    setRefreshError(null);
 
     try {
       const newRoutes = await generateOSRMRoutes(
@@ -275,23 +292,27 @@ export default function RunScreen() {
         ctx.endLocation,
         previousAnchors,
       );
+      ctx.setIsGenerating(false);
       if (newRoutes.length === 0) {
-        // Don't strand the user on a blank screen — bounce back to plan.
-        ctx.setIsGenerating(false);
-        router.replace('/');
+        // Keep the previous route visible — bouncing to plan strands the
+        // user with no route AND no clear next step (they hit generate, hit
+        // the same failure, get bounced again). Surface a banner instead.
+        showRefreshError("Couldn't find a different route. Try again or change distance.");
         return;
       }
       ctx.setRoutes(newRoutes);
       ctx.setSelectedRoute(newRoutes[0]);
-      ctx.setIsGenerating(false);
       persistOverpassCache();
       persistOSRMCache();
     } catch (err) {
       console.warn('Route refresh failed:', err);
       ctx.setIsGenerating(false);
-      router.replace('/');
+      const msg = err instanceof OSRMUnavailableError
+        ? 'Routing service is slow. Please try again in a moment.'
+        : "Couldn't refresh route. Check your connection and try again.";
+      showRefreshError(msg);
     }
-  }, [ctx, hasStarted, router]);
+  }, [ctx, hasStarted, showRefreshError]);
 
   // Real GPS-derived stats
   const { totalDistanceKm, elapsedSeconds, currentPace, avgPace, splits, coordinates, currentPosition } = tracking.stats;
@@ -446,6 +467,13 @@ export default function RunScreen() {
                   />
                 </Pressable>
               </View>
+            </View>
+          )}
+
+          {refreshError && !hasStarted && (
+            <View style={styles.refreshErrorBanner}>
+              <Ionicons name="alert-circle" size={14} color={Colors.destructive} />
+              <Text style={styles.refreshErrorText}>{refreshError}</Text>
             </View>
           )}
 
@@ -644,6 +672,23 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  refreshErrorBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: Colors.destructive + '1A',
+    borderRadius: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    marginTop: 8,
+    marginHorizontal: 4,
+  },
+  refreshErrorText: {
+    flex: 1,
+    fontFamily: Fonts.sans,
+    fontSize: 11,
+    color: Colors.destructive,
   },
   emptyState: {
     alignItems: 'center',

@@ -12,6 +12,8 @@ import {
   countStubs,
   trimStubs,
   countPendantLoops,
+  roundedDisplayMatches,
+  nearDisplayMatches,
   generateOSRMRoutes,
   setOSRMMock,
   setMockOSRMLatency,
@@ -177,6 +179,55 @@ describe('calculateSearchRadius', () => {
     // haversine(center, end) ~ 11.1 km, * 0.6 ~ 6.67
     expect(radius).toBeGreaterThan(5);
     expect(radius).toBeLessThan(10);
+  });
+});
+
+describe('roundedDisplayMatches', () => {
+  it('imperial: 5mi target / 5mi route → match', () => {
+    const fiveMi = 5 / 0.621371;
+    expect(roundedDisplayMatches(fiveMi, fiveMi, 'imperial')).toBe(true);
+  });
+  it('imperial: 5mi target / 5.6mi route (rounds to 6) → no match', () => {
+    const fiveMi = 5 / 0.621371;
+    const fiveSix = 5.6 / 0.621371;
+    expect(roundedDisplayMatches(fiveSix, fiveMi, 'imperial')).toBe(false);
+  });
+  it('metric: 5km target / 5.4km route (rounds to 5) → match', () => {
+    expect(roundedDisplayMatches(5.4, 5, 'metric')).toBe(true);
+  });
+  it('metric: 5km target / 5.6km route (rounds to 6) → no match', () => {
+    expect(roundedDisplayMatches(5.6, 5, 'metric')).toBe(false);
+  });
+});
+
+describe('nearDisplayMatches', () => {
+  // Guards the wrong-display fallback against returning wildly wrong distances
+  // (e.g. 4mi for a 7mi request) when no candidate hits the requested mile.
+  it('imperial: 7mi target / 4mi route (off by 3) → no match', () => {
+    const sevenMi = 7 / 0.621371;
+    const fourMi = 4 / 0.621371;
+    expect(nearDisplayMatches(fourMi, sevenMi, 'imperial')).toBe(false);
+  });
+  it('imperial: 7mi target / 6mi route (off by 1) → match', () => {
+    const sevenMi = 7 / 0.621371;
+    const sixMi = 6 / 0.621371;
+    expect(nearDisplayMatches(sixMi, sevenMi, 'imperial')).toBe(true);
+  });
+  it('imperial: 7mi target / 8mi route (off by 1) → match', () => {
+    const sevenMi = 7 / 0.621371;
+    const eightMi = 8 / 0.621371;
+    expect(nearDisplayMatches(eightMi, sevenMi, 'imperial')).toBe(true);
+  });
+  it('imperial: 20mi target / 22mi route (off by 2) → no match', () => {
+    const twentyMi = 20 / 0.621371;
+    const twentyTwoMi = 22 / 0.621371;
+    expect(nearDisplayMatches(twentyTwoMi, twentyMi, 'imperial')).toBe(false);
+  });
+  it('metric: 5km target / 6km route (off by 1) → match', () => {
+    expect(nearDisplayMatches(6, 5, 'metric')).toBe(true);
+  });
+  it('metric: 5km target / 7km route (off by 2) → no match', () => {
+    expect(nearDisplayMatches(7, 5, 'metric')).toBe(false);
   });
 });
 
