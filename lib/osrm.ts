@@ -2651,8 +2651,23 @@ export async function generateOSRMRoutes(
       }
       // Safety net: if trim left any pendant loops behind, drop the candidate.
       const fallbackPendant = routeType === 'out-and-back' ? 0 : countPendantLoops(points);
+      // Distance sanity. Step 3 candidates pass through this same band
+      // (line ~2305), but step 3.5 historically had no distance check at
+      // all — so when OSRM returned a degenerate ~0.5km result for a 30mi
+      // request (waypoints 9km from center crossing rivers, OSRM gives up),
+      // it shipped as a "0 mi" route. This catches that. The wrong-display
+      // fallback is for "displays as the wrong integer mile" not "displays
+      // as zero" — anything outside the same [0.5, 1.3] band step 3 enforces
+      // is catastrophically wrong, never user-facing.
+      const fallbackMaxRatio = routeType === 'point-to-point' ? 3.0 : 1.3;
+      const fallbackMinRatio = routeType === 'point-to-point' ? 0.2 : 0.5;
+      const fallbackDistRatio = distanceKm > 0 ? fallbackDistKm / distanceKm : 1;
+      const fallbackDistanceOutOfBand =
+        fallbackDistRatio > fallbackMaxRatio || fallbackDistRatio < fallbackMinRatio;
       if (fallbackPendant > 0) {
         traceEmit('candidate-rejected', { i: -1, reason: 'pendant-loop', pendantLoops: fallbackPendant, source: 'fallback-post-trim-residual' });
+      } else if (fallbackDistanceOutOfBand) {
+        traceEmit('candidate-rejected', { i: -1, reason: 'distance', distKm: fallbackDistKm, distRatio: fallbackDistRatio, target: distanceKm, source: 'fallback' });
       } else {
         const fallbackRecord: ResolvedCandidate = {
           index: 0,
