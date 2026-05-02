@@ -13,7 +13,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { generateOSRMRoutes, retraceRatio, overlapSegmentRatio, haversineDistance, calculateSearchRadius, dumpOSRMCache, loadOSRMCache, setOSRMCacheMax, setOSRMMock, setDeterministicSeed, countStubs, setOSRMBase, clearOSRMCache } from '../osrm';
+import { generateOSRMRoutes, retraceRatio, overlapSegmentRatio, haversineDistance, calculateSearchRadius, dumpOSRMCache, loadOSRMCache, setOSRMCacheMax, setOSRMMock, setDeterministicSeed, countStubs, countPendantLoops, setOSRMBase, clearOSRMCache } from '../osrm';
 import { fetchGreenSpacesAndHighways, dumpOverpassCaches, loadOverpassCaches, prefillOverpassCaches } from '../overpass';
 import { computeGreenSpaceProximity, turnCount } from '../route-scoring';
 import type { RoutePoint, RoutePreferences } from '../route-generator';
@@ -147,6 +147,12 @@ interface Thresholds {
   // route to enforce this; the harness threshold of 0 catches any case
   // where trimStubs misses a pattern.
   maxStubs: number;
+  // Hard cap on pendant loops (closed sub-loop attached by a single
+  // bridge segment traversed twice — see countPendantLoops). User-facing
+  // requirement: ZERO. Production hard-rejects any candidate with one;
+  // the harness threshold of 0 catches any case where the chosen route
+  // somehow still has one (e.g. step-3.5 fallback).
+  maxPendantLoops: number;
 }
 
 const DEFAULT_THRESHOLDS: Thresholds = {
@@ -154,6 +160,7 @@ const DEFAULT_THRESHOLDS: Thresholds = {
   maxRetraceRatio: 0.08,
   maxOverlapRatio: 0.10,
   maxStubs: 0,
+  maxPendantLoops: 0,
 };
 
 interface RouteMetrics {
@@ -175,6 +182,12 @@ interface RouteMetrics {
   /** Count of dead-end stubs (visible "small jutting line" pattern). >0 means
    *  the route forces the runner into a dead-end and back. */
   stubs: number;
+  /** Count of pendant loops (closed sub-loops attached by a single bridge
+   *  segment traversed twice — visually a small square hanging off a stem,
+   *  unrunnable as a single continuous path without doubling back). Production
+   *  hard-rejects any candidate with one; >0 here means the chosen route
+   *  came from a path that bypassed the reject (e.g. geometric fallback). */
+  pendantLoops: number;
   /** True if the algorithm fell through to step 3.5 (geometric bearing-trial
    *  fallback) instead of selecting an OSRM-routed anchored candidate. This
    *  is a strong negative signal whenever Overpass returned green spaces:
@@ -186,7 +199,7 @@ interface RouteMetrics {
   /** Per-reason count of how many candidates were rejected during step 3.
    *  A high `backtrack` count combined with `chosenFromFallback=true` is
    *  the smoking gun for "hard-reject too aggressive for this area". */
-  rejectionCounts: { distance: number; barrier: number; highway: number; backtrack: number; osrmNull: number };
+  rejectionCounts: { distance: number; barrier: number; highway: number; backtrack: number; pendantLoop: number; osrmNull: number };
   /** Turns per km — number of ≥45° heading changes per route km. Reported
    *  for measurement only (no threshold yet); tracking turn density to size
    *  a future scoring penalty for zigzag/staircase routes that pass distance
@@ -257,6 +270,14 @@ function applyThresholds(f: Fixture, m: RouteMetrics): string[] {
       `${m.stubs} dead-end stubs (max ${t.maxStubs}) — runner can't follow as one path`
     );
   }
+  // Pendant loops are NEVER acceptable for loop routes — the polyline can't
+  // be physically run end-to-end without doubling back across the bridge.
+  // Out-and-back exempt (its return leg looks like a pendant of every segment).
+  if (f.routeType !== 'out-and-back' && m.pendantLoops > t.maxPendantLoops) {
+    failures.push(
+      `${m.pendantLoops} pendant loops (max ${t.maxPendantLoops}) — closed sub-loop attached by single bridge, unrunnable as one path`
+    );
+  }
   // Step-3.5-fired-when-anchored check. The classic mode of regression that
   // pure metric thresholds miss: the chosen route's distance/retrace/stubs
   // can all look fine on their own, but it came from the geometric bearing-
@@ -265,8 +286,9 @@ function applyThresholds(f: Fixture, m: RouteMetrics): string[] {
   // 200m away. Only fail when Overpass actually returned data — fixtures in
   // green-space-poor areas legitimately use the fallback.
   if (m.chosenFromFallback && m.hasOverpassData) {
-    const breakdown = `backtrack=${m.rejectionCounts.backtrack}, distance=${m.rejectionCounts.distance}, ` +
-      `barrier=${m.rejectionCounts.barrier}, highway=${m.rejectionCounts.highway}, osrm-null=${m.rejectionCounts.osrmNull}`;
+    const breakdown = `backtrack=${m.rejectionCounts.backtrack}, pendant-loop=${m.rejectionCounts.pendantLoop}, ` +
+      `distance=${m.rejectionCounts.distance}, barrier=${m.rejectionCounts.barrier}, ` +
+      `highway=${m.rejectionCounts.highway}, osrm-null=${m.rejectionCounts.osrmNull}`;
     failures.push(
       `step-3.5 fallback fired despite Overpass data — anchored candidates rejected (${breakdown})`
     );
@@ -368,7 +390,7 @@ async function runFixture(f: Fixture, captureTrace: boolean, useSynthetic: boole
     // the algorithm dropped to geometric bearing-trial routing because every
     // step-3 candidate was rejected. That's the "Sidestreet Shuffle" anchorless
     // rectangle pattern in the East Village 4mi screenshot.
-    const rejectionCounts = { distance: 0, barrier: 0, highway: 0, backtrack: 0, osrmNull: 0 };
+    const rejectionCounts = { distance: 0, barrier: 0, highway: 0, backtrack: 0, pendantLoop: 0, osrmNull: 0 };
     let chosenFromFallback = false;
     for (const e of trace) {
       if (e.event === 'fallback-start') chosenFromFallback = true;
@@ -378,6 +400,7 @@ async function runFixture(f: Fixture, captureTrace: boolean, useSynthetic: boole
         else if (reason === 'barrier') rejectionCounts.barrier++;
         else if (reason === 'highway') rejectionCounts.highway++;
         else if (reason === 'backtrack') rejectionCounts.backtrack++;
+        else if (reason === 'pendant-loop') rejectionCounts.pendantLoop++;
         else if (reason === 'osrm-null') rejectionCounts.osrmNull++;
       }
     }
@@ -392,6 +415,7 @@ async function runFixture(f: Fixture, captureTrace: boolean, useSynthetic: boole
       greenProximity: computeGreenSpaceProximity(points, op.greenSpaces),
       anchorCount,
       stubs: countStubs(points),
+      pendantLoops: countPendantLoops(points),
       chosenFromFallback,
       rejectionCounts,
       turnsPerKm: actualKm > 0 ? turnCount(points) / actualKm : 0,
@@ -434,6 +458,7 @@ function fmtRow(r: FixtureResult): string {
     `retr=${(m.retraceRatio * 100).toFixed(0)}%  ` +
     `over=${(m.overlapRatio * 100).toFixed(0)}%  ` +
     `stubs=${m.stubs}  ` +
+    `pend=${m.pendantLoops}  ` +
     `t/km=${m.turnsPerKm.toFixed(1)}  ` +
     `green=${(m.greenProximity * 100).toFixed(0)}%  ` +
     `anch=${m.anchorCount}  ` +
@@ -441,9 +466,9 @@ function fmtRow(r: FixtureResult): string {
   // Show per-reason rejection breakdown only when something interesting
   // happened — otherwise it's noise on every clean PASS row.
   const rc = m.rejectionCounts;
-  const totalRejects = rc.distance + rc.barrier + rc.highway + rc.backtrack + rc.osrmNull;
+  const totalRejects = rc.distance + rc.barrier + rc.highway + rc.backtrack + rc.pendantLoop + rc.osrmNull;
   const rejectStr = totalRejects > 0
-    ? `  rej={bt=${rc.backtrack},d=${rc.distance},h=${rc.highway},b=${rc.barrier},n=${rc.osrmNull}}`
+    ? `  rej={bt=${rc.backtrack},pl=${rc.pendantLoop},d=${rc.distance},h=${rc.highway},b=${rc.barrier},n=${rc.osrmNull}}`
     : '';
   const tail = r.failures.length ? `  -- ${r.failures.join('; ')}` : '';
   return `${tag}  ${dataTag}${pad(r.fixture.name, 32)}  ${summary}${rejectStr}${tail}`;

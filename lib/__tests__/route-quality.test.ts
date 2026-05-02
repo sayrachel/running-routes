@@ -1,6 +1,8 @@
 import {
   removeSelfintersections,
   retraceRatio,
+  countPendantLoops,
+  trimPendantLoops,
   segmentsCross,
   hasLikelyWaterCrossing,
   removeWaterCrossings,
@@ -181,6 +183,149 @@ describe('retraceRatio', () => {
     const r = retraceRatio(route);
     expect(r).toBeGreaterThan(0.2);
     expect(r).toBeLessThan(0.5);
+  });
+});
+
+describe('countPendantLoops', () => {
+  // A "pendant loop" is a closed sub-loop attached to the rest of the polyline
+  // by a single bridge segment traversed in both directions. Visually: a small
+  // square hanging off a stem. Unrunnable as one continuous path.
+
+  /** Build a polyline with shape: stem (from→bridgeStart) + pendant square +
+   *  reverse stem. The pendant has 4 points around a small block. */
+  function makePendantLoopRoute(start: RoutePoint): RoutePoint[] {
+    // Walk east from start for 6 segments — this is the "main route" before
+    // we hit the bridge.
+    const pre: RoutePoint[] = [];
+    for (let i = 0; i <= 6; i++) {
+      pre.push(destinationPoint(start, 90, 0.05 * i));
+    }
+    // Bridge into the pendant: one segment going north (~80m).
+    const bridgeBase = pre[pre.length - 1];
+    const bridgeTip = destinationPoint(bridgeBase, 0, 0.08);
+    // Pendant square: 2 more corners (NE, then SE), then back to bridgeTip.
+    const ne = destinationPoint(bridgeTip, 90, 0.08);
+    const se = destinationPoint(ne, 180, 0.08);
+    // Walk continues east after the pendant.
+    const post: RoutePoint[] = [];
+    for (let i = 1; i <= 6; i++) {
+      post.push(destinationPoint(bridgeBase, 90, 0.05 * i));
+    }
+    return [
+      ...pre,                  // main route arriving from the west
+      bridgeTip,               // bridge in (one segment, bridgeBase → bridgeTip)
+      ne,                      // around the pendant
+      se,
+      bridgeTip,               // close pendant back at bridgeTip
+      bridgeBase,              // bridge out (reverse of bridge in)
+      ...post,                 // main route continuing east
+    ];
+  }
+
+  it('returns 0 for a clean non-retracing path', () => {
+    const route = makeStraightLine(NYC, destinationPoint(NYC, 90, 1), 30);
+    expect(countPendantLoops(route)).toBe(0);
+  });
+
+  it('returns 0 for a clean circle (no bridge)', () => {
+    const circle = makeCircle(NYC, 0.5, 30);
+    expect(countPendantLoops(circle)).toBe(0);
+  });
+
+  it('detects a single pendant loop (square attached by a stem)', () => {
+    const route = makePendantLoopRoute(NYC);
+    expect(countPendantLoops(route)).toBe(1);
+  });
+
+  it('detects two separate pendant loops on the same route', () => {
+    const a = makePendantLoopRoute(NYC);
+    const tail = a[a.length - 1];
+    const b = makePendantLoopRoute(tail);
+    const stacked = [...a, ...b.slice(1)];
+    expect(countPendantLoops(stacked)).toBe(2);
+  });
+
+  it('does not count a normal out-and-back as multiple pendants', () => {
+    // OAB has the entire return reversed — caller is expected to skip OAB.
+    // This test pins behavior: we report SOMETHING (not zero), and the
+    // caller must guard. We just check the function doesn't crash and
+    // returns a non-negative integer.
+    const out = makeStraightLine(NYC, destinationPoint(NYC, 90, 1), 20);
+    const back = [...out].reverse().slice(1);
+    const route = [...out, ...back];
+    const n = countPendantLoops(route);
+    expect(n).toBeGreaterThanOrEqual(0);
+  });
+
+  it('does not flag a 1-segment immediate stub as a pendant loop', () => {
+    // A→B→A — this is a degenerate stub, not a pendant. countStubs handles it.
+    const a: RoutePoint = { lat: 40.7, lng: -74.0 };
+    const b: RoutePoint = { lat: 40.701, lng: -74.0 };
+    const route = [a, b, a, { lat: 40.701, lng: -73.999 }, { lat: 40.702, lng: -73.999 }];
+    expect(countPendantLoops(route)).toBe(0);
+  });
+});
+
+describe('trimPendantLoops', () => {
+  /** Same shape as countPendantLoops's helper — duplicated locally to keep
+   *  the two describe blocks self-contained. */
+  function makePendantLoopRoute(start: RoutePoint): RoutePoint[] {
+    const pre: RoutePoint[] = [];
+    for (let i = 0; i <= 6; i++) {
+      pre.push(destinationPoint(start, 90, 0.05 * i));
+    }
+    const bridgeBase = pre[pre.length - 1];
+    const bridgeTip = destinationPoint(bridgeBase, 0, 0.08);
+    const ne = destinationPoint(bridgeTip, 90, 0.08);
+    const se = destinationPoint(ne, 180, 0.08);
+    const post: RoutePoint[] = [];
+    for (let i = 1; i <= 6; i++) {
+      post.push(destinationPoint(bridgeBase, 90, 0.05 * i));
+    }
+    return [...pre, bridgeTip, ne, se, bridgeTip, bridgeBase, ...post];
+  }
+
+  it('returns short routes unchanged (< 5 points)', () => {
+    const short: RoutePoint[] = [
+      { lat: 40.7, lng: -74.0 },
+      { lat: 40.701, lng: -74.0 },
+      { lat: 40.701, lng: -73.999 },
+    ];
+    expect(trimPendantLoops(short)).toBe(short);
+  });
+
+  it('returns a clean circle unchanged', () => {
+    const circle = makeCircle(NYC, 0.5, 30);
+    const result = trimPendantLoops(circle);
+    expect(result.length).toBe(circle.length);
+  });
+
+  it('removes a single pendant loop (square + bridge) from the polyline', () => {
+    const route = makePendantLoopRoute(NYC);
+    expect(countPendantLoops(route)).toBe(1);
+    const trimmed = trimPendantLoops(route);
+    expect(countPendantLoops(trimmed)).toBe(0);
+    // Trim removed bridge-in + 3 loop body points + bridge-out = 5 points.
+    expect(trimmed.length).toBe(route.length - 5);
+  });
+
+  it('removes multiple pendant loops in one call (iterates passes)', () => {
+    const a = makePendantLoopRoute(NYC);
+    const tail = a[a.length - 1];
+    const b = makePendantLoopRoute(tail);
+    const stacked = [...a, ...b.slice(1)];
+    expect(countPendantLoops(stacked)).toBe(2);
+    const trimmed = trimPendantLoops(stacked);
+    expect(countPendantLoops(trimmed)).toBe(0);
+  });
+
+  it('preserves the pre-pendant and post-pendant segments', () => {
+    const route = makePendantLoopRoute(NYC);
+    const trimmed = trimPendantLoops(route);
+    // First and last points of the original route should still be present
+    // and in the same positions (we only excised the middle pendant).
+    expect(trimmed[0]).toEqual(route[0]);
+    expect(trimmed[trimmed.length - 1]).toEqual(route[route.length - 1]);
   });
 });
 

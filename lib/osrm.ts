@@ -329,6 +329,127 @@ export function overlapSegmentRatio(
   return overlapLen / totalLen;
 }
 
+/**
+ * Trim pendant loops out of a polyline. A pendant loop is a closed sub-loop
+ * attached to the rest of the path by a single bridge segment traversed in
+ * both directions (see countPendantLoops for the topology). To eliminate it
+ * we remove the bridge-in segment, the loop body, and the bridge-out segment
+ * — the polyline jumps straight from the main route point on one side of
+ * the bridge to the main route point on the other side (which are the same
+ * physical intersection). The runner just doesn't take the side detour.
+ *
+ * Iterates so multi-pendant routes are all cleaned in one call. Each pass
+ * removes one pendant; we stop as soon as a pass finds nothing.
+ *
+ * Trimming reduces total distance by (bridge × 2 + loop body). Callers must
+ * recompute distance after this and re-run the distance hard-reject — a
+ * candidate whose pendant accounts for most of its length will get gutted
+ * and should be rejected by the existing distance band ([0.5, 1.3] of
+ * target), not surfaced to the user.
+ *
+ * Out-and-back routes intentionally retrace every segment; do not call this
+ * on them.
+ */
+export function trimPendantLoops(points: RoutePoint[]): RoutePoint[] {
+  if (points.length < 5) return points;
+  const MAX_PASSES = 8;
+  let current = points;
+  for (let pass = 0; pass < MAX_PASSES; pass++) {
+    const next = trimOnePendantLoop(current);
+    if (next === current) return current;
+    current = next;
+  }
+  return current;
+}
+
+function trimOnePendantLoop(points: RoutePoint[]): RoutePoint[] {
+  const TOL_KM = 0.020;
+  const MIN_BODY_SEGS = 2;
+  for (let i = 0; i < points.length - 1; i++) {
+    for (let j = i + 1 + MIN_BODY_SEGS; j < points.length - 1; j++) {
+      const startMatches = haversineDistance(points[i], points[j + 1]) < TOL_KM;
+      const endMatches = haversineDistance(points[i + 1], points[j]) < TOL_KM;
+      if (startMatches && endMatches) {
+        // Drop bridge-in (i→i+1), loop body (i+1..j), and bridge-out (j→j+1).
+        // P[i] ≈ P[j+1] is the same intersection; we keep the first copy and
+        // resume from P[j+2] so the polyline reconnects without a duplicate
+        // vertex.
+        return [...points.slice(0, i + 1), ...points.slice(j + 2)];
+      }
+    }
+  }
+  return points;
+}
+
+/**
+ * Detect "pendant loops" — closed sub-loops attached to the rest of the
+ * polyline by a single bridge segment that's traversed in both directions.
+ *
+ * Topology: the polyline goes …→A→B→[loop body]→B→A→… where (A,B) is the
+ * bridge edge. To physically run the polyline as a continuous path, the
+ * runner has to cover (A,B) twice — once entering the loop, once leaving —
+ * because the loop has only one connection back to the main route. Visually
+ * on the map this looks like a square (or other small polygon) attached to
+ * the main path by a short stem.
+ *
+ * Distinct from existing detectors:
+ *   - removeSelfintersections / segmentsCross — looks for X-shape crossings.
+ *     A pendant loop's bridge OVERLAPS itself rather than crossing, so X
+ *     detection misses it entirely.
+ *   - countStubs — looks for a single ≥150° U-turn within ≤300m. A 4-corner
+ *     pendant loop (e.g. around one NYC block) has four 90° turns and zero
+ *     ≥150° reversals, so stub detection misses it.
+ *   - retraceRatio — counts the duplicated bridge in km, but for a 6mi route
+ *     a 50–150m bridge is <1%, so retrace fraction stays low even with a
+ *     glaringly broken polyline.
+ *   - overlapSegmentRatio — detects parallel-street antiparallel segments
+ *     within 12m. A pendant-loop bridge IS antiparallel-overlapping with
+ *     itself (proximity ≈ 0), but again the contribution to total fraction
+ *     is tiny on long routes, never approaching the 0.50 hard-reject.
+ *
+ * The signature we detect is unambiguous: a pair of polyline segments
+ * (i, i+1) and (j, j+1) where (j > i) and the second is the *reverse* of
+ * the first within tolerance — i.e. P[i] ≈ P[j+1] AND P[i+1] ≈ P[j]. The
+ * polyline necessarily traces a closed sub-loop between them (returning
+ * to the same point). Caller should reject any candidate with count > 0.
+ *
+ * Out-and-back routes intentionally retrace every segment and would report
+ * huge counts here; callers must skip OAB.
+ */
+export function countPendantLoops(points: RoutePoint[]): number {
+  if (points.length < 5) return 0;
+
+  // ~20m tolerance for "same physical edge" — slightly looser than
+  // overlapSegmentRatio's 12m to absorb OSRM sub-meter wobble between
+  // outbound and inbound traversals of the same street.
+  const TOL_KM = 0.020;
+  // Loop body must have at least 2 segments between bridge-in and bridge-out.
+  // A 1-segment body is just a degenerate stub (already caught by countStubs
+  // when the U-turn is sharp). A 2+ segment body is a real polygon.
+  const MIN_BODY_SEGS = 2;
+
+  let count = 0;
+  // Mark indices already explained by a detected pendant loop so we don't
+  // double-count the inner segments of a multi-segment bridge or stacked
+  // pendant loops.
+  const consumed = new Array<boolean>(points.length).fill(false);
+
+  for (let i = 0; i < points.length - 1; i++) {
+    if (consumed[i]) continue;
+    for (let j = i + 1 + MIN_BODY_SEGS; j < points.length - 1; j++) {
+      if (consumed[j]) continue;
+      const startMatches = haversineDistance(points[i], points[j + 1]) < TOL_KM;
+      const endMatches = haversineDistance(points[i + 1], points[j]) < TOL_KM;
+      if (startMatches && endMatches) {
+        count++;
+        for (let k = i; k <= j; k++) consumed[k] = true;
+        break;
+      }
+    }
+  }
+  return count;
+}
+
 /** Check if two line segments cross each other */
 export function segmentsCross(
   a1: RoutePoint, a2: RoutePoint,
@@ -2123,7 +2244,7 @@ export async function generateOSRMRoutes(
       // target so a 1mi route caps stub trimming at ~130m (no false trims
       // of natural triangle legs).
       const stubThresholdKm = Math.min(0.30, distanceKm * 0.08);
-      const points = routeType === 'out-and-back'
+      const afterStubs = routeType === 'out-and-back'
         ? afterLollipop
         : trimStubs(afterLollipop, stubThresholdKm);
       // NOTE: an earlier experiment added a "side-trip detector" via
@@ -2136,12 +2257,35 @@ export async function generateOSRMRoutes(
       // borderline visible spurs that aren't clean U-turns remain a known
       // gap. Don't reintroduce trimDetours without solving the loop-
       // closure false positive.
-      if (points !== afterLollipop) {
-        let stubKm = 0;
-        for (let k = 1; k < points.length; k++) {
-          stubKm += haversineDistance(points[k - 1], points[k]);
+      let afterStubsKm = afterLollipopKm;
+      if (afterStubs !== afterLollipop) {
+        afterStubsKm = 0;
+        for (let k = 1; k < afterStubs.length; k++) {
+          afterStubsKm += haversineDistance(afterStubs[k - 1], afterStubs[k]);
         }
-        traceEmit('post-process-trim', { i, stage: 'stubs', before: afterLollipopKm, after: stubKm });
+        traceEmit('post-process-trim', { i, stage: 'stubs', before: afterLollipopKm, after: afterStubsKm });
+      }
+      // Trim pendant loops — closed sub-loops attached to the rest of the
+      // polyline by a single bridge segment that's traversed in both
+      // directions (e.g. "go west one block, around a square, back east the
+      // same block, continue"). To physically run the polyline as drawn,
+      // the runner has to cover the bridge twice. The user explicitly does
+      // not want this shape: "users will get so confused about how to run
+      // it." Trim is preferable to reject — surfacing "no routes found"
+      // when a perfectly fine route exists 50m east is worse UX than
+      // showing a slightly-shorter version of the same route. Distance
+      // hard-reject (distRatio band) downstream catches candidates whose
+      // pendant accounted for most of their length. OAB exempt — its
+      // return leg looks like a pendant of every segment.
+      const points = routeType === 'out-and-back'
+        ? afterStubs
+        : trimPendantLoops(afterStubs);
+      if (points !== afterStubs) {
+        let pendantKm = 0;
+        for (let k = 1; k < points.length; k++) {
+          pendantKm += haversineDistance(points[k - 1], points[k]);
+        }
+        traceEmit('post-process-trim', { i, stage: 'pendant-loops', before: afterStubsKm, after: pendantKm });
       }
       // Recompute distance from the FINAL points (after both lollipop
       // removal and stub trimming) so the displayed mileage matches the
@@ -2190,6 +2334,18 @@ export async function generateOSRMRoutes(
       // stubs=0 (because countStubs's wider default catches nothing) while
       // longer routes use the full 300m window.
       const stubs = countStubs(points, stubThresholdKm);
+      // Safety net: pendant loops should be eliminated by trimPendantLoops
+      // upstream. If any survive, something is wrong with the trimmer
+      // (overlapping detections, geometry edge case, etc.) — reject rather
+      // than ship an unrunnable polyline. OAB exempt for the same reason
+      // the trim skipped it: its return leg is the same edges in reverse
+      // by design.
+      const pendantLoops = routeType === 'out-and-back' ? 0 : countPendantLoops(points);
+      if (pendantLoops > 0) {
+        qualityRejectCount++;
+        traceEmit('candidate-rejected', { i, reason: 'pendant-loop', pendantLoops, source: 'post-trim-residual' });
+        continue;
+      }
       // HARD REJECT: visibly bad backtracking. The user-reported Build 23
       // spur in N. Williamsburg slipped through because the chooser picked
       // a candidate with retrace 22%, overlap 13% over rounding-wrong
@@ -2390,21 +2546,41 @@ export async function generateOSRMRoutes(
     }
 
     if (chosen.route) {
-      const points = chosen.route.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }));
-      resolved.push({
-        index: 0,
-        variant: 0,
-        points,
-        distKm: chosen.route.distance / 1000,
-        estimatedTime: Math.round(chosen.route.duration / 60),
-        fromOSRM: true,
-        anchors: [],
-        qualityPenalty: 0.5, // step-3.5 emergency fallback — no anchors, but real OSRM geometry
-      });
+      const rawFallbackPoints = chosen.route.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }));
+      // Apply the same pendant-loop trimming as step 3. The geometric bearing
+      // fallback is a triangle of waypoints around the center; OSRM can still
+      // route through awkward block detours that show as pendant loops. Trim
+      // rather than reject — surfacing "no routes" when a trimmed version is
+      // available is worse UX. Recompute distance from the trimmed polyline
+      // so the displayed mileage matches what's drawn.
+      const points = routeType === 'out-and-back' ? rawFallbackPoints : trimPendantLoops(rawFallbackPoints);
+      let fallbackDistKm = chosen.route.distance / 1000;
+      if (points !== rawFallbackPoints) {
+        fallbackDistKm = 0;
+        for (let k = 1; k < points.length; k++) {
+          fallbackDistKm += haversineDistance(points[k - 1], points[k]);
+        }
+        traceEmit('post-process-trim', { i: -1, stage: 'pendant-loops', source: 'fallback', before: chosen.route.distance / 1000, after: fallbackDistKm });
+      }
+      // Safety net: if trim left any pendant loops behind, drop the candidate.
+      const fallbackPendant = routeType === 'out-and-back' ? 0 : countPendantLoops(points);
+      if (fallbackPendant > 0) {
+        traceEmit('candidate-rejected', { i: -1, reason: 'pendant-loop', pendantLoops: fallbackPendant, source: 'fallback-post-trim-residual' });
+      } else {
+        resolved.push({
+          index: 0,
+          variant: 0,
+          points,
+          distKm: fallbackDistKm,
+          estimatedTime: Math.round(chosen.route.duration / 60),
+          fromOSRM: true,
+          anchors: [],
+          qualityPenalty: 0.5, // step-3.5 emergency fallback — no anchors, but real OSRM geometry
+        });
+      }
     }
-    // If even the bearing-trial fallback came back with no OSRM route,
-    // resolved stays empty — the caller surfaces "no routes found" rather
-    // than displaying raw straight-line waypoints over the map.
+    // If the bearing-trial fallback came back with no OSRM route at all, or
+    // trimming somehow left residual pendant loops, resolved stays empty.
   } else if (resolved.length === 0 && skipFallback) {
     traceEmit('fallback-skipped', {
       reason: budgetExpired ? 'budget-expired' : 'network-only-failure',
