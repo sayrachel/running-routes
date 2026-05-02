@@ -1456,6 +1456,19 @@ export function scaleWaypoints(
  * where road routing is much longer than the geometric estimate (e.g.
  * routes near water/barriers where OSRM must detour around obstacles).
  */
+/** Returns true when `routeKm` rounds to the same display unit as `targetKm`.
+ *  Imperial rounds to whole miles; metric rounds to whole km. The displayed
+ *  `route.distance` field is the user-visible mile/km integer — if these
+ *  don't match, the user reads the wrong number on the run screen even when
+ *  the absolute error is small. */
+function roundedDisplayMatches(routeKm: number, targetKm: number, units: 'imperial' | 'metric'): boolean {
+  if (units === 'metric') {
+    return Math.round(routeKm) === Math.round(targetKm);
+  }
+  const MI_PER_KM = 0.621371;
+  return Math.round(routeKm * MI_PER_KM) === Math.round(targetKm * MI_PER_KM);
+}
+
 async function fetchOSRMRouteAdjusted(
   waypoints: RoutePoint[],
   center: RoutePoint,
@@ -1467,7 +1480,14 @@ async function fetchOSRMRouteAdjusted(
   // budget regardless. Keeping 3 attempts (vs 2) is what gives the
   // distance-refinement loop room to converge — dropping to 2 caused
   // out-and-back fixtures to undershoot target by ~25%.
-  maxRetries: number = 2
+  maxRetries: number = 2,
+  // When set, the early-exit accept window also requires the route's
+  // displayed distance integer (rounded mile or km) to match the target's.
+  // Without this, the ±15% accept window happily exits on a 5.7mi route for
+  // a 5mi request — which then displays as "6 mi" in the UI and feels broken.
+  // If iteration runs out without satisfying both, returns best-so-far (the
+  // caller decides whether to accept or hard-reject the wrong-display result).
+  requireRoundedTargetUnits: 'imperial' | 'metric' | null = null,
 ): Promise<{ route: OSRMRoute | null; waypoints: RoutePoint[] }> {
   // Sequential first attempt + iterative refinement. A previous experiment
   // hedged 3 parallel scales upfront for wall-clock wins, but tripled the
@@ -1501,8 +1521,18 @@ async function fetchOSRMRouteAdjusted(
 
     // Accept window ±15%. Tighter (±7%) caused over-iteration and
     // overshoot — routes ended up FARTHER from target after extra scaling.
+    // When requireRoundedTargetUnits is set, the route also has to round to
+    // the same display integer as the target — otherwise we keep iterating.
+    // The current attempt remains tracked as `best` either way, so if we
+    // exhaust retries without satisfying the rounded-display check, we still
+    // return the closest-by-ratio route rather than failing entirely.
     if (ratio >= 0.85 && ratio <= 1.15) {
-      return { route, waypoints: currentWaypoints };
+      const roundedOk =
+        !requireRoundedTargetUnits ||
+        roundedDisplayMatches(routeDistKm, targetDistanceKm, requireRoundedTargetUnits);
+      if (roundedOk) {
+        return { route, waypoints: currentWaypoints };
+      }
     }
 
     // Divergence detection. Scaling waypoints across a hard barrier
@@ -2154,12 +2184,16 @@ export async function generateOSRMRoutes(
   // property mask those scorer blind spots until we can address them
   // properly.
   const useAdjustment = routeType !== 'point-to-point';
+  // Loop and out-and-back targets are user-chosen — we should land on the
+  // displayed mile/km the user requested. Point-to-point distance is fixed
+  // by the start/end pair; nothing to converge to.
+  const adjustUnits = useAdjustment ? prefs.units ?? 'imperial' : null;
   type Tagged = { idx: number; result: { route: OSRMRoute | null; waypoints: RoutePoint[] } };
   const pending = new Map<number, Promise<Tagged>>();
   for (let idx = 0; idx < candidates.length; idx++) {
     const c = candidates[idx];
     const p = (useAdjustment
-      ? fetchOSRMRouteAdjusted(c.waypoints, center, distanceKm)
+      ? fetchOSRMRouteAdjusted(c.waypoints, center, distanceKm, 2, adjustUnits)
       : fetchOSRMRoute(c.waypoints).then((route) => ({ route, waypoints: c.waypoints }))
     ).then((result) => ({ idx, result }));
     pending.set(idx, p);
@@ -2192,6 +2226,13 @@ export async function generateOSRMRoutes(
   // one rejection was for QUALITY (not network — if it was all network,
   // step 3.5 will also fail and just burn more user time).
   const resolved: ResolvedCandidate[] = [];
+  // Last-resort pool: candidates that pass every other check but whose
+  // distance rounds to the wrong display integer (e.g. 5.6mi for a 5mi
+  // request → would display "6 mi"). We keep them so that if NOTHING in
+  // `resolved` (right-display) survives — and step 3.5 also can't find a
+  // right-display route — we can fall back to the cleanest wrong-display
+  // candidate rather than show "no routes found" and strand the user.
+  const wrongDisplayFallback: ResolvedCandidate[] = [];
   // Track WHY candidates fell out so step 3.5 can decide whether to even try.
   let osrmNullCount = 0;
   let qualityRejectCount = 0;
@@ -2450,7 +2491,23 @@ export async function generateOSRMRoutes(
         anchorBonus
       );
       traceEmit('candidate-evaluated', { i, distKm, distRatio, hwProximity, retraced, overlap, stubs, startPasses, reversalsPerKm, turnsPerKm, turnPenalty, roundingPenalty, qualityPenalty });
-      resolved.push({ index: i, variant: candidates[i].variant, points, distKm, estimatedTime, fromOSRM: true, anchors: candidates[i].anchors, qualityPenalty });
+      // Final gate: rounded-display match. The user-facing distance label is
+      // an integer mile (or km, in metric). A 5mi request that returns a
+      // 5.6mi route shows "6 mi" — the user reads it as the wrong route even
+      // though every other quality metric is fine. Out-and-back and loop both
+      // gated; point-to-point exempt because its distance is fixed by the
+      // start/end pair. We don't drop the candidate — we shunt it to a
+      // wrong-display fallback pool so the algorithm has something to return
+      // even when geometry simply can't fit the requested mile (LES 6mi-
+      // sized cases).
+      const candidateRecord: ResolvedCandidate = { index: i, variant: candidates[i].variant, points, distKm, estimatedTime, fromOSRM: true, anchors: candidates[i].anchors, qualityPenalty };
+      const adjustUnitsForCheck = useAdjustment ? adjustUnits : null;
+      if (adjustUnitsForCheck && !roundedDisplayMatches(distKm, distanceKm, adjustUnitsForCheck)) {
+        wrongDisplayFallback.push(candidateRecord);
+        traceEmit('candidate-wrong-display', { i, distKm, target: distanceKm, units: adjustUnitsForCheck });
+        continue;
+      }
+      resolved.push(candidateRecord);
     } else {
       // OSRM returned nothing — likely network failure, timeout, or no route
       // exists for these waypoints. Skip the candidate entirely. Older code
@@ -2467,12 +2524,15 @@ export async function generateOSRMRoutes(
   // SKIP the fallback when:
   //   1. The resolution budget expired (we've already kept the user waiting
   //      ~18s — don't add another ~50s of sequential bearing trials).
-  //   2. ALL drops were osrm-null with zero quality rejections (the network
-  //      is the problem, step 3.5 will hit the same dead endpoint and just
-  //      compound the wait before returning the same empty result).
-  // Otherwise (mixed quality rejects + nulls, or pure quality rejects)
-  // step 3.5 has a real shot at producing a usable direct-bearing route.
-  const networkOnlyFailure = osrmNullCount > 0 && qualityRejectCount === 0;
+  //   2. ALL drops were osrm-null with zero quality rejections AND no wrong-
+  //      display candidates (the network is the problem, step 3.5 will hit
+  //      the same dead endpoint and just compound the wait). Wrong-display
+  //      candidates count as OSRM-responded — different geometry through the
+  //      bearing trials may converge to the right display unit.
+  // Otherwise (mixed quality rejects + nulls, or pure quality rejects, or
+  // wrong-display fallbacks exist) step 3.5 has a real shot at producing a
+  // usable direct-bearing route.
+  const networkOnlyFailure = osrmNullCount > 0 && qualityRejectCount === 0 && wrongDisplayFallback.length === 0;
   const skipFallback = budgetExpired || networkOnlyFailure;
   if (resolved.length === 0 && !skipFallback) {
     console.log('[RouteScoring] All candidates rejected — generating direct fallback');
@@ -2482,6 +2542,8 @@ export async function generateOSRMRoutes(
 
     if (routeType === 'point-to-point' && end) {
       // Direct route from start to end — only one waypoint option to try.
+      // Point-to-point distance is fixed by the start/end pair; rounded-
+      // display match doesn't apply because the user can't choose target.
       chosen = await fetchOSRMRouteAdjusted([center, end], center, distanceKm, 3);
     } else {
       // A single random bearing can land in water or impassable terrain —
@@ -2489,25 +2551,39 @@ export async function generateOSRMRoutes(
       // bearing pointed into the bay, forcing OSRM to detour around it.
       // Try N evenly-spaced bearings in parallel and keep the one whose
       // routed distance lands closest to the target.
-      const NUM_BEARINGS = 4;
+      // First pass: 4 bearings spaced 90° apart. If none of them land on
+      // the right display unit (mile/km), try 4 more rotated 45° from the
+      // first set — gives the algorithm a second shot at hitting the user's
+      // requested distance before falling through to a wrong-display result.
+      const FIRST_PASS_BEARINGS = 4;
+      const SECOND_PASS_BEARINGS = 4;
       const seedBearing = getSeed() % 360;
       const halfDist = distanceKm / (2 * ROUTING_OVERHEAD);
       // Same triangle-perimeter math as generateLoopWaypoints. Previously
       // used 2π here too, producing a 20–30% undershoot on the final fallback.
       const waypointDist = distanceKm / (LOOP_TRIANGLE_PERIMETER * ROUTING_OVERHEAD);
 
-      // Sequential, not parallel. Firing all 4 trials in parallel (each with
-      // its own internal retry loop) means up to 16 in-flight OSRM calls
+      // Sequential, not parallel. Firing all trials in parallel (each with
+      // its own internal retry loop) means many in-flight OSRM calls
       // against a free public endpoint, which rate-limits or times out — the
       // surviving trial is often the bad-bearing one. Sequential lets each
       // trial get OSRM's full attention; early-exit avoids wasted calls.
       chosen = { route: null, waypoints: [] };
       let bestErr = Infinity;
       let bestIdx = 0;
+      let foundRightDisplay = false;
       const EARLY_EXIT_RATIO = 0.10; // stop once we're within 10% of target
+      const totalBearings = FIRST_PASS_BEARINGS + SECOND_PASS_BEARINGS;
 
-      for (let i = 0; i < NUM_BEARINGS; i++) {
-        const bearing = (seedBearing + (i * 360) / NUM_BEARINGS) % 360;
+      for (let i = 0; i < totalBearings; i++) {
+        // First 4 bearings: evenly spaced 90° starting at seedBearing.
+        // Next 4 bearings: rotated 45° (interleaved between the first set).
+        // Skip the second pass entirely if we already found a right-display
+        // route — the extra trials are insurance, not always needed.
+        if (i >= FIRST_PASS_BEARINGS && foundRightDisplay) break;
+        const phase = i < FIRST_PASS_BEARINGS ? 0 : 360 / (FIRST_PASS_BEARINGS * 2);
+        const indexInPass = i % FIRST_PASS_BEARINGS;
+        const bearing = (seedBearing + phase + (indexInPass * 360) / FIRST_PASS_BEARINGS) % 360;
         const wps: RoutePoint[] = routeType === 'out-and-back'
           ? [center, destinationPoint(center, bearing, halfDist), center]
           : [
@@ -2520,27 +2596,38 @@ export async function generateOSRMRoutes(
               center,
             ];
 
-        const t = await fetchOSRMRouteAdjusted(wps, center, distanceKm, 3);
+        const t = await fetchOSRMRouteAdjusted(wps, center, distanceKm, 3, adjustUnits);
+        const trialDisplayMatches = !!t.route && !!adjustUnits &&
+          roundedDisplayMatches(t.route.distance / 1000, distanceKm, adjustUnits);
         traceEmit('fallback-trial', {
           i,
           bearing,
           routedKm: t.route ? t.route.distance / 1000 : null,
           ratio: t.route ? (t.route.distance / 1000) / distanceKm : null,
+          displayMatches: trialDisplayMatches,
           waypoints: t.waypoints,
         });
 
         if (!t.route) continue;
         const err = Math.abs(t.route.distance / 1000 - distanceKm);
-        if (err < bestErr) {
+        // Prefer a right-display route over a closer-by-distance wrong-
+        // display one. e.g. a 4.6mi route beats a 5.4mi route on raw error
+        // but the second one displays correctly as "5 mi" for a 5mi request.
+        // Within the same display-match status, prefer smaller error.
+        const beatsBest =
+          (trialDisplayMatches && !foundRightDisplay) ||
+          (trialDisplayMatches === foundRightDisplay && err < bestErr);
+        if (beatsBest) {
           chosen = t;
           bestErr = err;
           bestIdx = i;
+          if (trialDisplayMatches) foundRightDisplay = true;
         }
-        if (err / distanceKm <= EARLY_EXIT_RATIO) break;
+        if (foundRightDisplay && err / distanceKm <= EARLY_EXIT_RATIO) break;
       }
       traceEmit('fallback-chosen', {
         bestIdx,
-        bearing: (seedBearing + (bestIdx * 360) / NUM_BEARINGS) % 360,
+        foundRightDisplay,
         routedKm: chosen.route ? chosen.route.distance / 1000 : null,
       });
     }
@@ -2567,7 +2654,7 @@ export async function generateOSRMRoutes(
       if (fallbackPendant > 0) {
         traceEmit('candidate-rejected', { i: -1, reason: 'pendant-loop', pendantLoops: fallbackPendant, source: 'fallback-post-trim-residual' });
       } else {
-        resolved.push({
+        const fallbackRecord: ResolvedCandidate = {
           index: 0,
           variant: 0,
           points,
@@ -2576,12 +2663,23 @@ export async function generateOSRMRoutes(
           fromOSRM: true,
           anchors: [],
           qualityPenalty: 0.5, // step-3.5 emergency fallback — no anchors, but real OSRM geometry
-        });
+        };
+        // Same right-display gate as step 3. If the bearing trials couldn't
+        // converge to the requested mile/km, send the result to the wrong-
+        // display pool instead of `resolved` — keeps the contract that
+        // anything in `resolved` displays the user's requested distance.
+        const fallbackUnitsForCheck = routeType === 'point-to-point' ? null : adjustUnits;
+        if (fallbackUnitsForCheck && !roundedDisplayMatches(fallbackDistKm, distanceKm, fallbackUnitsForCheck)) {
+          wrongDisplayFallback.push(fallbackRecord);
+          traceEmit('candidate-wrong-display', { i: -1, distKm: fallbackDistKm, target: distanceKm, units: fallbackUnitsForCheck, source: 'fallback' });
+        } else {
+          resolved.push(fallbackRecord);
+        }
       }
     }
     // If the bearing-trial fallback came back with no OSRM route at all, or
     // trimming somehow left residual pendant loops, resolved stays empty.
-  } else if (resolved.length === 0 && skipFallback) {
+  } else if (resolved.length === 0 && skipFallback && wrongDisplayFallback.length === 0) {
     traceEmit('fallback-skipped', {
       reason: budgetExpired ? 'budget-expired' : 'network-only-failure',
       osrmNullCount,
@@ -2596,6 +2694,22 @@ export async function generateOSRMRoutes(
         ? `OSRM resolution budget expired after ${Date.now() - resolveStartMs}ms with ${osrmNullCount} nulls`
         : `OSRM unreachable: all ${osrmNullCount} candidates returned null`
     );
+  }
+
+  // After step 3 + step 3.5, fall back to wrong-display candidates only if we
+  // have zero right-display routes. Better to show a 5.6mi route labeled "6 mi"
+  // for a 5mi request (visible mismatch the user can see) than "no routes
+  // found" — they at least get something runnable in the right area, and the
+  // refresh button can hunt for a better-fitting candidate. Logged so harness
+  // can flag this as a known-imperfect case.
+  if (resolved.length === 0 && wrongDisplayFallback.length > 0) {
+    const sortedFallback = [...wrongDisplayFallback].sort((a, b) => a.qualityPenalty - b.qualityPenalty);
+    traceEmit('wrong-display-fallback-used', {
+      candidateCount: wrongDisplayFallback.length,
+      bestDistKm: sortedFallback[0].distKm,
+      targetKm: distanceKm,
+    });
+    resolved.push(...sortedFallback);
   }
 
   // Step 4: Score each candidate using locally-computable metrics only.

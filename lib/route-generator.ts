@@ -115,6 +115,11 @@ function generateOutAndBackRoute(
 
 export interface RoutePreferences {
   lowTraffic: boolean
+  // The user's display units. Used by generateOSRMRoutes to decide whether
+  // to converge candidates to the requested mile (imperial) or km (metric).
+  // Without it, the iteration accepts any route within ±15% of target — a
+  // 5mi request can come back as a 5.7mi route that displays as "6 mi".
+  units?: 'imperial' | 'metric'
 }
 
 const routeNamesQuiet = [
