@@ -8,13 +8,35 @@ const TIMEOUT_MS = 8000;
 const BBOX_BUFFER_DEG = 0.002; // ~200m buffer in degrees
 
 /**
- * Maximum search radius — `calculateSearchRadius` clamps to 10km, so all
- * route requests at a given location can be served from a single Overpass
- * fetch at this radius. Smaller-radius callers get the same data filtered
- * in-memory. Declared at module top so prefillOverpassCaches (used by the
- * harness) can reference it before the function definitions appear below.
+ * Default max radius used by the prefetch path — covers all "normal" route
+ * distances (≤ ~12mi loops, where calculateSearchRadius lands ≤ 10km).
+ * Long-distance requests bump beyond this via `getMaxOverpassRadius` and
+ * cache under a separate bucket.
  */
-const MAX_OVERPASS_RADIUS_KM = 10;
+const DEFAULT_OVERPASS_RADIUS_KM = 10;
+
+/**
+ * Pick an Overpass query radius that's large enough for the requested route
+ * distance. A 30mi loop needs green-space anchors 15-20km from start so the
+ * loop can wrap around water; capping at the prefetch's 10km starves the
+ * waypoint selector and forces the geometric fallback into a 9km-radius
+ * triangle that lands in the Hudson/East River for most NYC starts.
+ *
+ * Buckets at {10, 15, 20, 25} so a center accumulates at most a handful of
+ * cache entries even when the user toggles between distances. Each bucket
+ * covers ~5km of distance request range — a 5mi user and a 12mi user both
+ * land in bucket 10; a 25mi user and a 30mi user both land in bucket 25.
+ */
+export function getMaxOverpassRadius(distanceKm: number): number {
+  // distanceKm * 0.6 chosen to comfortably exceed `selectGreenSpaceWaypoints`'s
+  // maxRadius (loopRadius * 3.0 ≈ distanceKm * 0.36) so we never run out of
+  // waypoint candidates. Capped at 25km (NYC fits inside that from any start).
+  const desired = Math.min(25, Math.max(DEFAULT_OVERPASS_RADIUS_KM, distanceKm * 0.6));
+  if (desired <= 10) return 10;
+  if (desired <= 15) return 15;
+  if (desired <= 20) return 20;
+  return 25;
+}
 
 /** Enriched green space with metadata for waypoint selection */
 export interface GreenSpace {
@@ -67,19 +89,27 @@ export function loadOverpassCaches(snapshot: Partial<OverpassSnapshot>): void {
  * green-space-first algorithm can be exercised when Overpass is unavailable.
  *
  * IMPORTANT: must match the key the production code reads from. The combined
- * `fetchGreenSpacesAndHighways` always queries at MAX_OVERPASS_RADIUS_KM and
- * filters in-memory, so we cache under that same key — otherwise the prefill
- * silently misses and the algorithm runs against an empty cache (geometric
- * fallback), which is NOT the path production users hit.
+ * `fetchGreenSpacesAndHighways` queries at the bucketed radius
+ * (`getMaxOverpassRadius`) and filters in-memory, so we cache under that same
+ * key — otherwise the prefill silently misses and the algorithm runs against
+ * an empty cache (geometric fallback), which is NOT the path production users
+ * hit. Pre-fills under DEFAULT_OVERPASS_RADIUS_KM since synthetic fixtures
+ * are sized for sub-12mi tests; long-distance fixtures should pass radiusKm
+ * explicitly.
  */
 export function prefillOverpassCaches(
   center: RoutePoint,
-  _radiusKm: number,
+  radiusKm: number,
   greenSpaces: GreenSpace[],
   highwayPoints: RoutePoint[],
 ): void {
-  enrichedGreenSpaceCache.set(locationKey('enriched', center, MAX_OVERPASS_RADIUS_KM), greenSpaces);
-  highwayCache.set(locationKey('highway', center, MAX_OVERPASS_RADIUS_KM), highwayPoints);
+  // If caller didn't specify, use the default prefetch radius. Bucketing here
+  // matches the production fetch path so the key alignment holds.
+  const bucketed = radiusKm > DEFAULT_OVERPASS_RADIUS_KM
+    ? getMaxOverpassRadius(radiusKm / 0.6) // invert the * 0.6 to back into a request distance
+    : DEFAULT_OVERPASS_RADIUS_KM;
+  enrichedGreenSpaceCache.set(locationKey('enriched', center, bucketed), greenSpaces);
+  highwayCache.set(locationKey('highway', center, bucketed), highwayPoints);
 }
 
 /**
@@ -546,26 +576,43 @@ export async function fetchHighwaySegments(
  * fetchGreenSpacesEnriched + fetchHighwaySegments in parallel, and populates
  * both per-query caches so subsequent callers of either function get hits.
  *
- * Always queries at MAX_OVERPASS_RADIUS_KM and filters in-memory for the
- * caller's smaller radius — the public Overpass endpoint is the dominant
- * cold-start latency, so consolidating per-location requests behind a
- * single max-radius cache lets a 4mi loop, 6mi loop, and 8mi loop from
- * the same start share one network round trip.
+ * Queries at the bucketed radius from `getMaxOverpassRadius(radiusKm/0.6)`
+ * — typically the same 10km as the prefetch for normal-distance requests,
+ * but bumps to 15/20/25km for long requests so a 30mi loop can find
+ * Brooklyn parks 18km from a Manhattan start. Cache lookup checks the
+ * exact bucket first, then any LARGER cached bucket (filter down) so a
+ * 30mi user fetching at 25km also serves a subsequent 5mi request at the
+ * same start without a second network round trip.
  */
 export async function fetchGreenSpacesAndHighways(
   center: RoutePoint,
   radiusKm: number
 ): Promise<{ greenSpaces: GreenSpace[]; highwayPoints: RoutePoint[] }> {
-  const greenKey = locationKey('enriched', center, MAX_OVERPASS_RADIUS_KM);
-  const hwKey = locationKey('highway', center, MAX_OVERPASS_RADIUS_KM);
+  // Convert the requested in-memory radius back into a bucket. radiusKm
+  // here is what calculateSearchRadius returned — usually radius * 1.0 for
+  // loops or * 0.8 for OAB, so dividing by 0.6 gives a generous distance
+  // estimate that maps to the right bucket.
+  const fetchRadiusKm = getMaxOverpassRadius(radiusKm / 0.6);
 
-  const cachedGreen = enrichedGreenSpaceCache.get(greenKey);
-  const cachedHw = highwayCache.get(hwKey);
-  if (cachedGreen !== undefined && cachedHw !== undefined) {
+  // Cache lookup: prefer exact bucket; otherwise scan for any cached entry
+  // at >= fetchRadiusKm and filter down. Avoids re-fetching when a larger
+  // request previously warmed the cache for the same center.
+  const exactKey = locationKey('enriched', center, fetchRadiusKm);
+  const cachedAtBucket = enrichedGreenSpaceCache.get(exactKey);
+  if (cachedAtBucket !== undefined) {
+    const hwBucket = highwayCache.get(locationKey('highway', center, fetchRadiusKm));
+    if (hwBucket !== undefined) {
+      return filterByRadius(cachedAtBucket, hwBucket, center, radiusKm);
+    }
+  }
+  const covering = findCoveringCachedRadius(center, fetchRadiusKm);
+  if (covering !== null) {
+    const cachedGreen = enrichedGreenSpaceCache.get(locationKey('enriched', center, covering))!;
+    const cachedHw = highwayCache.get(locationKey('highway', center, covering))!;
     return filterByRadius(cachedGreen, cachedHw, center, radiusKm);
   }
 
-  const radiusMeters = Math.round(MAX_OVERPASS_RADIUS_KM * 1000);
+  const radiusMeters = Math.round(fetchRadiusKm * 1000);
   const a = `around:${radiusMeters},${center.lat},${center.lng}`;
   // Combined union — `out center bb tags;` works for both halves; highway
   // parsing only needs `center`, but the extra `bb tags` payload is small.
@@ -586,17 +633,38 @@ export async function fetchGreenSpacesAndHighways(
     const greenSpaces = parseGreenSpaceElements(greenElements);
     const highwayPoints = parseHighwayElements(highwayElements);
 
-    enrichedGreenSpaceCache.set(greenKey, greenSpaces);
-    highwayCache.set(hwKey, highwayPoints);
+    enrichedGreenSpaceCache.set(exactKey, greenSpaces);
+    highwayCache.set(locationKey('highway', center, fetchRadiusKm), highwayPoints);
     return filterByRadius(greenSpaces, highwayPoints, center, radiusKm);
   } catch (err: any) {
     // Keep the message short — full AggregateError stacks flood test output.
     const msg = err?.message ?? String(err);
     console.warn(`Combined Overpass query failed: ${msg.split('\n')[0]}`);
-    enrichedGreenSpaceCache.set(greenKey, []);
-    highwayCache.set(hwKey, []);
+    enrichedGreenSpaceCache.set(exactKey, []);
+    highwayCache.set(locationKey('highway', center, fetchRadiusKm), []);
     return { greenSpaces: [], highwayPoints: [] };
   }
+}
+
+/** Scan cache for entries at this center with radius >= `requiredRadiusKm`,
+ *  return the smallest such radius (or null). Lets a 30mi user's 25km cache
+ *  serve a subsequent 5mi request without a second fetch. */
+function findCoveringCachedRadius(center: RoutePoint, requiredRadiusKm: number): number | null {
+  const centerPrefix = `enriched:${center.lat.toFixed(3)},${center.lng.toFixed(3)},`;
+  let best: number | null = null;
+  for (const key of enrichedGreenSpaceCache.keys()) {
+    if (!key.startsWith(centerPrefix)) continue;
+    const radius = parseFloat(key.slice(centerPrefix.length));
+    if (radius >= requiredRadiusKm && (best === null || radius < best)) {
+      // Verify the highway cache also has this bucket — otherwise we'd hit
+      // an undefined .get() below. They're written together, so this is
+      // belt-and-suspenders, but cheap.
+      if (highwayCache.has(locationKey('highway', center, radius))) {
+        best = radius;
+      }
+    }
+  }
+  return best;
 }
 
 function filterByRadius(
@@ -605,22 +673,24 @@ function filterByRadius(
   center: RoutePoint,
   radiusKm: number,
 ): { greenSpaces: GreenSpace[]; highwayPoints: RoutePoint[] } {
-  if (radiusKm >= MAX_OVERPASS_RADIUS_KM) {
-    return { greenSpaces: green, highwayPoints: highway };
-  }
+  // No-op when the cached data was fetched at exactly the requested radius
+  // (or smaller — but findCoveringCachedRadius guarantees we only reach this
+  // with cached >= requested). Cheap haversine pass keeps things correct.
   const greenSpaces = green.filter((g) => haversineDistance(center, g.point) <= radiusKm);
   const highwayPoints = highway.filter((p) => haversineDistance(center, p) <= radiusKm);
   return { greenSpaces, highwayPoints };
 }
 
 /**
- * Kick off a max-radius Overpass fetch in the background and discard the
+ * Kick off a default-radius Overpass fetch in the background and discard the
  * result — the cache write is the side effect we care about. Use from the
  * UI as soon as the user's location is known so by the time they tap
- * "generate" the Overpass round trip is already complete.
+ * "generate" the Overpass round trip is already complete. Long-distance
+ * requests (>12mi) will trigger a second on-demand fetch at the larger
+ * bucket; we don't pre-warm those because the typical user requests <10mi.
  */
 export function prefetchGreenSpacesAndHighways(center: RoutePoint): void {
-  fetchGreenSpacesAndHighways(center, MAX_OVERPASS_RADIUS_KM).catch(() => {
+  fetchGreenSpacesAndHighways(center, DEFAULT_OVERPASS_RADIUS_KM).catch(() => {
     // Swallow — the real call will report any failure to the user.
   });
 }

@@ -153,9 +153,11 @@ describe('calculateSearchRadius', () => {
     expect(radius).toBe(1.5);
   });
 
-  it('clamps maximum to 10 km', () => {
+  it('clamps maximum to 25 km', () => {
+    // Lifted from 10km to 25km in May 2026 so 25-30mi loops can pull
+    // anchors from a wide enough area to wrap around water barriers.
     const radius = calculateSearchRadius('loop', 100, { lat: 0, lng: 0 });
-    expect(radius).toBe(10);
+    expect(radius).toBe(25);
   });
 
   it('uses 1.0 factor for loop', () => {

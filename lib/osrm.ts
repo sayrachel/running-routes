@@ -790,7 +790,13 @@ export function calculateSearchRadius(
   } else {
     radius = distanceKm * 0.6;
   }
-  return Math.min(Math.max(radius, 1.5), 10);
+  // Upper clamp lifted from 10 to 25 so long-distance loops (~25-30mi) can
+  // pull anchors from a wide enough area to wrap around water barriers like
+  // the Hudson/East River. The actual Overpass fetch radius is bucketed via
+  // getMaxOverpassRadius, so a 30mi user only causes one extra network call
+  // (10km bucket → 25km bucket) and subsequent shorter requests at the same
+  // start are served from the larger cache.
+  return Math.min(Math.max(radius, 1.5), 25);
 }
 
 // ---------------------------------------------------------------------------
@@ -916,8 +922,16 @@ export function selectGreenSpaceWaypoints(
 
   if (annotated.length < 2) return null;
 
-  // Use fewer sectors for shorter routes to avoid clustering
-  const numSectors = targetDistanceKm < 15 ? 3 : 4 + (variant % 2);
+  // Use fewer sectors for shorter routes to avoid clustering. Long routes
+  // need more sectors so the picks spread across a wider perimeter — a 30mi
+  // loop with 3 sectors clusters anchors in one direction and the loop
+  // collapses into a narrow strip; 6+ sectors give the 5-waypoint cap
+  // enough angular spread to actually wrap around water barriers.
+  const numSectors = targetDistanceKm < 15
+    ? 3
+    : targetDistanceKm < 25
+      ? 4 + (variant % 2)
+      : 6 + (variant % 2);
   const sectorSize = 360 / numSectors;
   const sectorOffset = (variant * 60) % 360;
 
@@ -974,10 +988,14 @@ export function selectGreenSpaceWaypoints(
   // its naming benefit), pick the highest-scoring remaining candidates that
   // sit at least ~60° away in bearing from any existing pick. This keeps
   // diversity without requiring uniform angular spread.
-  if (picks.length < 3) {
+  // Backfill target scales with distance — long routes (15mi+) need more
+  // picks for the larger waypoint cap below to draw from.
+  const backfillTargetMi = targetDistanceKm * 0.621371;
+  const backfillTarget = backfillTargetMi >= 22 ? 5 : backfillTargetMi >= 15 ? 4 : 3;
+  if (picks.length < backfillTarget) {
     const allByScore = annotated.slice().sort((a, b) => b.score - a.score);
     for (const cand of allByScore) {
-      if (picks.length >= 3) break;
+      if (picks.length >= backfillTarget) break;
       if (picks.some((p) => p.gs === cand.gs)) continue;
       // 45° threshold matches the downstream bearing-similarity filter and
       // lets a third pick squeeze in for clustered locations (Williamsburg
@@ -1012,7 +1030,14 @@ export function selectGreenSpaceWaypoints(
   // center→wp1 outbound leg. Quality scoring picks the best regardless
   // of waypoint count, so generating 3-waypoint candidates alongside
   // 2-waypoint ones gives the algorithm more options.
-  const maxGreenWaypoints = Math.min(picks.length, 3);
+  // For long distances (15mi+), 3 waypoints can't span enough area —
+  // a 30mi loop in NYC needs anchors across both Manhattan and Brooklyn,
+  // which demands 4-6 waypoints to wrap around the rivers. Cap scales:
+  // ≤15mi: 3, 15-22mi: 4, 22-32mi: 5. Per-bucket caps (3/4/5) keep
+  // each candidate's OSRM call shape predictable.
+  const targetMi = targetDistanceKm * 0.621371;
+  const distanceCap = targetMi >= 22 ? 5 : targetMi >= 15 ? 4 : 3;
+  const maxGreenWaypoints = Math.min(picks.length, distanceCap);
   const selectedPicks = picks
     .sort((a, b) => b.dist - a.dist) // drop farthest first if over cap
     .slice(picks.length - maxGreenWaypoints);
@@ -1889,16 +1914,50 @@ function generateLoopWaypoints(
   variant: number,
   _greenSpaces: RoutePoint[] = []
 ): RoutePoint[] {
-  const waypointDist = distanceKm / (LOOP_TRIANGLE_PERIMETER * ROUTING_OVERHEAD);
-  const bearing = (variant * 73) % 360;
+  // Waypoint count scales with distance. A 3-vertex triangle (2 waypoints +
+  // start/end) is fine up to ~10mi loops where each leg is ~3-4km; for a 30mi
+  // loop the same triangle puts each waypoint 9km from start, which in NYC
+  // routinely lands in the Hudson or East River. More waypoints = each one
+  // sits closer to start AND the loop wraps around water naturally.
+  // ≤14mi: 2 waypoints (current shape), 14-22mi: 3 waypoints (square),
+  // 22-32mi: 4 waypoints (pentagon).
+  const targetMi = distanceKm * 0.621371;
+  const numWaypoints = targetMi >= 22 ? 4 : targetMi >= 14 ? 3 : 2;
+  const seedBearing = (variant * 73) % 360;
 
-  const wp1 = destinationPoint(center, bearing, waypointDist);
-  // Offset wp2 30° from antipodal so the route forms a triangle, not a
-  // straight line — perfect-line waypoints make OSRM use the same streets
-  // both ways, which produces high retrace.
-  const wp2 = destinationPoint(center, (bearing + 210) % 360, waypointDist);
+  if (numWaypoints === 2) {
+    // Original triangle shape — keep byte-identical for distances where
+    // it works (avoids regression on the well-tested ≤14mi path).
+    const waypointDist = distanceKm / (LOOP_TRIANGLE_PERIMETER * ROUTING_OVERHEAD);
+    const wp1 = destinationPoint(center, seedBearing, waypointDist);
+    // Offset wp2 30° from antipodal so the route forms a triangle, not a
+    // straight line — perfect-line waypoints make OSRM use the same streets
+    // both ways, which produces high retrace.
+    const wp2 = destinationPoint(center, (seedBearing + 210) % 360, waypointDist);
+    return [center, wp1, wp2, center];
+  }
 
-  return [center, wp1, wp2, center];
+  // For N=3 waypoints (4-vertex polygon: start + 3 waypoints + return-to-start):
+  //   2 radial segments (center↔wp1, wp3↔center) of length D
+  //   2 chord segments (wp1↔wp2, wp2↔wp3) of length 2*D*sin(60°) ≈ 1.732*D
+  //   total ≈ (2 + 2*1.732) * D = 5.464 * D
+  // For N=4 waypoints (5-vertex polygon):
+  //   2 radial segments + 3 chords of 2*D*sin(45°) ≈ 1.414*D
+  //   total ≈ (2 + 3*1.414) * D = 6.243 * D
+  // Solve for D given target distanceKm with ROUTING_OVERHEAD baked in.
+  const perimeterFactor = numWaypoints === 3 ? 5.464 : 6.243;
+  const waypointDist = distanceKm / (perimeterFactor * ROUTING_OVERHEAD);
+  // Spread waypoints across an arc of ~330° (leave 30° gap on the closing
+  // side so the wpN→center leg doesn't overlap the center→wp1 leg). 360°/N
+  // would space them evenly but the final leg back to center would parallel
+  // the first leg out, causing visible retrace.
+  const arcDegrees = 330;
+  const wps: RoutePoint[] = [];
+  for (let i = 0; i < numWaypoints; i++) {
+    const angle = (seedBearing + i * (arcDegrees / (numWaypoints - 1))) % 360;
+    wps.push(destinationPoint(center, angle, waypointDist));
+  }
+  return [center, ...wps, center];
 }
 
 /**
@@ -2559,9 +2618,17 @@ export async function generateOSRMRoutes(
       const SECOND_PASS_BEARINGS = 4;
       const seedBearing = getSeed() % 360;
       const halfDist = distanceKm / (2 * ROUTING_OVERHEAD);
-      // Same triangle-perimeter math as generateLoopWaypoints. Previously
-      // used 2π here too, producing a 20–30% undershoot on the final fallback.
-      const waypointDist = distanceKm / (LOOP_TRIANGLE_PERIMETER * ROUTING_OVERHEAD);
+      // Waypoint count scales with target distance to match generateLoopWaypoints.
+      // Long-distance targets need more polygon vertices to keep each waypoint
+      // close enough to start that it doesn't land in water (Hudson, East River
+      // for NYC starts). See generateLoopWaypoints for perimeter-factor derivation.
+      const targetMi = distanceKm * 0.621371;
+      const numLoopWaypoints = targetMi >= 22 ? 4 : targetMi >= 14 ? 3 : 2;
+      const loopPerimeterFactor =
+        numLoopWaypoints === 4 ? 6.243 :
+        numLoopWaypoints === 3 ? 5.464 :
+        LOOP_TRIANGLE_PERIMETER;
+      const waypointDist = distanceKm / (loopPerimeterFactor * ROUTING_OVERHEAD);
 
       // Sequential, not parallel. Firing all trials in parallel (each with
       // its own internal retry loop) means many in-flight OSRM calls
@@ -2584,17 +2651,32 @@ export async function generateOSRMRoutes(
         const phase = i < FIRST_PASS_BEARINGS ? 0 : 360 / (FIRST_PASS_BEARINGS * 2);
         const indexInPass = i % FIRST_PASS_BEARINGS;
         const bearing = (seedBearing + phase + (indexInPass * 360) / FIRST_PASS_BEARINGS) % 360;
-        const wps: RoutePoint[] = routeType === 'out-and-back'
-          ? [center, destinationPoint(center, bearing, halfDist), center]
-          : [
-              center,
-              destinationPoint(center, bearing, waypointDist),
-              // Offset wp2 30° from antipodal so the route forms a triangle,
-              // not a straight line. OSRM tends to use the same streets
-              // both ways on a perfect line, causing high retrace.
-              destinationPoint(center, (bearing + 210) % 360, waypointDist),
-              center,
-            ];
+        let wps: RoutePoint[];
+        if (routeType === 'out-and-back') {
+          wps = [center, destinationPoint(center, bearing, halfDist), center];
+        } else if (numLoopWaypoints === 2) {
+          wps = [
+            center,
+            destinationPoint(center, bearing, waypointDist),
+            // Offset wp2 30° from antipodal so the route forms a triangle,
+            // not a straight line. OSRM tends to use the same streets
+            // both ways on a perfect line, causing high retrace.
+            destinationPoint(center, (bearing + 210) % 360, waypointDist),
+            center,
+          ];
+        } else {
+          // 3+ waypoints — spread across a 330° arc so the closing leg
+          // doesn't parallel the opening leg (which would visibly retrace).
+          const arc = 330;
+          const step = arc / (numLoopWaypoints - 1);
+          const generated: RoutePoint[] = [center];
+          for (let k = 0; k < numLoopWaypoints; k++) {
+            const angle = (bearing + k * step) % 360;
+            generated.push(destinationPoint(center, angle, waypointDist));
+          }
+          generated.push(center);
+          wps = generated;
+        }
 
         const t = await fetchOSRMRouteAdjusted(wps, center, distanceKm, 3, adjustUnits);
         const trialDisplayMatches = !!t.route && !!adjustUnits &&

@@ -103,6 +103,14 @@ const FIXTURES: Fixture[] = [
   { name: 'nyc-les-2mi-loop-quiet',     center: { lat: 40.715, lng: -73.985 }, distanceMi: 2, routeType: 'loop',         prefs: { lowTraffic: true } },
   { name: 'nyc-columbus-8mi-loop',      center: { lat: 40.768, lng: -73.982 }, distanceMi: 8, routeType: 'loop',         prefs: { lowTraffic: false } },
   { name: 'nyc-columbus-10mi-loop',     center: { lat: 40.768, lng: -73.982 }, distanceMi: 10, routeType: 'loop',        prefs: { lowTraffic: true } },
+  // Long-distance fixtures — exercise the multi-waypoint loop path
+  // (≥14mi triggers 3 waypoints, ≥22mi triggers 4) and the 25km Overpass
+  // bucket. Mock OSRM produces idealized geometry so these mostly verify
+  // the algorithm isn't crashing or returning degenerate results; real
+  // 30mi geometry needs a separate manual public-OSRM check.
+  { name: 'nyc-columbus-15mi-loop',     center: { lat: 40.768, lng: -73.982 }, distanceMi: 15, routeType: 'loop',        prefs: { lowTraffic: false } },
+  { name: 'nyc-columbus-20mi-loop',     center: { lat: 40.768, lng: -73.982 }, distanceMi: 20, routeType: 'loop',        prefs: { lowTraffic: false } },
+  { name: 'nyc-columbus-30mi-loop',     center: { lat: 40.768, lng: -73.982 }, distanceMi: 30, routeType: 'loop',        prefs: { lowTraffic: false } },
 
   // East Village / NoHo — matches the user's screenshots showing block-
   // weaving, dead-end stubs, and figure-8 patterns. The dense Manhattan
