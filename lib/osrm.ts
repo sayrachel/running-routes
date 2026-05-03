@@ -1427,6 +1427,24 @@ async function fetchWithRetry(url: string, retries = 1): Promise<Response> {
   throw new Error('OSRM request failed after retries');
 }
 
+/** One contiguous segment along the routed polyline, corresponding to a
+ *  single OSM way. The `name` field is what we lean on for off-street
+ *  detection: real public streets almost always have one, while interior
+ *  pedestrian paths inside private superblocks (residential complexes,
+ *  hospital/college campuses, gated developments) typically don't. */
+interface OSRMStep {
+  name: string;
+  distance: number; // meters
+  geometry: {
+    coordinates: [number, number][];
+    type: string;
+  };
+}
+
+interface OSRMLeg {
+  steps: OSRMStep[];
+}
+
 interface OSRMRoute {
   geometry: {
     coordinates: [number, number][];
@@ -1434,6 +1452,10 @@ interface OSRMRoute {
   };
   distance: number; // meters
   duration: number; // seconds
+  /** Per-segment breakdown when the request was made with `steps=true`.
+   *  Empty array in legacy/mock callers — `computeOffStreetRatio` treats
+   *  missing steps as "can't classify" and returns 0 (no rejection). */
+  legs: OSRMLeg[];
 }
 
 interface OSRMResponse {
@@ -1699,6 +1721,9 @@ export function mockOSRMRoute(waypoints: RoutePoint[]): OSRMRoute {
     geometry: { type: 'LineString', coordinates: coords },
     distance: distMeters,
     duration,
+    // Mock leaves legs empty. `computeOffStreetRatio` treats empty steps as
+    // "can't classify" and returns 0, so the harness behaves as before.
+    legs: [],
   };
 }
 
@@ -1843,6 +1868,75 @@ export function loadOSRMCache(snapshot: Partial<OSRMSnapshot>): void {
 }
 
 /**
+ * Fraction of a routed polyline (by distance) that's on UNNAMED OSM ways
+ * AND outside every known green-space catchment.
+ *
+ * Why this matters: OSRM's foot profile happily routes through interior
+ * `highway=footway`/`highway=service` paths inside private superblocks
+ * (residential complexes, hospital/college campuses, gated developments).
+ * Those paths are real in OSM but invisible on consumer basemaps, so the
+ * route renders as "a diagonal through nothing." Real public streets
+ * almost universally have a `name` tag in OSM; interior paths usually
+ * don't. Park paths are ALSO usually unnamed, but they fall inside known
+ * green-space polygons we already fetch, so we exclude them from the
+ * count.
+ *
+ * Returns 0 when:
+ *  - The route's `legs` array is empty (mock OSRM, or response without
+ *    `steps=true`) — caller should treat this as "can't classify, don't
+ *    reject."
+ *  - All steps are named or all unnamed steps fall inside green spaces.
+ */
+export function computeOffStreetRatio(
+  route: OSRMRoute,
+  greenSpaces: GreenSpace[],
+): number {
+  const totalMeters = route.distance;
+  if (totalMeters <= 0) return 0;
+  if (!route.legs || route.legs.length === 0) return 0;
+
+  let offStreetMeters = 0;
+  for (const leg of route.legs) {
+    for (const step of leg.steps) {
+      // Named step → assume real public street. This is the dominant signal.
+      if (step.name && step.name.trim().length > 0) continue;
+      // Unnamed step. Step distance ≤20m is often just a maneuver edge
+      // (corner clipping, lane transition) — too short to matter.
+      if (step.distance < 20) continue;
+      // Allow if the step's geometry centroid falls inside a known green
+      // space catchment (parks, named cycleways, pedestrian zones,
+      // waterfronts). One representative point is enough — green-space
+      // catchments are tens-to-hundreds of meters and steps are typically
+      // <500m in dense areas.
+      if (isStepInsideAnyGreenSpace(step, greenSpaces)) continue;
+      offStreetMeters += step.distance;
+    }
+  }
+  return offStreetMeters / totalMeters;
+}
+
+function isStepInsideAnyGreenSpace(step: OSRMStep, greenSpaces: GreenSpace[]): boolean {
+  const coords = step.geometry?.coordinates;
+  if (!coords || coords.length === 0) return false;
+  const mid = coords[Math.floor(coords.length / 2)];
+  const point = { lat: mid[1], lng: mid[0] };
+
+  for (const gs of greenSpaces) {
+    // Polygon green spaces (parks/gardens/nature reserves): catchment is
+    // the effective radius derived from the OSM bounds, plus 50m of slop
+    // to absorb perimeter paths that hug the edge of the park.
+    // Linear features (named cycleways, pedestrian streets, waterfront)
+    // have areaSize=0; we use a small fixed catchment because each record
+    // represents one centroid along the feature, not its full extent.
+    const radiusKm = gs.areaSize > 0
+      ? Math.sqrt(gs.areaSize / Math.PI) + 0.05
+      : 0.10;
+    if (haversineDistance(point, gs.point) <= radiusKm) return true;
+  }
+  return false;
+}
+
+/**
  * Call OSRM to get a walking route through the given waypoints.
  */
 async function fetchOSRMRoute(waypoints: RoutePoint[]): Promise<OSRMRoute | null> {
@@ -1870,7 +1964,12 @@ async function fetchOSRMRoute(waypoints: RoutePoint[]): Promise<OSRMRoute | null
   }
 
   const coords = coordsString(waypoints);
-  const url = `${osrmBase}/${coords}?overview=full&geometries=geojson&steps=false`;
+  // steps=true gives us per-segment way names. We use those names to detect
+  // when OSRM has routed through unnamed interior paths inside private
+  // superblocks (PCV/Stuy Town, college campuses, gated complexes). Costs
+  // ~10-20% more response payload but no extra requests. See
+  // `computeOffStreetRatio` for the consumer.
+  const url = `${osrmBase}/${coords}?overview=full&geometries=geojson&steps=true`;
 
   const cached = osrmRouteCache.get(url);
   if (cached !== undefined) {
@@ -2435,6 +2534,22 @@ export async function generateOSRMRoutes(
         traceEmit('candidate-rejected', { i, reason: 'highway', hwProximity });
         continue;
       }
+      // HARD REJECT: too much of the route is on unnamed OSM ways outside
+      // any known green space. Catches OSRM routing through interior
+      // pedestrian paths in private superblocks (residential complexes,
+      // hospital/college campuses) — the user reported PCV/Stuy Town as
+      // a recurring case where the rendered polyline visibly cuts across
+      // blocks where no public street exists. See `computeOffStreetRatio`
+      // for the rationale. Threshold of 10% lets brief unnamed alleys or
+      // sidewalk transitions through; systematic interior routing fails.
+      if (routeType !== 'point-to-point') {
+        const offStreetRatio = computeOffStreetRatio(osrmRoute, greenSpaces);
+        if (offStreetRatio > 0.10) {
+          qualityRejectCount++;
+          traceEmit('candidate-rejected', { i, reason: 'off-street', offStreetRatio });
+          continue;
+        }
+      }
       // SOFT METRICS: feed into a quality score. Lower retrace/overlap/stubs
       // = higher quality. We KEEP all candidates that pass hard rejection
       // and pick the best by quality at the end. This avoids the past bug
@@ -2759,10 +2874,21 @@ export async function generateOSRMRoutes(
       const fallbackDistRatio = distanceKm > 0 ? fallbackDistKm / distanceKm : 1;
       const fallbackDistanceOutOfBand =
         fallbackDistRatio > fallbackMaxRatio || fallbackDistRatio < fallbackMinRatio;
+      // Same off-street gate as step 3. The geometric bearing fallback is
+      // a generic triangle through arbitrary points around the center —
+      // OSRM can land waypoints inside private superblocks just as easily
+      // here as in step 3, and we don't want the fallback to be the
+      // escape hatch that ships a route through PCV/Stuy Town interior.
+      const fallbackOffStreetRatio = routeType === 'point-to-point'
+        ? 0
+        : computeOffStreetRatio(chosen.route, greenSpaces);
+      const fallbackOffStreet = fallbackOffStreetRatio > 0.10;
       if (fallbackPendant > 0) {
         traceEmit('candidate-rejected', { i: -1, reason: 'pendant-loop', pendantLoops: fallbackPendant, source: 'fallback-post-trim-residual' });
       } else if (fallbackDistanceOutOfBand) {
         traceEmit('candidate-rejected', { i: -1, reason: 'distance', distKm: fallbackDistKm, distRatio: fallbackDistRatio, target: distanceKm, source: 'fallback' });
+      } else if (fallbackOffStreet) {
+        traceEmit('candidate-rejected', { i: -1, reason: 'off-street', offStreetRatio: fallbackOffStreetRatio, source: 'fallback' });
       } else {
         const fallbackRecord: ResolvedCandidate = {
           index: 0,

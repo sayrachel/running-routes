@@ -14,6 +14,7 @@ import {
   countPendantLoops,
   roundedDisplayMatches,
   nearDisplayMatches,
+  computeOffStreetRatio,
   generateOSRMRoutes,
   setOSRMMock,
   setMockOSRMLatency,
@@ -228,6 +229,127 @@ describe('nearDisplayMatches', () => {
   });
   it('metric: 5km target / 7km route (off by 2) → no match', () => {
     expect(nearDisplayMatches(7, 5, 'metric')).toBe(false);
+  });
+});
+
+describe('computeOffStreetRatio', () => {
+  // Detects routes that traverse unnamed OSM ways outside any known green
+  // space — the signature of OSRM routing through interior pedestrian
+  // paths in private superblocks (residential complexes, hospital/college
+  // campuses). Reproduces the user-reported PCV/Stuy Town case.
+  type Step = { name: string; distance: number; geometry: { coordinates: [number, number][]; type: string } };
+  type Leg = { steps: Step[] };
+  type Route = { distance: number; duration: number; geometry: { coordinates: [number, number][]; type: string }; legs: Leg[] };
+
+  const mkStep = (name: string, distance: number, lat: number, lng: number): Step => ({
+    name,
+    distance,
+    geometry: { type: 'LineString', coordinates: [[lng, lat], [lng + 0.0001, lat + 0.0001]] },
+  });
+  const mkRoute = (steps: Step[]): Route => {
+    const distance = steps.reduce((s, st) => s + st.distance, 0);
+    return {
+      distance,
+      duration: distance,
+      geometry: { type: 'LineString', coordinates: [] },
+      legs: [{ steps }],
+    };
+  };
+
+  it('returns 0 when every step has a name', () => {
+    const route = mkRoute([
+      mkStep('Broadway', 400, 40.73, -73.99),
+      mkStep('E 14th St', 300, 40.733, -73.985),
+      mkStep('1st Ave', 500, 40.737, -73.984),
+    ]);
+    expect(computeOffStreetRatio(route, [])).toBe(0);
+  });
+
+  it('returns 0 when legs array is empty (mock OSRM, response without steps=true)', () => {
+    const route: Route = {
+      distance: 1000, duration: 540,
+      geometry: { type: 'LineString', coordinates: [] },
+      legs: [],
+    };
+    expect(computeOffStreetRatio(route, [])).toBe(0);
+  });
+
+  it('counts unnamed steps outside any green space (PCV/Stuy Town pattern)', () => {
+    // 600m of unnamed interior path + 400m on a real street.
+    const route = mkRoute([
+      mkStep('E 14th St', 400, 40.732, -73.985),
+      mkStep('', 600, 40.736, -73.978), // diagonal through PCV interior, no green nearby
+    ]);
+    const ratio = computeOffStreetRatio(route, []);
+    expect(ratio).toBeCloseTo(0.6, 2);
+  });
+
+  it('does NOT count unnamed steps inside a green-space catchment (park path)', () => {
+    // Same shape as above but the unnamed step's midpoint is inside a
+    // 0.05 km² park's catchment (effective radius ~125m + 50m fudge).
+    const greenSpaces = [{
+      point: { lat: 40.736, lng: -73.978 },
+      tier: 1 as const,
+      kind: 'park' as const,
+      name: 'Test Park',
+      areaSize: 0.05,
+    }];
+    const route = mkRoute([
+      mkStep('E 14th St', 400, 40.732, -73.985),
+      mkStep('', 600, 40.736, -73.978),
+    ]);
+    expect(computeOffStreetRatio(route, greenSpaces)).toBe(0);
+  });
+
+  it('ignores very short unnamed steps (maneuver edges)', () => {
+    // 10m unnamed corner clip should not register as off-street.
+    const route = mkRoute([
+      mkStep('Broadway', 400, 40.73, -73.99),
+      mkStep('', 10, 40.731, -73.989),
+      mkStep('E 14th St', 400, 40.732, -73.985),
+    ]);
+    expect(computeOffStreetRatio(route, [])).toBe(0);
+  });
+
+  it('triggers the 10% rejection threshold when off-street content > 10%', () => {
+    // 200m unnamed-outside-green over a 1500m route = 13.3%.
+    const route = mkRoute([
+      mkStep('Broadway', 700, 40.73, -73.99),
+      mkStep('', 200, 40.736, -73.978), // off-street segment
+      mkStep('1st Ave', 600, 40.737, -73.984),
+    ]);
+    const ratio = computeOffStreetRatio(route, []);
+    expect(ratio).toBeGreaterThan(0.10);
+  });
+
+  it('stays under the 10% threshold for a single brief unnamed alley', () => {
+    // 80m unnamed-outside-green over a 1500m route = 5.3% — passes.
+    const route = mkRoute([
+      mkStep('Broadway', 700, 40.73, -73.99),
+      mkStep('', 80, 40.731, -73.985), // brief unnamed connector
+      mkStep('1st Ave', 720, 40.737, -73.984),
+    ]);
+    const ratio = computeOffStreetRatio(route, []);
+    expect(ratio).toBeLessThan(0.10);
+  });
+
+  it('handles a large park: unnamed paths well inside still pass', () => {
+    // 1.4 km² park (Central Park-ish) → effective radius ~668m + 50m fudge.
+    // An unnamed path 500m from the park centroid stays inside the catchment.
+    const greenSpaces = [{
+      point: { lat: 40.785, lng: -73.968 },
+      tier: 1 as const,
+      kind: 'park' as const,
+      name: 'Big Park',
+      areaSize: 1.4,
+    }];
+    const offsetLat = 40.785 + 0.0045; // ~500m north
+    const route = mkRoute([
+      mkStep('Park Path South', 300, 40.781, -73.968),
+      mkStep('', 500, offsetLat, -73.968), // unnamed park path
+      mkStep('Park Path North', 300, 40.789, -73.968),
+    ]);
+    expect(computeOffStreetRatio(route, greenSpaces)).toBe(0);
   });
 });
 
