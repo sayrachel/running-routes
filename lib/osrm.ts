@@ -3008,20 +3008,53 @@ export async function generateOSRMRoutes(
     );
   }
 
-  // Wrong-display fallback REMOVED (May 2026). Earlier behavior promoted the
-  // cleanest candidate within ±1 rounded mile/km when no right-display
-  // candidates survived — a 4mi request could ship a 3.4mi route labeled
-  // "3 mi". User reported this as a bug ("you give me 3-mile options when
-  // I'm asking for 4"); the off-by-one display reads as broken regardless of
-  // how clean the geometry is. Surface "no routes found" instead so the user
-  // can refresh, change distance, or move the start. The wrongDisplayFallback
-  // array is still populated upstream because its presence gates whether
-  // step 3.5 runs (a populated array means OSRM is responding, just not at
-  // the right display unit — step 3.5 has a real shot at converging).
-  if (resolved.length === 0 && wrongDisplayFallback.length > 0) {
+  // Wrong-display fallback RESTORED (May 2026, second pass) with a
+  // target-distance gate. Original removal was over-aggressive — the user
+  // reported that "no routes found" happens often enough in dense areas
+  // (East Village 4mi loop: q=8 d=8 w=4 reproducing across multiple
+  // attempts) that "any route, even off-by-one mile" is preferable to
+  // failure. But: user also flagged that perceived-deltas are bigger at
+  // small target distances ("the lower the # of miles the user requests,
+  // the more sensitive they will be to the delta between requested and
+  // received miles"). A 1mi request returning a 2mi route is a 100% delta;
+  // a 5mi returning a 6mi is 20%. Same nominal "off by 1" feels very
+  // different. So: only promote the fallback when target ≥ 3 miles. Below
+  // that, surface "no routes found" — the user can change distance or
+  // location, and the candidates that would have qualified are by
+  // definition >50% off, which is "broken" not "close-enough."
+  const targetMiForFallback = distanceKm * 0.621371;
+  const allowWrongDisplayFallback = targetMiForFallback >= 3;
+  if (resolved.length === 0 && wrongDisplayFallback.length > 0 && allowWrongDisplayFallback) {
+    // ±1 rounded-mile/km guardrail (existing helper). Without this a 4mi
+    // request could ship a 7mi route from the wrong-display pool — the
+    // candidate distance gate is [0.5, 1.3] of target, wide enough to let
+    // that through. ±1 keeps us in "off by one" territory only.
+    const fallbackUnits = useAdjustment ? adjustUnits : null;
+    const eligible = fallbackUnits
+      ? wrongDisplayFallback.filter((c) => nearDisplayMatches(c.distKm, distanceKm, fallbackUnits))
+      : wrongDisplayFallback;
+    if (eligible.length > 0) {
+      const sortedFallback = [...eligible].sort((a, b) => a.qualityPenalty - b.qualityPenalty);
+      traceEmit('wrong-display-fallback-used', {
+        candidateCount: eligible.length,
+        rejectedFarCount: wrongDisplayFallback.length - eligible.length,
+        bestDistKm: sortedFallback[0].distKm,
+        targetKm: distanceKm,
+      });
+      resolved.push(...sortedFallback);
+    } else {
+      traceEmit('wrong-display-fallback-rejected', {
+        candidateCount: wrongDisplayFallback.length,
+        targetKm: distanceKm,
+        reason: 'all-too-far-from-target',
+      });
+    }
+  } else if (resolved.length === 0 && wrongDisplayFallback.length > 0) {
     traceEmit('wrong-display-fallback-suppressed', {
       candidateCount: wrongDisplayFallback.length,
       targetKm: distanceKm,
+      reason: 'target-too-small',
+      targetMi: targetMiForFallback,
     });
   }
 
