@@ -3,6 +3,14 @@ import type { RoutePoint } from './route-generator';
 const OVERPASS_URLS = [
   'https://overpass-api.de/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter',
+  // Added May 2026: both above mirrors were intermittently timing out
+  // (12s+ on simple park queries that normally take 3-5s), making the
+  // app produce g=0 across multiple sessions. The openstreetmap.fr
+  // mirror was responding in 6s for the same query while the others hung.
+  // Promise.any in fetchOverpassRace takes whichever responds first, so
+  // adding more mirrors only helps — at worst they all race and slowest
+  // get aborted when one wins.
+  'https://overpass.openstreetmap.fr/api/interpreter',
 ];
 // Bumped 8000 → 12000 to give the combined Overpass query (greens +
 // highways at 10km radius around dense areas like Manhattan) enough wall-
