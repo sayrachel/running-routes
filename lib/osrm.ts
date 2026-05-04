@@ -2418,8 +2418,16 @@ export async function generateOSRMRoutes(
     const launchDelay = idx * launchSpacingMs;
     const p = (async (): Promise<Tagged> => {
       if (launchDelay > 0) await new Promise((r) => setTimeout(r, launchDelay));
+      // 4 retries (5 total attempts). Was 2 (3 attempts), but the per-step
+      // scale cap of [0.80, 1.25] meant a candidate starting at ratio 0.4
+      // (waypoints landed in a tight pocket) could only reach ratio 0.625
+      // after 2 retries — still outside the [0.5, 1.3] hard-reject band.
+      // User-reported East Village 4mi refresh failed with q=9 (d=8 of
+      // those distance-band rejects); 4 retries lets ratio 0.4 reach 0.97.
+      // Worst case latency bounded by the 18s resolution budget +
+      // divergence detection (returns best-so-far if attempt 2x worse).
       const result = useAdjustment
-        ? await fetchOSRMRouteAdjusted(c.waypoints, center, distanceKm, 2, adjustUnits)
+        ? await fetchOSRMRouteAdjusted(c.waypoints, center, distanceKm, 4, adjustUnits)
         : { route: await fetchOSRMRoute(c.waypoints), waypoints: c.waypoints };
       return { idx, result };
     })();
