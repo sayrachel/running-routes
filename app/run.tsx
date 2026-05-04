@@ -314,6 +314,21 @@ export default function RunScreen() {
       );
       ctx.setIsGenerating(false);
       if (newRoutes.length === 0) {
+        // Cycle-to-history safety net (per user request: "instead of showing
+        // the error, why don't you just cycle it back to one of the
+        // previously generated routes?"). If we have any historical route
+        // that ISN'T the currently-selected one, swap to it so the user gets
+        // visible variety even when generation fails. Still surface the
+        // banner so they know it wasn't a fresh result. Falls through to
+        // the bare error if history is empty or only contains the current.
+        const cycleCandidate = ctx.routeHistory.find((r) => r.id !== ctx.selectedRoute?.id);
+        if (cycleCandidate) {
+          ctx.setRoutes([cycleCandidate]);
+          ctx.setSelectedRoute(cycleCandidate);
+          ctx.pushRouteToHistory(cycleCandidate); // promote to front so we cycle through history
+          showRefreshError(`Showing a previous route - couldn't find a new one. Try again.${failureDiagSuffix()}`);
+          return;
+        }
         // Keep the previous route visible — bouncing to plan strands the
         // user with no route AND no clear next step (they hit generate, hit
         // the same failure, get bounced again). Surface a banner instead.
@@ -322,6 +337,7 @@ export default function RunScreen() {
       }
       ctx.setRoutes(newRoutes);
       ctx.setSelectedRoute(newRoutes[0]);
+      ctx.pushRouteToHistory(newRoutes[0]);
       persistOverpassCache();
       persistOSRMCache();
     } catch (err) {

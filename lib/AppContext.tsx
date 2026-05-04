@@ -77,6 +77,13 @@ interface AppState {
   // remounted plan screen display it.
   generateError: string | null;
   setGenerateError: (v: string | null) => void;
+  // Recent successfully-generated routes (newest first, capped at 5). Used
+  // by the refresh handler on /run as a safety net: if generation returns
+  // [] the user gets cycled to a different historical route instead of
+  // staring at "no routes found." Cleaner UX than a dead end, since the
+  // user is already on /run with a working route — they just want variety.
+  routeHistory: GeneratedRoute[];
+  pushRouteToHistory: (route: GeneratedRoute) => void;
   endLocation: RoutePoint | null;
   setEndLocation: (v: RoutePoint | null) => void;
   favorites: FavoriteRoute[];
@@ -137,7 +144,20 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [selectedRoute, setSelectedRoute] = useState<GeneratedRoute | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
   const [generateError, setGenerateError] = useState<string | null>(null);
+  const [routeHistory, setRouteHistory] = useState<GeneratedRoute[]>([]);
   const [endLocation, setEndLocation] = useState<RoutePoint | null>(null);
+
+  // Cap kept small (5) — each route polyline is ~hundreds of points; 5
+  // covers "cycle through a few recent routes when refresh fails" without
+  // unbounded growth across a long session. Newest first; dedupe by id so
+  // re-pushing the same route promotes it to the front instead of
+  // duplicating.
+  const pushRouteToHistory = useCallback((route: GeneratedRoute) => {
+    setRouteHistory((prev) => {
+      const filtered = prev.filter((r) => r.id !== route.id);
+      return [route, ...filtered].slice(0, 5);
+    });
+  }, []);
   const [favorites, setFavorites] = useState<FavoriteRoute[]>([]);
 
   // Load cached favorites on mount for instant offline display
@@ -300,6 +320,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setIsGenerating,
         generateError,
         setGenerateError,
+        routeHistory,
+        pushRouteToHistory,
         endLocation,
         setEndLocation,
         favorites,

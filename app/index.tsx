@@ -624,6 +624,7 @@ export default function SetupScreen() {
       }
       ctx.setRoutes(newRoutes);
       ctx.setSelectedRoute(newRoutes[0] || null);
+      if (newRoutes[0]) ctx.pushRouteToHistory(newRoutes[0]);
       ctx.setIsGenerating(false);
       // Persist the Overpass + OSRM caches after a successful generation.
       // The network round trips just paid for fresh data — checkpointing
