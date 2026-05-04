@@ -70,6 +70,13 @@ interface AppState {
   setSelectedRoute: (v: GeneratedRoute | null) => void;
   isGenerating: boolean;
   setIsGenerating: (v: boolean) => void;
+  // Lifted from app/index.tsx local state because router.replace() unmounts
+  // the plan screen during generation. Error setters captured in the original
+  // mount's closure become no-ops by the time generation resolves; storing
+  // the message in a context that survives the unmount lets the freshly
+  // remounted plan screen display it.
+  generateError: string | null;
+  setGenerateError: (v: string | null) => void;
   endLocation: RoutePoint | null;
   setEndLocation: (v: RoutePoint | null) => void;
   favorites: FavoriteRoute[];
@@ -129,6 +136,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [routes, setRoutes] = useState<GeneratedRoute[]>([]);
   const [selectedRoute, setSelectedRoute] = useState<GeneratedRoute | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [generateError, setGenerateError] = useState<string | null>(null);
   const [endLocation, setEndLocation] = useState<RoutePoint | null>(null);
   const [favorites, setFavorites] = useState<FavoriteRoute[]>([]);
 
@@ -290,6 +298,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setSelectedRoute,
         isGenerating,
         setIsGenerating,
+        generateError,
+        setGenerateError,
         endLocation,
         setEndLocation,
         favorites,

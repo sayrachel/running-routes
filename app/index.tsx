@@ -206,7 +206,6 @@ export default function SetupScreen() {
   const [hasEndLocation, setHasEndLocation] = useState(false);
   const [drawerVisible, setDrawerVisible] = useState(false);
   const [sliderActive, setSliderActive] = useState(false);
-  const [generateError, setGenerateError] = useState<string | null>(null);
 
   // Bottom sheet collapse
   const [isSheetCollapsed, setIsSheetCollapsed] = useState(false);
@@ -525,7 +524,7 @@ export default function SetupScreen() {
     ctx.setRouteStyle(localRouteStyle);
     ctx.setPrefs(localPrefs);
     ctx.setIsGenerating(true);
-    setGenerateError(null);
+    ctx.setGenerateError(null);
 
     // Use local copies so geocoded values are available in the same tick
     let resolvedCenter = ctx.center;
@@ -597,9 +596,12 @@ export default function SetupScreen() {
       );
       if (newRoutes.length === 0) {
         ctx.setIsGenerating(false);
-        // Navigate back so user can retry
+        // Set the error in context BEFORE navigating. router.replace('/')
+        // unmounts the run screen and mounts a fresh plan screen; the new
+        // plan screen reads generateError from context (which survives the
+        // unmount) and renders the banner on first paint.
+        ctx.setGenerateError('No routes found for this area. Try a different location or distance.');
         router.replace('/');
-        setTimeout(() => setGenerateError('No routes found for this area. Try a different location or distance.'), 100);
         return;
       }
       ctx.setRoutes(newRoutes);
@@ -614,14 +616,14 @@ export default function SetupScreen() {
     } catch (err: any) {
       console.warn('Route generation failed:', err);
       ctx.setIsGenerating(false);
-      router.replace('/');
       // OSRMUnavailableError = endpoint timeout/5xx/budget. Generic catch =
       // anything else (geocoding, JSON parse, etc.). Different message for
       // each so the user knows whether to retry now or wait/move locations.
       const msg = err instanceof OSRMUnavailableError
         ? "Routing service is slow or unavailable. Please try again in a moment."
         : "Couldn't generate a route. Check your connection and try again.";
-      setTimeout(() => setGenerateError(msg), 100);
+      ctx.setGenerateError(msg);
+      router.replace('/');
     }
   }, [ctx, localRouteStyle, localPrefs, hasEndLocation, p2pDistance, router, startAddressText, endAddressText]);
 
@@ -988,10 +990,10 @@ export default function SetupScreen() {
           {!ctx.hasLocation && (
             <Text style={styles.helpText}>Set your location above to continue</Text>
           )}
-          {generateError && (
+          {ctx.generateError && (
             <View style={styles.errorBanner}>
               <Ionicons name="alert-circle" size={16} color={Colors.destructive} />
-              <Text style={styles.errorText}>{generateError}</Text>
+              <Text style={styles.errorText}>{ctx.generateError}</Text>
             </View>
           )}
         </View>

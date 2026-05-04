@@ -2932,38 +2932,21 @@ export async function generateOSRMRoutes(
     );
   }
 
-  // After step 3 + step 3.5, fall back to wrong-display candidates only if we
-  // have zero right-display routes. Better to show a 5.6mi route labeled "6 mi"
-  // for a 5mi request (visible mismatch the user can see) than "no routes
-  // found" — they at least get something runnable in the right area, and the
-  // refresh button can hunt for a better-fitting candidate. Logged so harness
-  // can flag this as a known-imperfect case.
+  // Wrong-display fallback REMOVED (May 2026). Earlier behavior promoted the
+  // cleanest candidate within ±1 rounded mile/km when no right-display
+  // candidates survived — a 4mi request could ship a 3.4mi route labeled
+  // "3 mi". User reported this as a bug ("you give me 3-mile options when
+  // I'm asking for 4"); the off-by-one display reads as broken regardless of
+  // how clean the geometry is. Surface "no routes found" instead so the user
+  // can refresh, change distance, or move the start. The wrongDisplayFallback
+  // array is still populated upstream because its presence gates whether
+  // step 3.5 runs (a populated array means OSRM is responding, just not at
+  // the right display unit — step 3.5 has a real shot at converging).
   if (resolved.length === 0 && wrongDisplayFallback.length > 0) {
-    // Guardrail: only promote fallbacks whose distance rounds to within ±1
-    // mile/km of target. The candidate distance gate is [0.5, 1.3] of target
-    // — wide enough that a 4mi route can pass it for a 7mi request, then ship
-    // as the cleanest wrong-display fallback. Off-by-one rounded display is
-    // the user's accepted compromise; off-by-three reads as a broken algo.
-    const fallbackUnits = useAdjustment ? adjustUnits : null;
-    const eligible = fallbackUnits
-      ? wrongDisplayFallback.filter((c) => nearDisplayMatches(c.distKm, distanceKm, fallbackUnits))
-      : wrongDisplayFallback;
-    if (eligible.length > 0) {
-      const sortedFallback = [...eligible].sort((a, b) => a.qualityPenalty - b.qualityPenalty);
-      traceEmit('wrong-display-fallback-used', {
-        candidateCount: eligible.length,
-        rejectedFarCount: wrongDisplayFallback.length - eligible.length,
-        bestDistKm: sortedFallback[0].distKm,
-        targetKm: distanceKm,
-      });
-      resolved.push(...sortedFallback);
-    } else {
-      traceEmit('wrong-display-fallback-rejected', {
-        candidateCount: wrongDisplayFallback.length,
-        targetKm: distanceKm,
-        reason: 'all-too-far-from-target',
-      });
-    }
+    traceEmit('wrong-display-fallback-suppressed', {
+      candidateCount: wrongDisplayFallback.length,
+      targetKm: distanceKm,
+    });
   }
 
   // Step 4: Score each candidate using locally-computable metrics only.
