@@ -15,11 +15,13 @@
     "ios": {
       "supportsTablet": false,
       "bundleIdentifier": "com.runroutes.app",
-      "buildNumber": "36",
+      "buildNumber": "37",
       "infoPlist": {
         "NSLocationWhenInUseUsageDescription": "Run Routes needs your location to generate running routes near you.",
         "NSLocationAlwaysAndWhenInUseUsageDescription": "Run Routes needs background location access to track your run even when the app is in the background.",
         "UIBackgroundModes": [
+          "location",
+          "location",
           "location",
           "location"
         ],
@@ -84,6 +86,9 @@
     },
     "updates": {
       "url": "https://u.expo.dev/cbab5abb-443f-4980-b641-0728a9dde070"
+    },
+    "runtimeVersion": {
+      "policy": "appVersion"
     }
   }
 }
