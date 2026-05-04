@@ -514,8 +514,19 @@ export default function SetupScreen() {
 
   const p2pDistance = useMemo(() => {
     if (localRouteStyle === 'point-to-point' && hasEndLocation && ctx.endLocation) {
-      const miles = haversineDistanceMiles(ctx.center.lat, ctx.center.lng, ctx.endLocation.lat, ctx.endLocation.lng);
-      const value = localPrefs.units === 'metric' ? miles * 1.60934 : miles;
+      // Apply routing overhead. The straight-line haversine between two
+      // NYC points is ~30-40% shorter than the actual streets-following
+      // route (you can't walk through buildings — the grid forces a
+      // longer path). Without this multiplier the plan-page number was
+      // misleading: user saw "3.8 mi" on plan and "5 mi" on the run
+      // screen for the same start→end pair. 1.4 is the NYC midpoint;
+      // mirrors the ROUTING_OVERHEAD constant in osrm.ts (1.45) used
+      // for the inverse direction (shrinking geometric waypoints to
+      // hit a routed-distance target).
+      const ROUTING_OVERHEAD_ESTIMATE = 1.4;
+      const haversineMi = haversineDistanceMiles(ctx.center.lat, ctx.center.lng, ctx.endLocation.lat, ctx.endLocation.lng);
+      const estimatedMi = haversineMi * ROUTING_OVERHEAD_ESTIMATE;
+      const value = localPrefs.units === 'metric' ? estimatedMi * 1.60934 : estimatedMi;
       return Math.round(value * 10) / 10;
     }
     return null;
