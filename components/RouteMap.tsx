@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useRef, useEffect, useMemo } from 'react';
 import { View, StyleSheet } from 'react-native';
 import MapView, { Polyline, Marker } from 'react-native-maps';
 import type { GeneratedRoute, RoutePoint } from '@/lib/route-generator';
@@ -17,41 +17,57 @@ interface RouteMapProps {
 export function RouteMap({ center, routes, selectedRouteId, gpsTrack, currentPosition }: RouteMapProps) {
   const selectedRoute = routes.find((r) => r.id === selectedRouteId) ?? null;
 
-  let latDelta = 0.02;
-  let lngDelta = 0.02;
+  // Recompute region whenever the underlying inputs change. Memoized so
+  // the useEffect below doesn't re-fire on unrelated re-renders.
+  const region = useMemo(() => {
+    let latDelta = 0.02;
+    let lngDelta = 0.02;
+    const allPoints: RoutePoint[] = [];
+    if (selectedRoute) allPoints.push(...selectedRoute.points);
+    if (gpsTrack && gpsTrack.length > 0) allPoints.push(...gpsTrack);
+    if (allPoints.length > 1) {
+      const lats = allPoints.map((p) => p.lat);
+      const lngs = allPoints.map((p) => p.lng);
+      latDelta = Math.max((Math.max(...lats) - Math.min(...lats)) * 1.5, 0.005);
+      lngDelta = Math.max((Math.max(...lngs) - Math.min(...lngs)) * 1.5, 0.005);
+    }
+    const mapCenter = currentPosition || center;
+    return {
+      latitude: mapCenter.lat,
+      longitude: mapCenter.lng,
+      latitudeDelta: latDelta,
+      longitudeDelta: lngDelta,
+    };
+  }, [selectedRoute, gpsTrack, currentPosition, center]);
 
-  const allPoints: RoutePoint[] = [];
-  if (selectedRoute) allPoints.push(...selectedRoute.points);
-  if (gpsTrack && gpsTrack.length > 0) allPoints.push(...gpsTrack);
-
-  if (allPoints.length > 1) {
-    const lats = allPoints.map((p) => p.lat);
-    const lngs = allPoints.map((p) => p.lng);
-    const minLat = Math.min(...lats);
-    const maxLat = Math.max(...lats);
-    const minLng = Math.min(...lngs);
-    const maxLng = Math.max(...lngs);
-    latDelta = Math.max((maxLat - minLat) * 1.5, 0.005);
-    lngDelta = Math.max((maxLng - minLng) * 1.5, 0.005);
-  }
-
-  const mapCenter = currentPosition || center;
+  // Animate camera on region changes after first mount. Setting `region`
+  // as a controlled prop on MapView caused abrupt single-frame snaps
+  // when the route changed — refresh would jump straight from the old
+  // route's bounds to the new route's bounds, which read as a glitch
+  // ("a route flashes for a second then updates to the actual route").
+  // Using `initialRegion` for first paint and `animateToRegion` for
+  // subsequent changes gives a smooth ~400ms transition.
+  const mapRef = useRef<MapView>(null);
+  const isFirstMountRef = useRef(true);
+  useEffect(() => {
+    if (isFirstMountRef.current) {
+      isFirstMountRef.current = false;
+      return;
+    }
+    mapRef.current?.animateToRegion(region, 400);
+  }, [region]);
 
   return (
     <View style={styles.container}>
       <MapView
+        ref={mapRef}
         style={styles.map}
         provider={undefined}
         userInterfaceStyle="dark"
         showsUserLocation={!currentPosition}
         showsMyLocationButton={false}
         showsCompass={false}
-        region={{
-          latitude: mapCenter.lat,
-          longitude: mapCenter.lng,
-          latitudeDelta: latDelta,
-          longitudeDelta: lngDelta,
-        }}
+        initialRegion={region}
       >
         {selectedRoute && (
           <Polyline
