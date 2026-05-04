@@ -25,7 +25,8 @@ import { RouteMap } from '@/components/RouteMap';
 import { ProfileDrawer } from '@/components/ProfileDrawer';
 import { useAppContext, type RouteStyle, type RunPreferences } from '@/lib/AppContext';
 import { distanceUnit } from '@/lib/units';
-import { generateOSRMRoutes, prewarmOSRMConnection, OSRMUnavailableError } from '@/lib/osrm';
+import { generateOSRMRoutes, prewarmOSRMConnection, OSRMUnavailableError, getLastFailureDiagnostics } from '@/lib/osrm';
+import * as Updates from 'expo-updates';
 import { prefetchGreenSpacesAndHighways } from '@/lib/overpass';
 import { persistOverpassCache } from '@/lib/overpass-persist';
 import { persistOSRMCache } from '@/lib/osrm-persist';
@@ -600,7 +601,16 @@ export default function SetupScreen() {
         // unmounts the run screen and mounts a fresh plan screen; the new
         // plan screen reads generateError from context (which survives the
         // unmount) and renders the banner on first paint.
-        ctx.setGenerateError('No routes found for this area. Try a different location or distance.');
+        // Diagnostic suffix: shows OSRM null count, quality rejects, wrong-
+        // display count, and the running update ID. Lets us debug
+        // "no routes" reports without console access. Sample format:
+        //   "...try a different distance. [n=4 q=2 w=3 v=019df105]"
+        const diag = getLastFailureDiagnostics();
+        const ver = (Updates.updateId ?? 'embedded').slice(0, 8);
+        const detail = diag
+          ? ` [n=${diag.osrmNullCount} q=${diag.qualityRejectCount} w=${diag.wrongDisplayCount}${diag.budgetExpired ? ' BUDGET' : ''} v=${ver}]`
+          : ` [v=${ver}]`;
+        ctx.setGenerateError(`No routes found for this area. Try a different location or distance.${detail}`);
         router.replace('/');
         return;
       }
@@ -619,9 +629,10 @@ export default function SetupScreen() {
       // OSRMUnavailableError = endpoint timeout/5xx/budget. Generic catch =
       // anything else (geocoding, JSON parse, etc.). Different message for
       // each so the user knows whether to retry now or wait/move locations.
+      const ver = (Updates.updateId ?? 'embedded').slice(0, 8);
       const msg = err instanceof OSRMUnavailableError
-        ? "Routing service is slow or unavailable. Please try again in a moment."
-        : "Couldn't generate a route. Check your connection and try again.";
+        ? `Routing service is slow or unavailable. Please try again in a moment. [v=${ver}]`
+        : `Couldn't generate a route. Check your connection and try again. [v=${ver}]`;
       ctx.setGenerateError(msg);
       router.replace('/');
     }

@@ -18,6 +18,23 @@ export function setOSRMBase(url: string | null): void {
 const MAX_CANDIDATE_COUNT = 3;
 const MAX_INTERNAL_CANDIDATES = 7;
 
+/** Diagnostic snapshot from the most recent `generateOSRMRoutes` call that
+ *  returned `[]`. Surfaced in the UI so we can tell a user-reported "no
+ *  routes found" apart from rate-limit-driven nulls vs every-candidate-was-
+ *  geometrically-bad without needing console access (iOS production builds
+ *  have no devtools). Reset to null on every generateOSRMRoutes call;
+ *  populated only when the function returns []. */
+export interface FailureDiagnostics {
+  osrmNullCount: number;
+  qualityRejectCount: number;
+  wrongDisplayCount: number;
+  budgetExpired: boolean;
+}
+let lastFailureDiagnostics: FailureDiagnostics | null = null;
+export function getLastFailureDiagnostics(): FailureDiagnostics | null {
+  return lastFailureDiagnostics;
+}
+
 /**
  * Thrown by `generateOSRMRoutes` when route generation failed because the
  * OSRM endpoint was unreachable or unresponsive (timeouts, 5xx, or the
@@ -2202,6 +2219,10 @@ export async function generateOSRMRoutes(
   end?: RoutePoint | null,
   excludeAnchors?: RoutePoint[] | null,
 ): Promise<GeneratedRoute[]> {
+  // Reset failure diagnostics on every call. Populated only on the path
+  // that returns [] so the UI can render "n/q/w" counts in the error
+  // banner. A successful generation leaves it null.
+  lastFailureDiagnostics = null;
   traceEmit('generate-start', { center, distanceKm, routeType, count, prefs, end: end ?? null });
 
   // Step 1: Fetch enriched green spaces and highway segments in a single
@@ -3008,6 +3029,21 @@ export async function generateOSRMRoutes(
     (a, b) => a.candidate.qualityPenalty - b.candidate.qualityPenalty
   );
   const topCandidates = sortedByQuality.slice(0, count);
+
+  // Snapshot the diagnostic counters when we're about to return an empty
+  // route list. Caller (UI) reads this via getLastFailureDiagnostics() to
+  // explain WHY no routes survived — without this, the user just sees a
+  // generic "no routes found" with no signal about whether OSRM was
+  // throttling, the algorithm gates were too tight, or geometry simply
+  // couldn't fit the requested mile.
+  if (topCandidates.length === 0) {
+    lastFailureDiagnostics = {
+      osrmNullCount,
+      qualityRejectCount,
+      wrongDisplayCount: wrongDisplayFallback.length,
+      budgetExpired,
+    };
+  }
 
   // Build final GeneratedRoute objects
   const terrain = routeType === 'point-to-point' ? 'Point to Point'
