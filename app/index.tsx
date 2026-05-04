@@ -607,8 +607,16 @@ export default function SetupScreen() {
         //   "...try a different distance. [n=4 q=2 w=3 v=019df105]"
         const diag = getLastFailureDiagnostics();
         const ver = (Updates.updateId ?? 'embedded').slice(0, 8);
+        // Per-reason breakdown when q > 0 (otherwise the suffix is noise).
+        // Single letters: d=distance, b=barrier, h=highway, o=off-street,
+        // p=pendant-loop, t=backtrack. Lets us see "q=6 (b=2 o=2 d=2)" at
+        // a glance and target the dominant gate.
+        const rr = diag?.rejectReasons;
+        const qBreakdown = rr && diag!.qualityRejectCount > 0
+          ? ` (d=${rr.distance} b=${rr.barrier} h=${rr.highway} o=${rr.offStreet} p=${rr.pendantLoop} t=${rr.backtrack})`
+          : '';
         const detail = diag
-          ? ` [n=${diag.osrmNullCount} q=${diag.qualityRejectCount} w=${diag.wrongDisplayCount}${diag.budgetExpired ? ' BUDGET' : ''} v=${ver}]`
+          ? ` [n=${diag.osrmNullCount} q=${diag.qualityRejectCount}${qBreakdown} w=${diag.wrongDisplayCount}${diag.budgetExpired ? ' BUDGET' : ''} v=${ver}]`
           : ` [v=${ver}]`;
         ctx.setGenerateError(`No routes found for this area. Try a different location or distance.${detail}`);
         router.replace('/');

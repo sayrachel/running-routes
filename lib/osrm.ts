@@ -16,7 +16,15 @@ export function setOSRMBase(url: string | null): void {
 // User-facing route count cap. The internal candidate pool is larger so
 // quality rejection has alternatives — see SAFETY_EXTRAS below.
 const MAX_CANDIDATE_COUNT = 3;
-const MAX_INTERNAL_CANDIDATES = 7;
+// Bumped 7 → 12 (May 2026). The 7-candidate pool routinely left dense-grid
+// runs with no clean survivor — user reported 4mi East Village failing on a
+// generate-again attempt with q=6 (6 quality rejects, 1 wrong-display, 0
+// nulls), meaning OSRM was healthy and the pool just didn't contain a clean
+// shape near target. With the 150ms launch stagger now in place, 12
+// candidates is safe against burst rate limiting (1.8s launch window vs 1s
+// at 7) and well within the 18s resolution budget. CLAUDE.md noted this
+// fix as already-applied but the constant had remained at 7.
+const MAX_INTERNAL_CANDIDATES = 12;
 
 /** Diagnostic snapshot from the most recent `generateOSRMRoutes` call that
  *  returned `[]`. Surfaced in the UI so we can tell a user-reported "no
@@ -29,6 +37,16 @@ export interface FailureDiagnostics {
   qualityRejectCount: number;
   wrongDisplayCount: number;
   budgetExpired: boolean;
+  /** Per-reason breakdown of qualityRejectCount. Lets the banner show
+   *  q=6 (b=2 o=2 d=1 p=1) so we can target the over-rejecting gate. */
+  rejectReasons: {
+    distance: number;
+    barrier: number;
+    highway: number;
+    offStreet: number;
+    pendantLoop: number;
+    backtrack: number;
+  };
 }
 let lastFailureDiagnostics: FailureDiagnostics | null = null;
 export function getLastFailureDiagnostics(): FailureDiagnostics | null {
@@ -2273,7 +2291,10 @@ export async function generateOSRMRoutes(
   // scorer enough variants to find a clean candidate near target. The
   // public OSRM router is the dominant latency source, so capping the
   // candidate pool directly drives perceived speed.
-  const SAFETY_EXTRAS = 6;
+  // SAFETY_EXTRAS = 11 makes count(1) + extras(11) = 12, hitting the bumped
+  // MAX_INTERNAL_CANDIDATES cap. Was 6 (yielding 7 candidates) before the
+  // East Village dense-grid q=6 incident.
+  const SAFETY_EXTRAS = 11;
   const candidateCount = Math.min(MAX_INTERNAL_CANDIDATES, count + SAFETY_EXTRAS);
   const timeSeed = getSeed() % 100000;
   const candidates: { variant: number; waypoints: RoutePoint[]; anchors: GreenSpace[] }[] = [];
@@ -2442,6 +2463,12 @@ export async function generateOSRMRoutes(
   // Track WHY candidates fell out so step 3.5 can decide whether to even try.
   let osrmNullCount = 0;
   let qualityRejectCount = 0;
+  // Per-reason breakdown so the UI banner can tell us which gate dominates
+  // when generation fails — q=6 alone hides whether to loosen off-street,
+  // backtrack, or distance.
+  const rejectReasons = {
+    distance: 0, barrier: 0, highway: 0, offStreet: 0, pendantLoop: 0, backtrack: 0,
+  };
   // Hard rejection only for "completely unusable" cases: distance way off,
   // crosses a clear barrier, or routes along highways. Soft thresholds on
   // retrace/overlap/stubs feed into a quality score; the worst-quality
@@ -2553,12 +2580,14 @@ export async function generateOSRMRoutes(
       const minRatio = routeType === 'point-to-point' ? 0.2 : 0.5;
       if (distRatio > maxRatio || distRatio < minRatio) {
         qualityRejectCount++;
+        rejectReasons.distance++;
         traceEmit('candidate-rejected', { i, reason: 'distance', distKm, distRatio, target: distanceKm });
         continue;
       }
       // HARD REJECT: route crosses a clear barrier (tunnel, bridge, water)
       if (routeType !== 'point-to-point' && hasRoutedBarrierCrossing(points, greenSpaces, center, distanceKm)) {
         qualityRejectCount++;
+        rejectReasons.barrier++;
         traceEmit('candidate-rejected', { i, reason: 'barrier', distKm });
         continue;
       }
@@ -2566,6 +2595,7 @@ export async function generateOSRMRoutes(
       // HARD REJECT: route runs alongside major highways
       if (hwProximity > 0.15) {
         qualityRejectCount++;
+        rejectReasons.highway++;
         traceEmit('candidate-rejected', { i, reason: 'highway', hwProximity });
         continue;
       }
@@ -2581,6 +2611,7 @@ export async function generateOSRMRoutes(
         const offStreetRatio = computeOffStreetRatio(osrmRoute, greenSpaces);
         if (offStreetRatio > 0.10) {
           qualityRejectCount++;
+          rejectReasons.offStreet++;
           traceEmit('candidate-rejected', { i, reason: 'off-street', offStreetRatio });
           continue;
         }
@@ -2606,6 +2637,7 @@ export async function generateOSRMRoutes(
       const pendantLoops = routeType === 'out-and-back' ? 0 : countPendantLoops(points);
       if (pendantLoops > 0) {
         qualityRejectCount++;
+        rejectReasons.pendantLoop++;
         traceEmit('candidate-rejected', { i, reason: 'pendant-loop', pendantLoops, source: 'post-trim-residual' });
         continue;
       }
@@ -2634,6 +2666,7 @@ export async function generateOSRMRoutes(
       // ~0.30 vs step-3.5's 0.50, so the reject was the wrong tool anyway.
       if (routeType !== 'out-and-back' && (retraced + overlap) > 0.50) {
         qualityRejectCount++;
+        rejectReasons.backtrack++;
         traceEmit('candidate-rejected', { i, reason: 'backtrack', retraced, overlap });
         continue;
       }
@@ -3042,6 +3075,7 @@ export async function generateOSRMRoutes(
       qualityRejectCount,
       wrongDisplayCount: wrongDisplayFallback.length,
       budgetExpired,
+      rejectReasons,
     };
   }
 
