@@ -494,16 +494,21 @@ export default function RunScreen() {
                 {(() => {
                   const r = ctx.selectedRoute;
                   const ver = (Updates.updateId ?? 'embedded').slice(0, 8);
-                  // Parse candidate index out of id (format: "route-N-timestamp-rand").
-                  // i=0 means the direct candidate won (means my skip-direct fix
-                  // didn't run); i>0 means a non-direct candidate. a=N is the
-                  // anchor count — 0 means generateGreenSpacePointToPoint found
-                  // no greens in corridor and we fell through to perpendicular
-                  // offset. Both cases manifest as a generic-pool route name.
-                  const idMatch = r?.id?.match(/^route-(\d+)-/);
-                  const i = idMatch ? idMatch[1] : '?';
+                  // id format now: route-{i}-g{N}-r{0|1}-{timestamp}-{rand}
+                  // i=cand index, g=green-pool size, r=refresh flag (1 = refresh,
+                  // 0 = initial), a=anchor count of winning candidate.
+                  // What the values mean together:
+                  //   g=0           → Overpass returned no greens (radius/network)
+                  //   g>0 a=0       → greens exist but corridor filter rejected them
+                  //   r=0 a=0 i=0   → initial generate, direct route won (expected)
+                  //   r=1 a=0 i=0   → refresh, candidate 0 won with no anchors
+                  //                   (means my fix is running but greens unusable)
+                  const m = r?.id?.match(/^route-(\d+)-g(\d+)-r([01])-/);
+                  const i = m ? m[1] : '?';
+                  const g = m ? m[2] : '?';
+                  const rfl = m ? m[3] : '?';
                   const a = r?.anchorPoints?.length ?? 0;
-                  return `${r?.name || 'Route'} · v=${ver} · i=${i} · a=${a}`;
+                  return `${r?.name || 'Route'} · v=${ver} · i=${i} · a=${a} · g=${g} · r=${rfl}`;
                 })()}
               </Text>
               <View style={styles.routeActions}>

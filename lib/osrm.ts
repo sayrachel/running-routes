@@ -3148,6 +3148,15 @@ export async function generateOSRMRoutes(
   const terrain = routeType === 'point-to-point' ? 'Point to Point'
     : routeType === 'loop' ? 'Loop' : 'Out & Back';
 
+  // Encode green-pool size + refresh flag into the route id so the UI
+  // can surface them in the debug suffix. Lets us tell the difference
+  // between "Overpass returned 0 greens" (g=0, the algorithm has nothing
+  // to work with) and "greens exist but corridor filter rejected all of
+  // them" (g>0 but a=0). Removable along with the rest of the debug
+  // suffix once the underlying behavior is confirmed.
+  const debugGreenCount = greenSpaces.length;
+  const debugIsRefresh = excludeAnchors !== undefined ? '1' : '0';
+
   return topCandidates.map(({ candidate }) => {
     const elevationGain = fabricateElevationGain(candidate.distKm, candidate.variant);
     const difficulty: 'easy' | 'moderate' | 'hard' =
@@ -3155,7 +3164,7 @@ export async function generateOSRMRoutes(
     const distanceMiles = Math.round(candidate.distKm * 0.621371);
 
     return {
-      id: `route-${candidate.index}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      id: `route-${candidate.index}-g${debugGreenCount}-r${debugIsRefresh}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       name: pickRouteName(prefs, candidate.index, center.lat, candidate.anchors, routeType),
       points: candidate.points,
       distance: distanceMiles,
