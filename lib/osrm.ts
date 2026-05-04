@@ -2314,11 +2314,25 @@ export async function generateOSRMRoutes(
         );
 
     if (routeType === 'point-to-point' && end) {
-      if (i === 0) {
-        // First candidate: direct route — let OSRM find the shortest path
+      // On refresh (signaled by excludeAnchors being passed at all, even if
+      // empty), skip the direct shortest-path candidate. Why: the direct
+      // route's quality penalty almost always wins for p2p (distRatio = 1,
+      // zero detour cost, no anchors to add up to a meaningful bonus), so
+      // keeping it in the pool meant every refresh re-elected the same
+      // shortest-path result. The user reported "I'm hitting refresh for a
+      // route from NoHo to Central Park, and you're only returning the same
+      // option." Skipping i=0 on refresh forces all candidates to be green-
+      // space variants → different greens per refresh (anchors excluded by
+      // the existing usedParkPoints filter) → genuinely different routes.
+      const isRefresh = excludeAnchors !== undefined;
+      if (i === 0 && !isRefresh) {
+        // First candidate, initial Generate: direct route — let OSRM find
+        // the shortest path. This is what most users want from a fresh p2p
+        // generate; the variety comes on refresh.
         waypoints = [center, end];
       } else {
-        // Other candidates: route via green spaces for scenic variety
+        // Other candidates (always on refresh, candidates 1+ on initial):
+        // route via green spaces for scenic variety
         const result = generateGreenSpacePointToPoint(center, end, prefs, variant, availableGreenSpaces, strategy);
         if (result.anchors.length > 0) {
           waypoints = result.waypoints;
