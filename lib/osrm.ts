@@ -2265,11 +2265,21 @@ export async function generateOSRMRoutes(
       !excludeAnchors.some((ex) => haversineDistance(ex, gs.point) < 0.5)
     );
     const eligibleAfter = filtered.filter((gs) => WAYPOINT_KINDS.has(gs.kind)).length;
-    if (eligibleAfter >= 2) {
+    // Threshold is route-type aware. Loops use sectoring across multiple
+    // anchors to produce shape diversity, so they need >= 2 eligibles after
+    // exclusion. Point-to-point only needs 1 anchor (a single via-waypoint
+    // along the corridor between start and end), so >= 1 is sufficient —
+    // and necessary for refresh to actually do anything in narrow corridors
+    // like NoHo → Central Park where only ~2 parks (Madison Sq, Bryant
+    // Park) sit in the corridor at all. With the previous >= 2 threshold,
+    // excluding 1 left 1 remaining, the filter was skipped, same park
+    // re-selected, refresh produced identical route every time.
+    const minEligibleForExclusion = routeType === 'point-to-point' ? 1 : 2;
+    if (eligibleAfter >= minEligibleForExclusion) {
       greenSpaces = filtered;
       traceEmit('refresh-exclude', { excluded: rawGreenSpaces.length - filtered.length, remainingEligible: eligibleAfter });
     } else {
-      traceEmit('refresh-exclude-skipped', { reason: 'insufficient-remaining', eligibleAfter });
+      traceEmit('refresh-exclude-skipped', { reason: 'insufficient-remaining', eligibleAfter, threshold: minEligibleForExclusion });
     }
   }
   traceEmit('overpass-result', {
