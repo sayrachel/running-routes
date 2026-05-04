@@ -4,7 +4,12 @@ const OVERPASS_URLS = [
   'https://overpass-api.de/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter',
 ];
-const TIMEOUT_MS = 8000;
+// Bumped 8000 → 12000 to give the combined Overpass query (greens +
+// highways at 10km radius around dense areas like Manhattan) enough wall-
+// clock to finish. Server-side timeout is 10s (see the queries below);
+// client should outlast that with a small margin so we get a real error
+// or response instead of an AbortError that races the server's own.
+const TIMEOUT_MS = 12000;
 const BBOX_BUFFER_DEG = 0.002; // ~200m buffer in degrees
 
 /**
@@ -650,7 +655,13 @@ export async function fetchGreenSpacesAndHighways(
   const a = `around:${radiusMeters},${center.lat},${center.lng}`;
   // Combined union — `out center bb tags;` works for both halves; highway
   // parsing only needs `center`, but the extra `bb tags` payload is small.
-  const query = `[out:json][timeout:5];(${greenSpaceSubQuery(a)}${highwaySubQuery(a)});out center bb tags;`;
+  // Server timeout bumped 5 → 10 because the combined query was hitting
+  // the 5s server-side limit for 10km radius queries over dense areas
+  // (Manhattan). When that happens Overpass returns HTTP 200 with an
+  // empty elements array AND a `remark: "Query timed out..."` field —
+  // which our code was silently treating as "no greens here." Detected
+  // explicitly below.
+  const query = `[out:json][timeout:10];(${greenSpaceSubQuery(a)}${highwaySubQuery(a)});out center bb tags;`;
 
   // Wrap the actual fetch in a promise we can register before awaiting.
   // The .finally below removes the entry whether the fetch succeeded or
@@ -660,6 +671,16 @@ export async function fetchGreenSpacesAndHighways(
     try {
       const res = await fetchOverpassRace(query);
       const data = await res.json();
+      // Detect server-side timeout disguised as a 200. Overpass returns
+      // {elements: [], remark: "runtime error: Query timed out..."} when
+      // the query exceeds the [out:json][timeout:N] limit. Without this
+      // check we'd treat the timeout as a successful "no greens here"
+      // result, cache it (in old code), and serve empty forever. Now we
+      // throw and let the catch return empty WITHOUT caching — next call
+      // retries.
+      if (typeof data.remark === 'string' && /timed out|runtime error/i.test(data.remark)) {
+        throw new Error(`Overpass server-side timeout: ${data.remark}`);
+      }
       const elements = data.elements || [];
 
       const greenElements: any[] = [];
