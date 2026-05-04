@@ -25,9 +25,25 @@ import { saveRunRecord, addPendingRun, getCachedRunHistory } from '@/lib/firesto
 import { buildGoogleMapsUrl } from '@/lib/route-export';
 import { BottomTabBar } from '@/components/BottomTabBar';
 import { Colors, Fonts } from '@/lib/theme';
-import { generateOSRMRoutes, OSRMUnavailableError } from '@/lib/osrm';
+import { generateOSRMRoutes, OSRMUnavailableError, getLastFailureDiagnostics } from '@/lib/osrm';
 import { persistOverpassCache } from '@/lib/overpass-persist';
 import { persistOSRMCache } from '@/lib/osrm-persist';
+import * as Updates from 'expo-updates';
+
+/** Build the same `[n=… q=… (…) w=… v=…]` suffix used by the plan-screen
+ *  error banner so refresh failures carry the same diagnostic. Without
+ *  this we can't tell which gate is over-rejecting on a refresh attempt
+ *  vs a fresh-generate attempt. */
+function failureDiagSuffix(): string {
+  const diag = getLastFailureDiagnostics();
+  const ver = (Updates.updateId ?? 'embedded').slice(0, 8);
+  if (!diag) return ` [v=${ver}]`;
+  const rr = diag.rejectReasons;
+  const qBreakdown = diag.qualityRejectCount > 0
+    ? ` (d=${rr.distance} b=${rr.barrier} h=${rr.highway} o=${rr.offStreet} p=${rr.pendantLoop} t=${rr.backtrack})`
+    : '';
+  return ` [n=${diag.osrmNullCount} q=${diag.qualityRejectCount}${qBreakdown} w=${diag.wrongDisplayCount}${diag.budgetExpired ? ' BUDGET' : ''} v=${ver}]`;
+}
 
 function formatTime(seconds: number): string {
   const h = Math.floor(seconds / 3600);
@@ -297,7 +313,7 @@ export default function RunScreen() {
         // Keep the previous route visible — bouncing to plan strands the
         // user with no route AND no clear next step (they hit generate, hit
         // the same failure, get bounced again). Surface a banner instead.
-        showRefreshError("Couldn't find a different route. Try again or change distance.");
+        showRefreshError(`Couldn't find a different route. Try again or change distance.${failureDiagSuffix()}`);
         return;
       }
       ctx.setRoutes(newRoutes);
@@ -307,9 +323,10 @@ export default function RunScreen() {
     } catch (err) {
       console.warn('Route refresh failed:', err);
       ctx.setIsGenerating(false);
+      const ver = (Updates.updateId ?? 'embedded').slice(0, 8);
       const msg = err instanceof OSRMUnavailableError
-        ? 'Routing service is slow. Please try again in a moment.'
-        : "Couldn't refresh route. Check your connection and try again.";
+        ? `Routing service is slow. Please try again in a moment. [v=${ver}]`
+        : `Couldn't refresh route. Check your connection and try again. [v=${ver}]`;
       showRefreshError(msg);
     }
   }, [ctx, hasStarted, showRefreshError]);
