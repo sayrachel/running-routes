@@ -491,7 +491,20 @@ export default function RunScreen() {
           {ctx.routes.length >= 1 && !hasStarted && (
             <View style={styles.routeSelector}>
               <Text style={styles.routeCounter}>
-                {(ctx.selectedRoute?.name || 'Route') + ` · v=${(Updates.updateId ?? 'embedded').slice(0, 8)}`}
+                {(() => {
+                  const r = ctx.selectedRoute;
+                  const ver = (Updates.updateId ?? 'embedded').slice(0, 8);
+                  // Parse candidate index out of id (format: "route-N-timestamp-rand").
+                  // i=0 means the direct candidate won (means my skip-direct fix
+                  // didn't run); i>0 means a non-direct candidate. a=N is the
+                  // anchor count — 0 means generateGreenSpacePointToPoint found
+                  // no greens in corridor and we fell through to perpendicular
+                  // offset. Both cases manifest as a generic-pool route name.
+                  const idMatch = r?.id?.match(/^route-(\d+)-/);
+                  const i = idMatch ? idMatch[1] : '?';
+                  const a = r?.anchorPoints?.length ?? 0;
+                  return `${r?.name || 'Route'} · v=${ver} · i=${i} · a=${a}`;
+                })()}
               </Text>
               <View style={styles.routeActions}>
                 <Pressable
