@@ -2348,15 +2348,29 @@ export async function generateOSRMRoutes(
           waypoints = result.waypoints;
           anchors = result.anchors;
         } else {
-          // No green spaces — create diversity by adding an offset waypoint
-          // perpendicular to the direct path
+          // No green spaces in corridor — create diversity by offsetting the
+          // midpoint waypoint. Now varies by `variant` (refresh seed) too,
+          // not just `i`, so refresh produces different routes per attempt
+          // even when Overpass is unreachable. Was: side and scale depended
+          // only on i, so OSRM cache hits made repeated refreshes return
+          // identical routes (user-reported "third time refresh did nothing,
+          // i=1 r=1 still. fourth time the same thing").
           const midLat = (center.lat + end.lat) / 2;
           const midLng = (center.lng + end.lng) / 2;
           const dLat = end.lat - center.lat;
           const dLng = end.lng - center.lng;
-          // Alternate sides: candidate 1 goes left, candidate 2 goes right
-          const side = i % 2 === 1 ? 1 : -1;
-          const offsetScale = 0.15 + (i * 0.05); // increasing offset per candidate
+          // variant is timeSeed + i + 1; timeSeed is Date.now() % 100000 in
+          // production, so it changes every refresh. Quantize to a small
+          // angle range so we don't fly the offset wildly off.
+          const variantSlot = variant % 8; // 0..7 buckets
+          // base side from i (-1 or +1) flipped by variant slot's parity
+          // → both i and variant influence which side the offset goes
+          const variantSideFlip = variantSlot % 2 === 0 ? 1 : -1;
+          const side = (i % 2 === 1 ? 1 : -1) * variantSideFlip;
+          // base scale from i, plus a small variant-driven jitter so
+          // successive refreshes produce different waypoint distances
+          const variantScaleJitter = (variantSlot - 3.5) * 0.04; // -0.14 to +0.14
+          const offsetScale = Math.max(0.10, 0.15 + (i * 0.05) + variantScaleJitter);
           const offsetLat = midLat + side * dLng * offsetScale;
           const offsetLng = midLng - side * dLat * offsetScale;
           waypoints = [center, { lat: offsetLat, lng: offsetLng }, end];
