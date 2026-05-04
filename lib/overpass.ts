@@ -81,11 +81,25 @@ export function dumpOverpassCaches(): OverpassSnapshot {
 }
 
 export function loadOverpassCaches(snapshot: Partial<OverpassSnapshot>): void {
+  // Skip persisted entries with empty arrays. A previous Overpass call that
+  // failed (network blip, mirror down, etc.) caches an empty result so the
+  // user wasn't blocked at the moment, but persisting that empty entry to
+  // AsyncStorage poisons the cache forever — every app launch reloads the
+  // empty result, every subsequent generation hits the empty cache, the
+  // green-space-first algorithm has nothing to work with. User reported
+  // p2p NoHo→Central Park refreshing to "Peaceful Path" with g=0 across
+  // many attempts — exactly this pattern. Skipping empty entries on load
+  // forces a re-fetch the next time that center is queried, which is the
+  // recovery path.
   if (snapshot.enriched) {
-    for (const [k, v] of snapshot.enriched) enrichedGreenSpaceCache.set(k, v);
+    for (const [k, v] of snapshot.enriched) {
+      if (v.length > 0) enrichedGreenSpaceCache.set(k, v);
+    }
   }
   if (snapshot.highway) {
-    for (const [k, v] of snapshot.highway) highwayCache.set(k, v);
+    for (const [k, v] of snapshot.highway) {
+      if (v.length > 0) highwayCache.set(k, v);
+    }
   }
 }
 
@@ -665,8 +679,14 @@ export async function fetchGreenSpacesAndHighways(
       // Keep the message short — full AggregateError stacks flood test output.
       const msg = err?.message ?? String(err);
       console.warn(`Combined Overpass query failed: ${msg.split('\n')[0]}`);
-      enrichedGreenSpaceCache.set(exactKey, []);
-      highwayCache.set(locationKey('highway', center, fetchRadiusKm), []);
+      // Don't cache the empty failure result. Caching empties on error means
+      // a single transient failure poisons the cache for the rest of the
+      // session AND across launches (via overpass-persist) until the user
+      // moves locations enough to query a different bucket. Returning empty
+      // without caching means the next lookup retries — slower if Overpass
+      // stays down, but the only path back to working state when it
+      // recovers. Successful empty results (rare in NYC, common in remote
+      // areas) DO get cached above, since those are legitimate.
       return { greenSpaces: [], highwayPoints: [] };
     }
   })();
