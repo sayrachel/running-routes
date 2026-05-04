@@ -280,7 +280,11 @@ export default function RunScreen() {
   const showRefreshError = useCallback((msg: string) => {
     setRefreshError(msg);
     if (refreshErrorTimeout.current) clearTimeout(refreshErrorTimeout.current);
-    refreshErrorTimeout.current = setTimeout(() => setRefreshError(null), 5000);
+    // Bumped 5s → 30s. The shorter window wasn't enough time to read the
+    // failure diagnostic suffix ("[n=… q=… (d=… b=… h=… o=… p=… t=…) w=… v=…]"),
+    // and refresh failures still need to auto-dismiss eventually so a stale
+    // banner doesn't sit there after the user has moved on.
+    refreshErrorTimeout.current = setTimeout(() => setRefreshError(null), 30000);
   }, []);
 
   const handleRefresh = useCallback(async () => {
@@ -490,7 +494,7 @@ export default function RunScreen() {
           {refreshError && !hasStarted && (
             <View style={styles.refreshErrorBanner}>
               <Ionicons name="alert-circle" size={14} color={Colors.destructive} />
-              <Text style={styles.refreshErrorText}>{refreshError}</Text>
+              <Text style={styles.refreshErrorText} selectable>{refreshError}</Text>
             </View>
           )}
 

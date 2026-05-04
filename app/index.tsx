@@ -1012,7 +1012,7 @@ export default function SetupScreen() {
           {ctx.generateError && (
             <View style={styles.errorBanner}>
               <Ionicons name="alert-circle" size={16} color={Colors.destructive} />
-              <Text style={styles.errorText}>{ctx.generateError}</Text>
+              <Text style={styles.errorText} selectable>{ctx.generateError}</Text>
             </View>
           )}
         </View>
