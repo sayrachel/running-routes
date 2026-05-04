@@ -56,6 +56,12 @@ const quietCache = new Map<string, number>();
 const greenSpaceCache = new Map<string, RoutePoint[]>();
 const enrichedGreenSpaceCache = new Map<string, GreenSpace[]>();
 const highwayCache = new Map<string, RoutePoint[]>();
+// In-flight coalescing for combined green/highway fetches. Keyed by the
+// same exactKey the caches use. Lets a prefetch and an immediate Generate
+// share a single Overpass round trip instead of firing two parallel
+// queries that compete with each other and (under load) get throttled.
+// Cleared on completion regardless of success/failure.
+const inflightCombinedFetches = new Map<string, Promise<{ greenSpaces: GreenSpace[]; highwayPoints: RoutePoint[] }>>();
 
 /**
  * Snapshot the green-space and highway caches for record-and-replay testing.
@@ -612,37 +618,64 @@ export async function fetchGreenSpacesAndHighways(
     return filterByRadius(cachedGreen, cachedHw, center, radiusKm);
   }
 
+  // In-flight coalescing: if another caller is already fetching this exact
+  // bucket, await their promise instead of firing a duplicate request. The
+  // production race we're closing: useEffect kicks off prefetch when GPS
+  // locks; user taps Generate ~2s later before prefetch completes; without
+  // this guard, both calls hit Overpass in parallel, compete with each
+  // other under any kind of mirror load, and the slow one sometimes blows
+  // the resolution budget — surfacing as the "first Generate fails,
+  // subsequent succeed" pattern.
+  const inflight = inflightCombinedFetches.get(exactKey);
+  if (inflight !== undefined) {
+    const result = await inflight;
+    return filterByRadius(result.greenSpaces, result.highwayPoints, center, radiusKm);
+  }
+
   const radiusMeters = Math.round(fetchRadiusKm * 1000);
   const a = `around:${radiusMeters},${center.lat},${center.lng}`;
   // Combined union — `out center bb tags;` works for both halves; highway
   // parsing only needs `center`, but the extra `bb tags` payload is small.
   const query = `[out:json][timeout:5];(${greenSpaceSubQuery(a)}${highwaySubQuery(a)});out center bb tags;`;
 
-  try {
-    const res = await fetchOverpassRace(query);
-    const data = await res.json();
-    const elements = data.elements || [];
+  // Wrap the actual fetch in a promise we can register before awaiting.
+  // The .finally below removes the entry whether the fetch succeeded or
+  // threw — leaving a stale in-flight entry would deadlock all subsequent
+  // callers waiting on a settled promise that nobody is going to resolve.
+  const fetchPromise = (async (): Promise<{ greenSpaces: GreenSpace[]; highwayPoints: RoutePoint[] }> => {
+    try {
+      const res = await fetchOverpassRace(query);
+      const data = await res.json();
+      const elements = data.elements || [];
 
-    const greenElements: any[] = [];
-    const highwayElements: any[] = [];
-    for (const el of elements) {
-      if (MAJOR_HIGHWAY_TYPES.has(el.tags?.highway)) highwayElements.push(el);
-      else greenElements.push(el);
+      const greenElements: any[] = [];
+      const highwayElements: any[] = [];
+      for (const el of elements) {
+        if (MAJOR_HIGHWAY_TYPES.has(el.tags?.highway)) highwayElements.push(el);
+        else greenElements.push(el);
+      }
+
+      const greenSpaces = parseGreenSpaceElements(greenElements);
+      const highwayPoints = parseHighwayElements(highwayElements);
+
+      enrichedGreenSpaceCache.set(exactKey, greenSpaces);
+      highwayCache.set(locationKey('highway', center, fetchRadiusKm), highwayPoints);
+      return { greenSpaces, highwayPoints };
+    } catch (err: any) {
+      // Keep the message short — full AggregateError stacks flood test output.
+      const msg = err?.message ?? String(err);
+      console.warn(`Combined Overpass query failed: ${msg.split('\n')[0]}`);
+      enrichedGreenSpaceCache.set(exactKey, []);
+      highwayCache.set(locationKey('highway', center, fetchRadiusKm), []);
+      return { greenSpaces: [], highwayPoints: [] };
     }
-
-    const greenSpaces = parseGreenSpaceElements(greenElements);
-    const highwayPoints = parseHighwayElements(highwayElements);
-
-    enrichedGreenSpaceCache.set(exactKey, greenSpaces);
-    highwayCache.set(locationKey('highway', center, fetchRadiusKm), highwayPoints);
-    return filterByRadius(greenSpaces, highwayPoints, center, radiusKm);
-  } catch (err: any) {
-    // Keep the message short — full AggregateError stacks flood test output.
-    const msg = err?.message ?? String(err);
-    console.warn(`Combined Overpass query failed: ${msg.split('\n')[0]}`);
-    enrichedGreenSpaceCache.set(exactKey, []);
-    highwayCache.set(locationKey('highway', center, fetchRadiusKm), []);
-    return { greenSpaces: [], highwayPoints: [] };
+  })();
+  inflightCombinedFetches.set(exactKey, fetchPromise);
+  try {
+    const result = await fetchPromise;
+    return filterByRadius(result.greenSpaces, result.highwayPoints, center, radiusKm);
+  } finally {
+    inflightCombinedFetches.delete(exactKey);
   }
 }
 
