@@ -119,6 +119,7 @@ const FIXTURES: Fixture[] = [
   { name: 'nyc-east-village-2mi-loop',  center: { lat: 40.7280, lng: -73.9920 }, distanceMi: 2, routeType: 'loop',       prefs: { lowTraffic: true } },
   { name: 'nyc-east-village-3mi-loop',  center: { lat: 40.7280, lng: -73.9920 }, distanceMi: 3, routeType: 'loop',       prefs: { lowTraffic: true } },
   { name: 'nyc-east-village-4mi-loop',  center: { lat: 40.7280, lng: -73.9920 }, distanceMi: 4, routeType: 'loop',       prefs: { lowTraffic: false } },
+  { name: 'nyc-east-village-4mi-loop-quiet', center: { lat: 40.7280, lng: -73.9920 }, distanceMi: 4, routeType: 'loop',  prefs: { lowTraffic: true } },
   { name: 'nyc-east-village-6mi-loop',  center: { lat: 40.7280, lng: -73.9920 }, distanceMi: 6, routeType: 'loop',       prefs: { lowTraffic: false } },
 
   // Additional NYC neighborhoods — broader real-OSRM coverage. Each area

@@ -2361,12 +2361,26 @@ export async function generateOSRMRoutes(
   const adjustUnits = useAdjustment ? prefs.units ?? 'imperial' : null;
   type Tagged = { idx: number; result: { route: OSRMRoute | null; waypoints: RoutePoint[] } };
   const pending = new Map<number, Promise<Tagged>>();
+  // Stagger candidate OSRM launches against public OSRM (skipped under
+  // mock — the harness needs to stay fast). Firing all 7 candidates at
+  // once is a documented null-spike trigger: the public endpoint throttles
+  // bursts and returns 429s, which become nulls and lose candidates. With
+  // wrong-display fallback now removed, every null counts directly toward
+  // "No routes found." 150ms × 7 candidates ≈ 1s added launch window —
+  // well under the 18s resolution budget, big drop in burst pressure.
+  // CLAUDE.md note: "Total simultaneous request count matters more than
+  // per-candidate math."
+  const launchSpacingMs = osrmMockEnabled ? 0 : 150;
   for (let idx = 0; idx < candidates.length; idx++) {
     const c = candidates[idx];
-    const p = (useAdjustment
-      ? fetchOSRMRouteAdjusted(c.waypoints, center, distanceKm, 2, adjustUnits)
-      : fetchOSRMRoute(c.waypoints).then((route) => ({ route, waypoints: c.waypoints }))
-    ).then((result) => ({ idx, result }));
+    const launchDelay = idx * launchSpacingMs;
+    const p = (async (): Promise<Tagged> => {
+      if (launchDelay > 0) await new Promise((r) => setTimeout(r, launchDelay));
+      const result = useAdjustment
+        ? await fetchOSRMRouteAdjusted(c.waypoints, center, distanceKm, 2, adjustUnits)
+        : { route: await fetchOSRMRoute(c.waypoints), waypoints: c.waypoints };
+      return { idx, result };
+    })();
     pending.set(idx, p);
   }
 
