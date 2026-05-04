@@ -491,7 +491,7 @@ export default function RunScreen() {
           {ctx.routes.length >= 1 && !hasStarted && (
             <View style={styles.routeSelector}>
               <Text style={styles.routeCounter}>
-                {ctx.selectedRoute?.name || 'Route'}
+                {(ctx.selectedRoute?.name || 'Route') + ` · v=${(Updates.updateId ?? 'embedded').slice(0, 8)}`}
               </Text>
               <View style={styles.routeActions}>
                 <Pressable
