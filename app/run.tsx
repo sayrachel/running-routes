@@ -415,13 +415,20 @@ export default function RunScreen() {
         <View style={[styles.header, { paddingTop: insets.top + 8 }]}>
           {/* Left */}
           <View style={styles.headerSide}>
-            <Pressable
-              onPress={showStats ? () => setShowStats(false) : handleBack}
-              disabled={!showStats && hasStarted}
-              style={[styles.headerBtn, !showStats && hasStarted && { opacity: 0.4 }]}
-            >
-              <Ionicons name="chevron-back" size={16} color={Colors.mutedForeground} />
-            </Pressable>
+            {/* Back button only renders when it has a real action: closing
+              * the stats overlay, OR navigating back to plan when no run is
+              * in progress. Once a run has started (running or paused) and
+              * stats aren't open, the button has no destination — tapping
+              * mid-run shouldn't lose the user's progress. Was previously
+              * shown-but-disabled (opacity 0.4), which read as broken. */}
+            {(showStats || !hasStarted) && (
+              <Pressable
+                onPress={showStats ? () => setShowStats(false) : handleBack}
+                style={styles.headerBtn}
+              >
+                <Ionicons name="chevron-back" size={16} color={Colors.mutedForeground} />
+              </Pressable>
+            )}
           </View>
 
           {/* Center: recording indicator */}
