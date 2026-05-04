@@ -653,15 +653,20 @@ export async function fetchGreenSpacesAndHighways(
 
   const radiusMeters = Math.round(fetchRadiusKm * 1000);
   const a = `around:${radiusMeters},${center.lat},${center.lng}`;
-  // Combined union — `out center bb tags;` works for both halves; highway
-  // parsing only needs `center`, but the extra `bb tags` payload is small.
-  // Server timeout bumped 5 → 10 because the combined query was hitting
-  // the 5s server-side limit for 10km radius queries over dense areas
-  // (Manhattan). When that happens Overpass returns HTTP 200 with an
-  // empty elements array AND a `remark: "Query timed out..."` field —
-  // which our code was silently treating as "no greens here." Detected
-  // explicitly below.
-  const query = `[out:json][timeout:10];(${greenSpaceSubQuery(a)}${highwaySubQuery(a)});out center bb tags;`;
+  // Split into TWO parallel queries instead of one combined union.
+  // Background: the combined query (greens + highways) was timing out
+  // server-side at 5s, then at 10s, even at the bumped client timeout —
+  // because the highway sub-query alone takes 10-15s in dense Manhattan
+  // (it scans every motorway/trunk/primary in 10km). The greens
+  // sub-query is fast on its own (~3-5s), so combining them was
+  // dragging the whole thing into the timeout. Splitting lets greens
+  // succeed quickly (which is the CRITICAL path — without greens, the
+  // algorithm has no waypoint anchors and falls through to perpendicular
+  // offset, hence the user-reported "Peaceful Path · g=0" loop). Highway
+  // data is used to penalize routes near major roads; missing highway
+  // data degrades quality slightly but doesn't block generation.
+  const greenQuery = `[out:json][timeout:10];(${greenSpaceSubQuery(a)});out center bb tags;`;
+  const highwayQuery = `[out:json][timeout:10];(${highwaySubQuery(a)});out center;`;
 
   // Wrap the actual fetch in a promise we can register before awaiting.
   // The .finally below removes the entry whether the fetch succeeded or
@@ -669,29 +674,37 @@ export async function fetchGreenSpacesAndHighways(
   // callers waiting on a settled promise that nobody is going to resolve.
   const fetchPromise = (async (): Promise<{ greenSpaces: GreenSpace[]; highwayPoints: RoutePoint[] }> => {
     try {
-      const res = await fetchOverpassRace(query);
-      const data = await res.json();
-      // Detect server-side timeout disguised as a 200. Overpass returns
-      // {elements: [], remark: "runtime error: Query timed out..."} when
-      // the query exceeds the [out:json][timeout:N] limit. Without this
-      // check we'd treat the timeout as a successful "no greens here"
-      // result, cache it (in old code), and serve empty forever. Now we
-      // throw and let the catch return empty WITHOUT caching — next call
-      // retries.
-      if (typeof data.remark === 'string' && /timed out|runtime error/i.test(data.remark)) {
-        throw new Error(`Overpass server-side timeout: ${data.remark}`);
-      }
-      const elements = data.elements || [];
+      // Fire both queries in parallel. Each is wrapped to detect the
+      // server-timeout-as-200 disguise (Overpass returns
+      // {elements: [], remark: "Query timed out..."} when the query
+      // exceeds [out:json][timeout:N]).
+      const greenFetch = (async (): Promise<GreenSpace[]> => {
+        const res = await fetchOverpassRace(greenQuery);
+        const data = await res.json();
+        if (typeof data.remark === 'string' && /timed out|runtime error/i.test(data.remark)) {
+          throw new Error(`Overpass green-query timeout: ${data.remark}`);
+        }
+        return parseGreenSpaceElements(data.elements || []);
+      })();
+      // Highways are best-effort. Catch failures and return [] so the
+      // outer flow still gets a valid result with greens. The algorithm
+      // skips highway-proximity penalties when highwayPoints is empty.
+      const highwayFetch = (async (): Promise<RoutePoint[]> => {
+        try {
+          const res = await fetchOverpassRace(highwayQuery);
+          const data = await res.json();
+          if (typeof data.remark === 'string' && /timed out|runtime error/i.test(data.remark)) {
+            console.warn(`Overpass highway-query timeout (non-fatal): ${data.remark}`);
+            return [];
+          }
+          return parseHighwayElements(data.elements || []);
+        } catch (err: any) {
+          console.warn(`Overpass highway query failed (non-fatal): ${err?.message ?? err}`);
+          return [];
+        }
+      })();
 
-      const greenElements: any[] = [];
-      const highwayElements: any[] = [];
-      for (const el of elements) {
-        if (MAJOR_HIGHWAY_TYPES.has(el.tags?.highway)) highwayElements.push(el);
-        else greenElements.push(el);
-      }
-
-      const greenSpaces = parseGreenSpaceElements(greenElements);
-      const highwayPoints = parseHighwayElements(highwayElements);
+      const [greenSpaces, highwayPoints] = await Promise.all([greenFetch, highwayFetch]);
 
       enrichedGreenSpaceCache.set(exactKey, greenSpaces);
       highwayCache.set(locationKey('highway', center, fetchRadiusKm), highwayPoints);
