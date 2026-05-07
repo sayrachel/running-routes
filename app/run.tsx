@@ -295,6 +295,13 @@ export default function RunScreen() {
       : ctx.distance * 1.60934;
 
     const previousAnchors = ctx.selectedRoute?.anchorPoints ?? null;
+    // Polyline of the route the user is currently looking at. Passed to
+    // generateOSRMRoutes so the chooser can demote any candidate whose
+    // geometry replays it — without this, p2p refresh in green-poor
+    // corridors deterministically picks the same OSRM alternative every
+    // time (alt 1 always wins on quality penalty against alt 2), and the
+    // user sees the same route forever.
+    const previousPoints = ctx.selectedRoute?.points ?? null;
 
     ctx.setIsGenerating(true);
     setRouteIndex(0);
@@ -311,6 +318,7 @@ export default function RunScreen() {
         ctx.prefs,
         ctx.endLocation,
         previousAnchors,
+        previousPoints,
       );
       ctx.setIsGenerating(false);
       if (newRoutes.length === 0) {

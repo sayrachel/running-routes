@@ -15,6 +15,7 @@ import {
   roundedDisplayMatches,
   nearDisplayMatches,
   computeOffStreetRatio,
+  polylineDivergenceKm,
   generateOSRMRoutes,
   setOSRMMock,
   setMockOSRMLatency,
@@ -350,6 +351,41 @@ describe('computeOffStreetRatio', () => {
       mkStep('Park Path North', 300, 40.789, -73.968),
     ]);
     expect(computeOffStreetRatio(route, greenSpaces)).toBe(0);
+  });
+});
+
+describe('polylineDivergenceKm', () => {
+  it('returns ~0 for identical polylines', () => {
+    const a: RoutePoint[] = [
+      { lat: 40.72, lng: -73.99 },
+      { lat: 40.74, lng: -73.99 },
+      { lat: 40.76, lng: -73.99 },
+    ];
+    expect(polylineDivergenceKm(a, a)).toBeLessThan(0.05);
+  });
+
+  it('returns 1 (treat as different) for empty references', () => {
+    const a: RoutePoint[] = [{ lat: 40.72, lng: -73.99 }, { lat: 40.74, lng: -73.99 }];
+    expect(polylineDivergenceKm(a, [])).toBe(1);
+    expect(polylineDivergenceKm([], a)).toBe(1);
+  });
+
+  it('separates polylines that take parallel streets ~600m apart', () => {
+    // Two N-S corridors: one at lng -73.99 (e.g. Park Ave area), one at -73.984
+    // (~6 avenues east). Same start/end latitude band.
+    const a: RoutePoint[] = [
+      { lat: 40.73, lng: -73.99 },
+      { lat: 40.74, lng: -73.99 },
+      { lat: 40.75, lng: -73.99 },
+      { lat: 40.76, lng: -73.99 },
+    ];
+    const b: RoutePoint[] = [
+      { lat: 40.73, lng: -73.984 },
+      { lat: 40.74, lng: -73.984 },
+      { lat: 40.75, lng: -73.984 },
+      { lat: 40.76, lng: -73.984 },
+    ];
+    expect(polylineDivergenceKm(a, b)).toBeGreaterThan(0.3);
   });
 });
 

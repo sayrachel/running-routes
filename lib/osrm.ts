@@ -316,6 +316,40 @@ export function countStubs(points: RoutePoint[], maxStubLenKm: number = 0.30): n
 }
 
 /**
+ * "Are these two polylines essentially the same route?" — used by the
+ * refresh path to demote candidates whose geometry replays the previously-
+ * shown route.
+ *
+ * Samples 8 evenly-spaced positions along `a`; for each, takes the minimum
+ * haversine distance to any vertex on `b`. Returns the average. Two routes
+ * that follow the same streets sample to <50m on average; routes that take
+ * different avenues separate by 200m+.
+ *
+ * Returns 1 (treat as different) if either polyline is empty so callers
+ * never accidentally demote candidates against a missing reference.
+ */
+export function polylineDivergenceKm(a: RoutePoint[], b: RoutePoint[]): number {
+  if (a.length === 0 || b.length === 0) return 1;
+  const SAMPLES = 8;
+  let total = 0;
+  for (let i = 0; i < SAMPLES; i++) {
+    // Skip endpoints — for p2p they're identical (same start, same end) by
+    // construction and would always pull the average toward 0.
+    const t = (i + 1) / (SAMPLES + 1);
+    const aIdx = Math.min(a.length - 1, Math.max(0, Math.floor(t * (a.length - 1))));
+    const aPt = a[aIdx];
+    let nearest = Infinity;
+    for (const bPt of b) {
+      const d = haversineDistance(aPt, bPt);
+      if (d < nearest) nearest = d;
+      if (nearest === 0) break;
+    }
+    total += nearest;
+  }
+  return total / SAMPLES;
+}
+
+/**
  * Fraction of total route distance covered by segments that overlap a later
  * segment in space — i.e. they sit within `proximityKm` of another segment
  * and run roughly parallel or antiparallel (same physical street).
@@ -2037,6 +2071,71 @@ async function fetchOSRMRoute(waypoints: RoutePoint[]): Promise<OSRMRoute | null
 }
 
 /**
+ * In-memory cache for `?alternatives=true` responses. Keyed by URL (which
+ * encodes both the waypoints and the alternatives flag), so it never
+ * collides with `osrmRouteCache`. Stores the FULL alternatives array per URL
+ * so subsequent callers asking for alt 1, 2, etc. don't re-hit OSRM.
+ */
+const osrmAlternativesCache = new Map<string, OSRMRoute[]>();
+
+/**
+ * Fetch a direct route between two waypoints WITH up to N alternatives.
+ *
+ * Public OSRM (router.project-osrm.org runs OSRM 5.x) supports
+ * `alternatives=true` which returns the primary shortest path plus up to 3
+ * structurally different routes (e.g. one via Park Ave, one via 6th Ave).
+ * We use this for p2p when the corridor has no usable green-space anchors —
+ * without it, the perpendicular-offset diversification snaps back to the
+ * same dominant avenue every refresh, producing the user-reported "i=0
+ * a=0 g=0 r=1, same route every refresh" pattern.
+ *
+ * Returns the full `routes[]` array. routes[0] is the primary (same as
+ * fetchOSRMRoute would return), routes[1+] are the alternatives. Returns
+ * empty array on network failure.
+ */
+async function fetchOSRMRouteAlternatives(
+  waypoints: RoutePoint[],
+  alternativesCount: number,
+): Promise<OSRMRoute[]> {
+  if (osrmMockEnabled) {
+    // Mock OSRM doesn't model alternatives; return just the primary so
+    // harness behavior is unchanged. The diversification this function
+    // provides is only meaningful against a real road network.
+    if (waypoints.length < 2) return [];
+    const route = mockOSRMRoute(waypoints);
+    return route ? [route] : [];
+  }
+
+  const coords = coordsString(waypoints);
+  const url = `${osrmBase}/${coords}?overview=full&geometries=geojson&steps=true&alternatives=${alternativesCount}`;
+
+  const cached = osrmAlternativesCache.get(url);
+  if (cached !== undefined) {
+    osrmAlternativesCache.delete(url);
+    osrmAlternativesCache.set(url, cached);
+    return cached;
+  }
+
+  try {
+    const res = await fetchWithRetry(url);
+    if (!res.ok) return [];
+    const data: OSRMResponse = await res.json();
+    if (data.code !== 'Ok' || !data.routes || data.routes.length === 0) {
+      return [];
+    }
+    if (osrmAlternativesCache.size >= osrmCacheMax) {
+      const oldest = osrmAlternativesCache.keys().next().value;
+      if (oldest !== undefined) osrmAlternativesCache.delete(oldest);
+    }
+    osrmAlternativesCache.set(url, data.routes);
+    return data.routes;
+  } catch (err) {
+    console.warn('OSRM alternatives fetch failed:', err);
+    return [];
+  }
+}
+
+/**
  * Triangle perimeter factor for the (center, wp1, wp2, center) waypoint
  * pattern with wp1 at bearing B and wp2 at bearing B+210°, both at the
  * same distance d from center:
@@ -2236,6 +2335,13 @@ export async function generateOSRMRoutes(
   prefs: RoutePreferences = { lowTraffic: false },
   end?: RoutePoint | null,
   excludeAnchors?: RoutePoint[] | null,
+  // Polyline of the previously-shown route, passed on refresh. Candidates
+  // whose geometry essentially replays this polyline are demoted in the
+  // final pick so refresh produces visible variety even when the underlying
+  // candidate pool is small (e.g. p2p with no green-space anchors, where
+  // OSRM's alternatives are the only diversification source). Null on
+  // initial generate.
+  excludePoints?: RoutePoint[] | null,
 ): Promise<GeneratedRoute[]> {
   // Reset failure diagnostics on every call. Populated only on the path
   // that returns [] so the UI can render "n/q/w" counts in the error
@@ -2307,8 +2413,30 @@ export async function generateOSRMRoutes(
   const SAFETY_EXTRAS = 11;
   const candidateCount = Math.min(MAX_INTERNAL_CANDIDATES, count + SAFETY_EXTRAS);
   const timeSeed = getSeed() % 100000;
-  const candidates: { variant: number; waypoints: RoutePoint[]; anchors: GreenSpace[] }[] = [];
+  type CandidateSpec = {
+    variant: number;
+    waypoints: RoutePoint[];
+    anchors: GreenSpace[];
+    /** When set, the OSRM dispatch awaits this instead of issuing its own
+     *  fetch. Used to share one `alternatives=true` call across multiple
+     *  alternative-route candidates without N parallel network requests. */
+    prefetchedResult?: Promise<{ route: OSRMRoute | null; waypoints: RoutePoint[] }>;
+  };
+  const candidates: CandidateSpec[] = [];
   const usedParkPoints: RoutePoint[] = []; // Parks already used by earlier candidates
+
+  // For p2p, fire OSRM's `alternatives=true` request in parallel with the
+  // candidate-generation loop so we have structurally-different routes ready
+  // by the time we'd otherwise fall back to perpendicular-offset waypoints.
+  // Why this matters: perpendicular offsets ≤500m snap back to the same
+  // dominant avenue under OSRM's shortest-path logic, producing the same
+  // rendered route every refresh. OSRM's native alternatives consider the
+  // road network and return genuinely different paths (e.g. one via Park
+  // Ave, one via 6th Ave). One extra OSRM call, much better refresh variety.
+  const p2pAlternativesPromise: Promise<OSRMRoute[]> =
+    routeType === 'point-to-point' && end
+      ? fetchOSRMRouteAlternatives([center, end], 3)
+      : Promise.resolve([]);
 
   for (let i = 0; i < candidateCount; i++) {
     const variant = timeSeed + i + 1;
@@ -2348,32 +2476,13 @@ export async function generateOSRMRoutes(
           waypoints = result.waypoints;
           anchors = result.anchors;
         } else {
-          // No green spaces in corridor — create diversity by offsetting the
-          // midpoint waypoint. Now varies by `variant` (refresh seed) too,
-          // not just `i`, so refresh produces different routes per attempt
-          // even when Overpass is unreachable. Was: side and scale depended
-          // only on i, so OSRM cache hits made repeated refreshes return
-          // identical routes (user-reported "third time refresh did nothing,
-          // i=1 r=1 still. fourth time the same thing").
-          const midLat = (center.lat + end.lat) / 2;
-          const midLng = (center.lng + end.lng) / 2;
-          const dLat = end.lat - center.lat;
-          const dLng = end.lng - center.lng;
-          // variant is timeSeed + i + 1; timeSeed is Date.now() % 100000 in
-          // production, so it changes every refresh. Quantize to a small
-          // angle range so we don't fly the offset wildly off.
-          const variantSlot = variant % 8; // 0..7 buckets
-          // base side from i (-1 or +1) flipped by variant slot's parity
-          // → both i and variant influence which side the offset goes
-          const variantSideFlip = variantSlot % 2 === 0 ? 1 : -1;
-          const side = (i % 2 === 1 ? 1 : -1) * variantSideFlip;
-          // base scale from i, plus a small variant-driven jitter so
-          // successive refreshes produce different waypoint distances
-          const variantScaleJitter = (variantSlot - 3.5) * 0.04; // -0.14 to +0.14
-          const offsetScale = Math.max(0.10, 0.15 + (i * 0.05) + variantScaleJitter);
-          const offsetLat = midLat + side * dLng * offsetScale;
-          const offsetLng = midLng - side * dLat * offsetScale;
-          waypoints = [center, { lat: offsetLat, lng: offsetLng }, end];
+          // No green-space anchor for this candidate. Skip — OSRM's native
+          // `alternatives=true` (fired in parallel above) will provide the
+          // diversity. Previously this generated a perpendicular-offset
+          // midpoint waypoint, but offsets ≤500m reliably snapped back to
+          // the same dominant avenue, so OSRM returned the same route every
+          // refresh. Bailing here lets the alternatives pool dominate.
+          continue;
         }
       }
     } else if (routeType === 'out-and-back') {
@@ -2418,6 +2527,40 @@ export async function generateOSRMRoutes(
     candidates.push({ variant, waypoints, anchors });
   }
 
+  // For p2p, append two alternative-route candidates that share a single
+  // pre-fetched `alternatives=true` OSRM call. We always skip alt 0:
+  //   - On initial generate, alt 0 is identical to the i=0 direct candidate
+  //     above (same waypoints, same shortest-path geometry) so adding it
+  //     would just duplicate work.
+  //   - On refresh, alt 0 is the route the user just refreshed away from —
+  //     showing it again defeats the point of refresh.
+  // The two slots below pull alts 1 and 2, which are structurally different
+  // routes from the OSRM road-network engine (e.g. via a different avenue).
+  if (routeType === 'point-to-point' && end) {
+    for (let altIdx = 1; altIdx <= 2; altIdx++) {
+      const altWaypoints: RoutePoint[] = [center, end];
+      const prefetchedResult = (async () => {
+        const alts = await p2pAlternativesPromise;
+        return { route: alts[altIdx] ?? null, waypoints: altWaypoints };
+      })();
+      candidates.push({
+        variant: timeSeed + 1000 + altIdx,
+        waypoints: altWaypoints,
+        anchors: [],
+        prefetchedResult,
+      });
+      traceEmit('candidate-built', {
+        i: candidates.length - 1,
+        strategy: 'osrm-alternative' as CandidateStrategy,
+        variant: timeSeed + 1000 + altIdx,
+        anchorCount: 0,
+        anchorNames: [],
+        waypointCount: altWaypoints.length,
+        waypoints: altWaypoints,
+      });
+    }
+  }
+
   // Step 3: Fetch OSRM routes for all candidates, with iterative distance
   // adjustment. If a candidate's OSRM distance is too far from the target,
   // shrink/expand waypoints toward center and re-query (up to 2 retries).
@@ -2453,7 +2596,11 @@ export async function generateOSRMRoutes(
   const launchSpacingMs = osrmMockEnabled ? 0 : 150;
   for (let idx = 0; idx < candidates.length; idx++) {
     const c = candidates[idx];
-    const launchDelay = idx * launchSpacingMs;
+    // Candidates with a prefetched result (p2p OSRM-alternatives slots)
+    // skip the launch stagger entirely — they don't issue their own OSRM
+    // call, just await the shared `alternatives=true` promise that was
+    // fired before this loop started.
+    const launchDelay = c.prefetchedResult ? 0 : idx * launchSpacingMs;
     const p = (async (): Promise<Tagged> => {
       if (launchDelay > 0) await new Promise((r) => setTimeout(r, launchDelay));
       // 4 retries (5 total attempts). Was 2 (3 attempts), but the per-step
@@ -2464,9 +2611,11 @@ export async function generateOSRMRoutes(
       // those distance-band rejects); 4 retries lets ratio 0.4 reach 0.97.
       // Worst case latency bounded by the 18s resolution budget +
       // divergence detection (returns best-so-far if attempt 2x worse).
-      const result = useAdjustment
-        ? await fetchOSRMRouteAdjusted(c.waypoints, center, distanceKm, 4, adjustUnits)
-        : { route: await fetchOSRMRoute(c.waypoints), waypoints: c.waypoints };
+      const result = c.prefetchedResult
+        ? await c.prefetchedResult
+        : useAdjustment
+          ? await fetchOSRMRouteAdjusted(c.waypoints, center, distanceKm, 4, adjustUnits)
+          : { route: await fetchOSRMRoute(c.waypoints), waypoints: c.waypoints };
       return { idx, result };
     })();
     pending.set(idx, p);
@@ -3137,7 +3286,39 @@ export async function generateOSRMRoutes(
   // OSRM output had high retrace despite using "best" parks. Sorting by
   // quality means a candidate-2 with 5% retrace beats candidate-0 with 30%
   // retrace, regardless of which parks each used.
-  const sortedByQuality = [...scored].sort(
+  //
+  // Refresh-divergence boost: when the caller passed `excludePoints` (the
+  // previous route's polyline), candidates whose geometry is essentially
+  // a replay of that polyline get a penalty bump so the chooser prefers a
+  // visibly different route. Only applies when there's at least one
+  // candidate that IS sufficiently different — otherwise we fall back to
+  // showing the best-quality result and let "no different route exists"
+  // surface naturally. Threshold: 100m average sample distance — empirically
+  // the gap between "OSRM cache replay (same street)" and "different
+  // alternative (parallel avenue ≥ 1 block away)".
+  const REFRESH_REPLAY_THRESHOLD_KM = 0.10;
+  const REFRESH_REPLAY_PENALTY = 1.0;
+  let scoredForSort = scored;
+  if (excludePoints && excludePoints.length > 0) {
+    const annotated = scored.map((s) => {
+      const divergence = polylineDivergenceKm(s.candidate.points, excludePoints);
+      const isReplay = divergence < REFRESH_REPLAY_THRESHOLD_KM;
+      return { entry: s, divergence, isReplay };
+    });
+    const haveDifferentOption = annotated.some((a) => !a.isReplay);
+    if (haveDifferentOption) {
+      scoredForSort = annotated.map((a) =>
+        a.isReplay
+          ? { ...a.entry, candidate: { ...a.entry.candidate, qualityPenalty: a.entry.candidate.qualityPenalty + REFRESH_REPLAY_PENALTY } }
+          : a.entry
+      );
+      traceEmit('refresh-replay-demote', {
+        replayCount: annotated.filter((a) => a.isReplay).length,
+        differentCount: annotated.filter((a) => !a.isReplay).length,
+      });
+    }
+  }
+  const sortedByQuality = [...scoredForSort].sort(
     (a, b) => a.candidate.qualityPenalty - b.candidate.qualityPenalty
   );
   const topCandidates = sortedByQuality.slice(0, count);
