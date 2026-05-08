@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   View,
   Text,
@@ -11,6 +11,7 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
+import * as AppleAuthentication from 'expo-apple-authentication';
 import { useAppContext } from '@/lib/AppContext';
 import { Colors, Fonts } from '@/lib/theme';
 
@@ -20,6 +21,13 @@ export default function LandingScreen() {
   const ctx = useAppContext();
   const [loading, setLoading] = useState<'apple' | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [appleAvailable, setAppleAvailable] = useState(false);
+
+  useEffect(() => {
+    if (Platform.OS === 'ios') {
+      AppleAuthentication.isAvailableAsync().then(setAppleAvailable);
+    }
+  }, []);
 
   const handleSuccess = () => {
     router.replace('/');
@@ -62,35 +70,34 @@ export default function LandingScreen() {
       </View>
 
       <View style={styles.buttonArea}>
-        {/* Apple Sign-In */}
-        {Platform.OS !== 'android' && (
-          <Pressable
-            onPress={handleAppleSignIn}
-            disabled={isLoading}
-            style={({ pressed }) => [
-              styles.oauthButton,
-              styles.appleButton,
-              pressed && !isLoading && { transform: [{ scale: 0.98 }] },
-              isLoading && { opacity: 0.7 },
-            ]}
-          >
+        {/* Apple Sign-In — uses the native AppleAuthenticationButton so it
+            renders Apple's HIG-compliant button (required by App Review). */}
+        {appleAvailable && (
+          <View style={styles.appleButtonWrap}>
             {loading === 'apple' ? (
-              <ActivityIndicator size="small" color="#fff" />
+              <View style={styles.appleLoading}>
+                <ActivityIndicator size="small" color="#000" />
+              </View>
             ) : (
-              <Ionicons name="logo-apple" size={20} color="#fff" />
+              <AppleAuthentication.AppleAuthenticationButton
+                buttonType={AppleAuthentication.AppleAuthenticationButtonType.CONTINUE}
+                buttonStyle={AppleAuthentication.AppleAuthenticationButtonStyle.WHITE}
+                cornerRadius={16}
+                style={styles.appleButton}
+                onPress={handleAppleSignIn}
+              />
             )}
-            <Text style={[styles.oauthText, { color: '#fff' }]}>
-              {loading === 'apple' ? 'Signing in...' : 'Continue with Apple'}
-            </Text>
-          </Pressable>
+          </View>
         )}
 
         {/* Divider */}
-        <View style={styles.divider}>
-          <View style={styles.dividerLine} />
-          <Text style={styles.dividerText}>or</Text>
-          <View style={styles.dividerLine} />
-        </View>
+        {appleAvailable && (
+          <View style={styles.divider}>
+            <View style={styles.dividerLine} />
+            <Text style={styles.dividerText}>or</Text>
+            <View style={styles.dividerLine} />
+          </View>
+        )}
 
         {/* Continue as Guest */}
         <Pressable
@@ -158,8 +165,19 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     paddingVertical: 16,
   },
+  appleButtonWrap: {
+    height: 52,
+  },
   appleButton: {
-    backgroundColor: '#000',
+    width: '100%',
+    height: 52,
+  },
+  appleLoading: {
+    height: 52,
+    borderRadius: 16,
+    backgroundColor: '#fff',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   guestButton: {
     backgroundColor: Colors.card,
