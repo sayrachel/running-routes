@@ -1676,6 +1676,44 @@ async function fetchOSRMRouteAdjusted(
 
     // Out of retries — return the closest attempt rather than the latest.
     if (attempt === maxRetries) {
+      // Bearing-rotation retry: when scaling-based iteration converges on a
+      // wrong-display result, the local road network in the original
+      // direction simply may not offer a route at the requested mile.
+      // Rotate the best waypoints 45° around center and try ONE more OSRM
+      // call. Only fires when the caller asked for rounded-display match
+      // AND the best attempt failed it — bounded extra cost (1 call per
+      // truly-stuck candidate). Swap in the rotated route only if it's
+      // BOTH within the accept window AND rounds to the right display
+      // integer; otherwise keep best-so-far.
+      if (
+        requireRoundedTargetUnits &&
+        !roundedDisplayMatches(best.route.distance / 1000, targetDistanceKm, requireRoundedTargetUnits)
+      ) {
+        const rotated = best.waypoints.map((p) => {
+          const distFromCenter = haversineDistance(center, p);
+          if (distFromCenter < 0.001) return p; // ~1m epsilon — leave start/end
+          const newBearing = (bearingFrom(center, p) + 45) % 360;
+          return destinationPoint(center, newBearing, distFromCenter);
+        });
+        const rRoute = await fetchOSRMRoute(rotated);
+        if (rRoute) {
+          const rDistKm = rRoute.distance / 1000;
+          const rRatio = rDistKm / targetDistanceKm;
+          if (
+            rRatio >= 0.85 && rRatio <= 1.15 &&
+            roundedDisplayMatches(rDistKm, targetDistanceKm, requireRoundedTargetUnits)
+          ) {
+            traceEmit('adjust-rotation-recovered', {
+              originalRatio: best.ratio, rotatedRatio: rRatio,
+              originalDistKm: best.route.distance / 1000, rotatedDistKm: rDistKm,
+            });
+            return { route: rRoute, waypoints: rotated };
+          }
+          traceEmit('adjust-rotation-no-help', { rotatedRatio: rRatio, rotatedDistKm: rDistKm });
+        } else {
+          traceEmit('adjust-rotation-no-route', {});
+        }
+      }
       traceEmit('adjust-give-up', { bestRatio: best.ratio });
       return { route: best.route, waypoints: best.waypoints };
     }
@@ -3195,22 +3233,16 @@ export async function generateOSRMRoutes(
     );
   }
 
-  // Wrong-display fallback RESTORED (May 2026, second pass) with a
-  // target-distance gate. Original removal was over-aggressive — the user
-  // reported that "no routes found" happens often enough in dense areas
-  // (East Village 4mi loop: q=8 d=8 w=4 reproducing across multiple
-  // attempts) that "any route, even off-by-one mile" is preferable to
-  // failure. But: user also flagged that perceived-deltas are bigger at
-  // small target distances ("the lower the # of miles the user requests,
-  // the more sensitive they will be to the delta between requested and
-  // received miles"). A 1mi request returning a 2mi route is a 100% delta;
-  // a 5mi returning a 6mi is 20%. Same nominal "off by 1" feels very
-  // different. So: only promote the fallback when target ≥ 3 miles. Below
-  // that, surface "no routes found" — the user can change distance or
-  // location, and the candidates that would have qualified are by
-  // definition >50% off, which is "broken" not "close-enough."
+  // Wrong-display fallback gated by target distance. Off-by-one mile reads
+  // very differently at different scales: 4mi → 3mi is a 25% short delta
+  // and feels broken; 10mi → 11mi is 10% and reads as close-enough. User
+  // direction (May 2026): for targets < 5 mi, require exact rounded-mile
+  // match — no ±1 fallback. Below 5mi we'd rather surface "no routes
+  // found" so the user can change distance or location than ship a route
+  // that's visibly the wrong mile. ≥ 5mi keeps the ±1 fallback so dense
+  // areas don't dead-end users on longer requests.
   const targetMiForFallback = distanceKm * 0.621371;
-  const allowWrongDisplayFallback = targetMiForFallback >= 3;
+  const allowWrongDisplayFallback = targetMiForFallback >= 5;
   if (resolved.length === 0 && wrongDisplayFallback.length > 0 && allowWrongDisplayFallback) {
     // ±1 rounded-mile/km guardrail (existing helper). Without this a 4mi
     // request could ship a 7mi route from the wrong-display pool — the
@@ -3368,6 +3400,7 @@ export async function generateOSRMRoutes(
       terrain,
       difficulty,
       anchorPoints: candidate.anchors.map((a) => a.point),
+      routeStyle: routeType,
     };
   });
 }

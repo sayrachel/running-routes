@@ -26,16 +26,19 @@ import { buildGoogleMapsUrl } from '@/lib/route-export';
 import { BottomTabBar } from '@/components/BottomTabBar';
 import { Colors, Fonts } from '@/lib/theme';
 import { generateOSRMRoutes, OSRMUnavailableError, getLastFailureDiagnostics, haversineDistance } from '@/lib/osrm';
+import { findMatchingHistoricalRoute } from '@/lib/route-history';
+import { isDevUser } from '@/lib/dev-mode';
 import type { RoutePoint } from '@/lib/route-generator';
 import { persistOverpassCache } from '@/lib/overpass-persist';
 import { persistOSRMCache } from '@/lib/osrm-persist';
 import * as Updates from 'expo-updates';
 
 /** Build the same `[n=… q=… (…) w=… v=…]` suffix used by the plan-screen
- *  error banner so refresh failures carry the same diagnostic. Without
- *  this we can't tell which gate is over-rejecting on a refresh attempt
- *  vs a fresh-generate attempt. */
-function failureDiagSuffix(): string {
+ *  error banner so refresh failures carry the same diagnostic. Returns ''
+ *  for non-dev users (lib/dev-mode.ts) so the banner stays clean for
+ *  everyone else. */
+function failureDiagSuffix(email: string | null | undefined): string {
+  if (!isDevUser(email)) return '';
   const diag = getLastFailureDiagnostics();
   const ver = (Updates.updateId ?? 'embedded').slice(0, 8);
   if (!diag) return ` [v=${ver}]`;
@@ -396,25 +399,33 @@ export default function RunScreen() {
       );
       ctx.setIsGenerating(false);
       if (newRoutes.length === 0) {
-        // Cycle-to-history safety net (per user request: "instead of showing
-        // the error, why don't you just cycle it back to one of the
-        // previously generated routes?"). If we have any historical route
-        // that ISN'T the currently-selected one, swap to it so the user gets
-        // visible variety even when generation fails. Still surface the
-        // banner so they know it wasn't a fresh result. Falls through to
-        // the bare error if history is empty or only contains the current.
-        const cycleCandidate = ctx.routeHistory.find((r) => r.id !== ctx.selectedRoute?.id);
+        // Cycle-to-history safety net: when generation fails, swap to a
+        // historical route matching the same distance + style + start. Silent
+        // on success — the user just sees a different route, same as a
+        // normal refresh. Parameter-matched (not just any historical route)
+        // so a 4mi refresh never silently swaps to a 6mi.
+        const styleNormalized = ctx.routeStyle === 'point-to-point' ? 'point-to-point'
+          : ctx.routeStyle === 'out-and-back' ? 'out-and-back'
+          : 'loop';
+        const cycleCandidate = findMatchingHistoricalRoute(
+          ctx.routeHistory,
+          ctx.distance,
+          ctx.prefs.units,
+          styleNormalized,
+          ctx.center,
+          ctx.endLocation,
+          ctx.selectedRoute?.id ?? null,
+        );
         if (cycleCandidate) {
           ctx.setRoutes([cycleCandidate]);
           ctx.setSelectedRoute(cycleCandidate);
           ctx.pushRouteToHistory(cycleCandidate); // promote to front so we cycle through history
-          showRefreshError(`Showing a previous route - couldn't find a new one. Try again.${failureDiagSuffix()}`);
           return;
         }
-        // Keep the previous route visible — bouncing to plan strands the
-        // user with no route AND no clear next step (they hit generate, hit
-        // the same failure, get bounced again). Surface a banner instead.
-        showRefreshError(`Couldn't find a different route. Try again or change distance.${failureDiagSuffix()}`);
+        // No matching history to cycle to — surface a banner so the user
+        // knows the refresh did fail (otherwise tapping refresh appears to
+        // do nothing).
+        showRefreshError(`Couldn't find a different route. Try again or change distance.${failureDiagSuffix(ctx.user?.email)}`);
         return;
       }
       ctx.setRoutes(newRoutes);
@@ -425,10 +436,12 @@ export default function RunScreen() {
     } catch (err) {
       console.warn('Route refresh failed:', err);
       ctx.setIsGenerating(false);
-      const ver = (Updates.updateId ?? 'embedded').slice(0, 8);
+      const verSuffix = isDevUser(ctx.user?.email)
+        ? ` [v=${(Updates.updateId ?? 'embedded').slice(0, 8)}]`
+        : '';
       const msg = err instanceof OSRMUnavailableError
-        ? `Routing service is slow. Please try again in a moment. [v=${ver}]`
-        : `Couldn't refresh route. Check your connection and try again. [v=${ver}]`;
+        ? `Routing service is slow. Please try again in a moment.${verSuffix}`
+        : `Couldn't refresh route. Check your connection and try again.${verSuffix}`;
       showRefreshError(msg);
     }
   }, [ctx, hasStarted, showRefreshError]);

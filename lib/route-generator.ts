@@ -7,7 +7,7 @@ export interface GeneratedRoute {
   id: string
   name: string
   points: RoutePoint[]
-  distance: number // in km
+  distance: number // rounded miles (kept as miles regardless of user units)
   estimatedTime: number // in minutes
   elevationGain: number // in meters
   terrain: string
@@ -16,6 +16,10 @@ export interface GeneratedRoute {
   // subsequent refresh can exclude the same parks and produce a genuinely
   // different route — the OSRM cache otherwise replays identical waypoints.
   anchorPoints?: RoutePoint[]
+  // Set by generateOSRMRoutes so the in-session history fallback can match
+  // style. Optional because routes loaded from firestore (favorites, run
+  // history) predate this field.
+  routeStyle?: "loop" | "out-and-back" | "point-to-point"
 }
 
 function toRad(deg: number): number {

@@ -26,6 +26,8 @@ import { ProfileDrawer } from '@/components/ProfileDrawer';
 import { useAppContext, type RouteStyle, type RunPreferences } from '@/lib/AppContext';
 import { distanceUnit } from '@/lib/units';
 import { generateOSRMRoutes, prewarmOSRMConnection, OSRMUnavailableError, getLastFailureDiagnostics } from '@/lib/osrm';
+import { findMatchingHistoricalRoute } from '@/lib/route-history';
+import { isDevUser } from '@/lib/dev-mode';
 import * as Updates from 'expo-updates';
 import { prefetchGreenSpacesAndHighways } from '@/lib/overpass';
 import { persistOverpassCache } from '@/lib/overpass-persist';
@@ -581,28 +583,55 @@ export default function SetupScreen() {
         end
       );
       if (newRoutes.length === 0) {
+        // Silent history fallback: before showing "No routes found", check
+        // if a previously-generated route in this session matches the same
+        // distance + style + start neighborhood. If so, ship it — the user
+        // gets a runnable route instead of a dead-end. Stays on /run since
+        // ctx.routes is now populated.
+        const targetUserUnits = localRouteStyle === 'point-to-point' && p2pDistance != null
+          ? p2pDistance
+          : ctx.distance;
+        const styleNormalized = localRouteStyle === 'point-to-point' ? 'point-to-point'
+          : localRouteStyle === 'out-and-back' ? 'out-and-back'
+          : 'loop';
+        const fallback = findMatchingHistoricalRoute(
+          ctx.routeHistory,
+          targetUserUnits,
+          localPrefs.units,
+          styleNormalized,
+          resolvedCenter,
+          end,
+          null,
+        );
+        if (fallback) {
+          ctx.setRoutes([fallback]);
+          ctx.setSelectedRoute(fallback);
+          ctx.pushRouteToHistory(fallback);
+          ctx.setIsGenerating(false);
+          return;
+        }
         ctx.setIsGenerating(false);
         // Set the error in context BEFORE navigating. router.replace('/')
         // unmounts the run screen and mounts a fresh plan screen; the new
         // plan screen reads generateError from context (which survives the
         // unmount) and renders the banner on first paint.
-        // Diagnostic suffix: shows OSRM null count, quality rejects, wrong-
-        // display count, and the running update ID. Lets us debug
-        // "no routes" reports without console access. Sample format:
-        //   "...try a different distance. [n=4 q=2 w=3 v=019df105]"
-        const diag = getLastFailureDiagnostics();
-        const ver = (Updates.updateId ?? 'embedded').slice(0, 8);
-        // Per-reason breakdown when q > 0 (otherwise the suffix is noise).
-        // Single letters: d=distance, b=barrier, h=highway, o=off-street,
-        // p=pendant-loop, t=backtrack. Lets us see "q=6 (b=2 o=2 d=2)" at
-        // a glance and target the dominant gate.
-        const rr = diag?.rejectReasons;
-        const qBreakdown = rr && diag!.qualityRejectCount > 0
-          ? ` (d=${rr.distance} b=${rr.barrier} h=${rr.highway} o=${rr.offStreet} p=${rr.pendantLoop} t=${rr.backtrack})`
-          : '';
-        const detail = diag
-          ? ` [n=${diag.osrmNullCount} q=${diag.qualityRejectCount}${qBreakdown} w=${diag.wrongDisplayCount}${diag.budgetExpired ? ' BUDGET' : ''} v=${ver}]`
-          : ` [v=${ver}]`;
+        // Diagnostic suffix is appended only for dev users (lib/dev-mode.ts);
+        // everyone else sees a clean message. Letters: n=osrm null count,
+        // q=quality rejects with per-reason (d/b/h/o/p/t), w=wrong-display
+        // pool size, v=update id. Sample dev format:
+        //   "...try a different distance. [n=4 q=2 (d=…) w=3 v=019df105]"
+        let detail = '';
+        if (isDevUser(ctx.user?.email)) {
+          const diag = getLastFailureDiagnostics();
+          const ver = (Updates.updateId ?? 'embedded').slice(0, 8);
+          const rr = diag?.rejectReasons;
+          const qBreakdown = rr && diag!.qualityRejectCount > 0
+            ? ` (d=${rr.distance} b=${rr.barrier} h=${rr.highway} o=${rr.offStreet} p=${rr.pendantLoop} t=${rr.backtrack})`
+            : '';
+          detail = diag
+            ? ` [n=${diag.osrmNullCount} q=${diag.qualityRejectCount}${qBreakdown} w=${diag.wrongDisplayCount}${diag.budgetExpired ? ' BUDGET' : ''} v=${ver}]`
+            : ` [v=${ver}]`;
+        }
         ctx.setGenerateError(`No routes found for this area. Try a different location or distance.${detail}`);
         router.replace('/');
         return;
@@ -623,10 +652,13 @@ export default function SetupScreen() {
       // OSRMUnavailableError = endpoint timeout/5xx/budget. Generic catch =
       // anything else (geocoding, JSON parse, etc.). Different message for
       // each so the user knows whether to retry now or wait/move locations.
-      const ver = (Updates.updateId ?? 'embedded').slice(0, 8);
+      // Version suffix appended only for dev users (lib/dev-mode.ts).
+      const verSuffix = isDevUser(ctx.user?.email)
+        ? ` [v=${(Updates.updateId ?? 'embedded').slice(0, 8)}]`
+        : '';
       const msg = err instanceof OSRMUnavailableError
-        ? `Routing service is slow or unavailable. Please try again in a moment. [v=${ver}]`
-        : `Couldn't generate a route. Check your connection and try again. [v=${ver}]`;
+        ? `Routing service is slow or unavailable. Please try again in a moment.${verSuffix}`
+        : `Couldn't generate a route. Check your connection and try again.${verSuffix}`;
       ctx.setGenerateError(msg);
       router.replace('/');
     }
