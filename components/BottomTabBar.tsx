@@ -2,15 +2,33 @@ import React from 'react';
 import { View, Text, Pressable, StyleSheet } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useRouter, usePathname } from 'expo-router';
-import { Ionicons } from '@expo/vector-icons';
+import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { Colors, Fonts } from '@/lib/theme';
 
 type TabKey = 'plan' | 'run' | 'saved';
 
-const TABS: { key: TabKey; label: string; icon: keyof typeof Ionicons.glyphMap; activeIcon: keyof typeof Ionicons.glyphMap; route: string }[] = [
-  { key: 'plan', label: 'Plan', icon: 'map-outline', activeIcon: 'map', route: '/' },
-  { key: 'run', label: 'Run', icon: 'walk-outline', activeIcon: 'walk', route: '/run' },
-  { key: 'saved', label: 'Saved', icon: 'bookmark-outline', activeIcon: 'bookmark', route: '/saved' },
+// Each tab provides its own render fn so the Run tab can pull from
+// MaterialCommunityIcons (the only set with a true running pose that
+// matches the app icon — Ionicons only ships `walk`).
+const TABS: { key: TabKey; label: string; render: (color: string, active: boolean) => React.ReactNode; route: string }[] = [
+  {
+    key: 'plan',
+    label: 'Plan',
+    render: (color, active) => <Ionicons name={active ? 'map' : 'map-outline'} size={22} color={color} />,
+    route: '/',
+  },
+  {
+    key: 'run',
+    label: 'Run',
+    render: (color) => <MaterialCommunityIcons name="run" size={24} color={color} />,
+    route: '/run',
+  },
+  {
+    key: 'saved',
+    label: 'Saved',
+    render: (color, active) => <Ionicons name={active ? 'bookmark' : 'bookmark-outline'} size={22} color={color} />,
+    route: '/saved',
+  },
 ];
 
 export function BottomTabBar() {
@@ -35,11 +53,7 @@ export function BottomTabBar() {
             onPress={() => handleTabPress(tab)}
             style={styles.tab}
           >
-            <Ionicons
-              name={isActive ? tab.activeIcon : tab.icon}
-              size={22}
-              color={isActive ? Colors.primary : Colors.mutedForeground}
-            />
+            {tab.render(isActive ? Colors.primary : Colors.mutedForeground, isActive)}
             <Text style={[styles.tabLabel, isActive && styles.tabLabelActive]}>
               {tab.label}
             </Text>
