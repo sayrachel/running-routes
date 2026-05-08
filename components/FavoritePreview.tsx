@@ -9,6 +9,7 @@ import { generateRoutes } from '@/lib/route-generator';
 import { generateOSRMRoutes } from '@/lib/osrm';
 import type { FavoriteRoute } from '@/lib/AppContext';
 import { Colors, Fonts } from '@/lib/theme';
+import { distanceUnit } from '@/lib/units';
 
 interface FavoritePreviewProps {
   favorite: FavoriteRoute;
@@ -115,7 +116,7 @@ export function FavoritePreview({ favorite, onClose }: FavoritePreviewProps) {
         <View style={styles.routeMeta}>
           <View style={styles.metaItem}>
             <Ionicons name="navigate-outline" size={14} color={Colors.mutedForeground} />
-            <Text style={styles.metaText}>{favorite.distance} km</Text>
+            <Text style={styles.metaText}>{favorite.distance} {distanceUnit(ctx.prefs.units)}</Text>
           </View>
           <View style={styles.metaItem}>
             <Ionicons name="map-outline" size={14} color={Colors.mutedForeground} />

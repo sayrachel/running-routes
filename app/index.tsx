@@ -30,7 +30,6 @@ import * as Updates from 'expo-updates';
 import { prefetchGreenSpacesAndHighways } from '@/lib/overpass';
 import { persistOverpassCache } from '@/lib/overpass-persist';
 import { persistOSRMCache } from '@/lib/osrm-persist';
-import { accuracyToStrength } from '@/lib/useLocationTracking';
 import { BottomTabBar } from '@/components/BottomTabBar';
 import { Colors, Fonts } from '@/lib/theme';
 import type { GeocodeSuggestion } from '@/lib/types';
@@ -273,29 +272,6 @@ export default function SetupScreen() {
     }
   }, [ctx.center]);
 
-  // Real GPS strength from location accuracy
-  useEffect(() => {
-    let subscription: Location.LocationSubscription | null = null;
-
-    (async () => {
-      const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') {
-        ctx.setGpsStrength(0);
-        return;
-      }
-
-      subscription = await Location.watchPositionAsync(
-        { accuracy: Location.Accuracy.Balanced, timeInterval: 5000 },
-        (loc) => {
-          ctx.setGpsStrength(accuracyToStrength(loc.coords.accuracy));
-        }
-      );
-    })();
-
-    return () => {
-      subscription?.remove();
-    };
-  }, []);
 
   // Re-fetch GPS every time the screen is focused, but only if the user hasn't
   // manually set a start location. This ensures returning from a run resets
@@ -311,7 +287,6 @@ export default function SetupScreen() {
             const loc = await Location.getCurrentPositionAsync({});
             ctx.setCenter({ lat: loc.coords.latitude, lng: loc.coords.longitude });
             ctx.setHasLocation(true);
-            ctx.setGpsStrength(accuracyToStrength(loc.coords.accuracy));
             try {
               const [geo] = await Location.reverseGeocodeAsync({
                 latitude: loc.coords.latitude,
@@ -408,7 +383,6 @@ export default function SetupScreen() {
         const loc = await Location.getCurrentPositionAsync({});
         ctx.setCenter({ lat: loc.coords.latitude, lng: loc.coords.longitude });
         ctx.setHasLocation(true);
-        ctx.setGpsStrength(accuracyToStrength(loc.coords.accuracy));
         // Reverse geocode
         try {
           const [geo] = await Location.reverseGeocodeAsync({

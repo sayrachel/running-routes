@@ -56,8 +56,6 @@ interface AppState {
   setCenter: (p: RoutePoint) => void;
   hasLocation: boolean;
   setHasLocation: (v: boolean) => void;
-  gpsStrength: 0 | 1 | 2 | 3;
-  setGpsStrength: (v: 0 | 1 | 2 | 3) => void;
   distance: number;
   setDistance: (v: number) => void;
   routeStyle: RouteStyle;
@@ -102,7 +100,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [center, setCenter] = useState<RoutePoint>(DEFAULT_CENTER);
   const [hasLocation, setHasLocation] = useState(false);
-  const [gpsStrength, setGpsStrength] = useState<0 | 1 | 2 | 3>(0);
   const [distance, setDistanceRaw] = useState(3);
   const [routeStyle, setRouteStyle] = useState<RouteStyle>('loop');
 
@@ -304,8 +301,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setCenter,
         hasLocation,
         setHasLocation,
-        gpsStrength,
-        setGpsStrength,
         distance,
         setDistance,
         routeStyle,

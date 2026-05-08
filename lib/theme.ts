@@ -16,6 +16,7 @@ export const Colors = {
   mutedForeground: '#6b7a8d',
   destructive: '#ef4444',
   destructiveForeground: '#fafafa',
+  warning: '#f5a524',
   border: '#232b36',
   accent: '#c8ff00',
   accentForeground: '#0b0f14',

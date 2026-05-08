@@ -31,15 +31,6 @@ function formatSplitTime(seconds: number): string {
   return `${mins}:${String(secs).padStart(2, '0')}`;
 }
 
-/** GPS accuracy to signal strength (0-3) */
-export function accuracyToStrength(accuracy: number | null): 0 | 1 | 2 | 3 {
-  if (accuracy === null) return 0;
-  if (accuracy <= 5) return 3;
-  if (accuracy <= 15) return 2;
-  if (accuracy <= 30) return 1;
-  return 0;
-}
-
 export interface TrackingStats {
   coordinates: RoutePoint[];
   totalDistanceKm: number;
@@ -114,6 +105,11 @@ export function useLocationTracking() {
   const lastPointRef = useRef<RoutePoint | null>(null);
   const splitTimestampsRef = useRef<number[]>([]);
   const accuracyRef = useRef<number | null>(null);
+  // Cached snapshot of the coordinates array we last handed to setStats.
+  // Reused as the next setStats `coordinates` field when no new GPS points
+  // came in, so the reference stays stable and React.memo'd map consumers
+  // can skip re-rendering once per second for nothing.
+  const lastEmittedCoordsRef = useRef<RoutePoint[]>([]);
 
   // Elapsed time ticker
   useEffect(() => {
@@ -179,8 +175,16 @@ export function useLocationTracking() {
           });
         }
 
+        // Only allocate a fresh coordinates array when length actually grew.
+        // Otherwise reuse the previously-emitted ref so downstream React.memo
+        // checks (RouteMap compares gpsTrack length) skip cleanly.
+        const coordsForState = coords.length === lastEmittedCoordsRef.current.length
+          ? lastEmittedCoordsRef.current
+          : [...coords];
+        lastEmittedCoordsRef.current = coordsForState;
+
         setStats({
-          coordinates: [...coords],
+          coordinates: coordsForState,
           totalDistanceKm: dist,
           elapsedSeconds: elapsed,
           currentPace,
@@ -207,6 +211,7 @@ export function useLocationTracking() {
     elapsedRef.current = 0;
     lastPointRef.current = null;
     splitTimestampsRef.current = [];
+    lastEmittedCoordsRef.current = [];
     sharedCoordinates = [];
     sharedTotalDistance = 0;
     lastBackgroundPoint = null;

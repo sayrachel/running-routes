@@ -9,7 +9,7 @@ type TabKey = 'plan' | 'run' | 'saved';
 
 const TABS: { key: TabKey; label: string; icon: keyof typeof Ionicons.glyphMap; activeIcon: keyof typeof Ionicons.glyphMap; route: string }[] = [
   { key: 'plan', label: 'Plan', icon: 'map-outline', activeIcon: 'map', route: '/' },
-  { key: 'run', label: 'Run', icon: 'stats-chart-outline', activeIcon: 'stats-chart', route: '/run' },
+  { key: 'run', label: 'Run', icon: 'walk-outline', activeIcon: 'walk', route: '/run' },
   { key: 'saved', label: 'Saved', icon: 'bookmark-outline', activeIcon: 'bookmark', route: '/saved' },
 ];
 

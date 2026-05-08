@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, Pressable, ScrollView, StyleSheet, Dimensions, Share, ActivityIndicator, Linking } from 'react-native';
+import { View, Text, Pressable, ScrollView, StyleSheet, Dimensions, Share, ActivityIndicator, Linking, Alert } from 'react-native';
 
 import { useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -58,7 +58,6 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
   const ctx = useAppContext();
   const translateX = useSharedValue(SCREEN_WIDTH);
   const [mounted, setMounted] = useState(false);
-  const [deleteLabel, setDeleteLabel] = useState('Delete Account');
   const [isDeleting, setIsDeleting] = useState(false);
   const [view, setView] = useState<DrawerView>('profile');
   const [selectedRun, setSelectedRun] = useState<RunRecord | null>(null);
@@ -69,7 +68,6 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
   useEffect(() => {
     if (visible) {
       setMounted(true);
-      setDeleteLabel('Delete Account');
       setView(initialView || 'profile');
       setSelectedRun(null);
       translateX.value = withTiming(0, { duration: 300 });
@@ -134,21 +132,30 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
     router.replace('/landing');
   };
 
-  const handleDelete = async () => {
-    if (deleteLabel === 'Delete Account') {
-      setDeleteLabel('Tap again to confirm');
-      return;
-    }
-    setIsDeleting(true);
-    try {
-      await ctx.deleteAccount();
-    } catch {
-      // If re-auth is needed, fall back to sign out
-      await ctx.signOutUser();
-    }
-    setIsDeleting(false);
-    onClose();
-    router.replace('/landing');
+  const handleDelete = () => {
+    Alert.alert(
+      'Delete Account?',
+      'This permanently deletes your account, run history, and favorites. This cannot be undone.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            setIsDeleting(true);
+            try {
+              await ctx.deleteAccount();
+            } catch {
+              // If re-auth is needed, fall back to sign out
+              await ctx.signOutUser();
+            }
+            setIsDeleting(false);
+            onClose();
+            router.replace('/landing');
+          },
+        },
+      ],
+    );
   };
 
   const handleRemoveFavorite = (id: string) => {
@@ -263,13 +270,12 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
               <Pressable style={styles.menuRow} onPress={async () => {
                 try {
                   await Share.share({
-                    message: 'Discover Run Routes: your personal running route generator based on your preferences. https://runroutes.app',
+                    message: 'Discover Run Routes: your personal running route generator based on your preferences. https://apps.apple.com/app/id6760323382',
                   });
                 } catch {}
               }}>
                 <Ionicons name="share-outline" size={20} color={Colors.mutedForeground} />
                 <Text style={styles.menuLabel}>Share Run Routes</Text>
-                <Ionicons name="chevron-forward" size={16} color={Colors.mutedForeground} />
               </Pressable>
 
               <Pressable style={styles.menuRow} onPress={() => setView('contact')}>
@@ -304,7 +310,6 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
               >
                 <Ionicons name="log-out-outline" size={20} color={Colors.mutedForeground} />
                 <Text style={styles.menuLabel}>Log Out</Text>
-                <Ionicons name="chevron-forward" size={16} color={Colors.mutedForeground} />
               </Pressable>
 
               <Pressable
@@ -317,8 +322,7 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
                 ) : (
                   <Ionicons name="trash-outline" size={20} color={Colors.destructive} />
                 )}
-                <Text style={[styles.menuLabel, { color: Colors.destructive }]}>{isDeleting ? 'Deleting...' : deleteLabel}</Text>
-                <Ionicons name="chevron-forward" size={16} color={Colors.mutedForeground} />
+                <Text style={[styles.menuLabel, { color: Colors.destructive }]}>{isDeleting ? 'Deleting...' : 'Delete Account'}</Text>
               </Pressable>
             </View>
           </ScrollView>
@@ -366,11 +370,11 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
             <Text style={styles.sectionLabel}>EMAIL</Text>
             <View style={styles.contactEmailCard}>
               <Ionicons name="mail-outline" size={20} color={Colors.primary} />
-              <Text style={styles.contactEmail} selectable>support@runroutes.app</Text>
+              <Text style={styles.contactEmail} selectable>irachelma@gmail.com</Text>
               <Pressable
                 hitSlop={8}
                 onPress={() => {
-                  Linking.openURL('mailto:support@runroutes.app?subject=Running%20Routes%20Support');
+                  Linking.openURL('mailto:irachelma@gmail.com?subject=Running%20Routes%20Support');
                 }}
               >
                 <Ionicons name="open-outline" size={20} color={Colors.mutedForeground} />

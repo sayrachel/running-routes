@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, Pressable, ScrollView, StyleSheet, ActivityIndicator, Animated, PanResponder } from 'react-native';
+import { View, Text, Pressable, ScrollView, StyleSheet, ActivityIndicator, Animated, PanResponder, Alert } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { useAppContext, type FavoriteRoute } from '@/lib/AppContext';
@@ -148,10 +148,23 @@ export default function SavedScreen() {
     setPreviewFavorite(route);
   };
 
-  const handleDeleteRun = async (runId: string) => {
-    if (selectedRun?.id === runId) setSelectedRun(null);
-    setRunHistory((prev) => prev.filter((r) => r.id !== runId));
-    await deleteRunRecord(ctx.firebaseUid, runId);
+  const handleDeleteRun = (runId: string, runName: string) => {
+    Alert.alert(
+      'Delete Run?',
+      `Permanently delete "${runName}" from your history. This cannot be undone.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            if (selectedRun?.id === runId) setSelectedRun(null);
+            setRunHistory((prev) => prev.filter((r) => r.id !== runId));
+            await deleteRunRecord(ctx.firebaseUid, runId);
+          },
+        },
+      ],
+    );
   };
 
   // Run detail view
@@ -220,7 +233,7 @@ export default function SavedScreen() {
 
           {/* Delete */}
           <Pressable
-            onPress={() => handleDeleteRun(selectedRun.id!)}
+            onPress={() => handleDeleteRun(selectedRun.id!, selectedRun.routeName)}
             style={({ pressed }) => [styles.deleteBtn, pressed && { opacity: 0.7 }]}
           >
             <Ionicons name="trash-outline" size={16} color={Colors.destructive} />
@@ -341,7 +354,7 @@ export default function SavedScreen() {
                 const durationMin = formatDuration(run.duration);
                 const pace = run.avgPace || (durationMin / run.distance).toFixed(1);
                 return (
-                  <SwipeableCard key={run.id} onDelete={() => handleDeleteRun(run.id!)}>
+                  <SwipeableCard key={run.id} onDelete={() => handleDeleteRun(run.id!, run.routeName)}>
                     <Pressable
                       style={styles.cardInner}
                       onPress={() => setSelectedRun(run)}

@@ -1,5 +1,5 @@
 import React from 'react';
-import { View, Text, ScrollView, Pressable, StyleSheet } from 'react-native';
+import { View, Text, ScrollView, Pressable, StyleSheet, Alert } from 'react-native';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { Colors, Fonts } from '@/lib/theme';
 import type { UnitSystem } from '@/lib/units';
@@ -140,7 +140,17 @@ export function StatsView({
               <Text style={styles.saveLabel}>Save Activity</Text>
             </Pressable>
             <Pressable
-              onPress={(e) => { e.stopPropagation(); onDiscard(); }}
+              onPress={(e) => {
+                e.stopPropagation();
+                Alert.alert(
+                  'Discard Run?',
+                  'Your GPS track and stats from this run will be lost. This cannot be undone.',
+                  [
+                    { text: 'Cancel', style: 'cancel' },
+                    { text: 'Discard', style: 'destructive', onPress: onDiscard },
+                  ],
+                );
+              }}
               style={({ pressed }) => [styles.discardBtn, pressed && { opacity: 0.7 }]}
             >
               <Ionicons name="trash-outline" size={16} color={Colors.mutedForeground} />

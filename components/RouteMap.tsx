@@ -14,8 +14,20 @@ interface RouteMapProps {
   currentPosition?: RoutePoint | null;
 }
 
-export function RouteMap({ center, routes, selectedRouteId, gpsTrack, currentPosition }: RouteMapProps) {
+function RouteMapImpl({ center, routes, selectedRouteId, gpsTrack, currentPosition }: RouteMapProps) {
   const selectedRoute = routes.find((r) => r.id === selectedRouteId) ?? null;
+
+  // Convert {lat, lng} → {latitude, longitude} once per route/track change.
+  // Without this, every render rebuilds the array — costly during a run when
+  // gpsTrack grows to hundreds of points and the map re-renders frequently.
+  const selectedRouteCoords = useMemo(
+    () => selectedRoute?.points.map((p: RoutePoint) => ({ latitude: p.lat, longitude: p.lng })) ?? null,
+    [selectedRoute],
+  );
+  const gpsTrackCoords = useMemo(
+    () => gpsTrack?.map((p) => ({ latitude: p.lat, longitude: p.lng })) ?? null,
+    [gpsTrack],
+  );
 
   // Recompute region whenever the underlying inputs change. Memoized so
   // the useEffect below doesn't re-fire on unrelated re-renders.
@@ -69,23 +81,17 @@ export function RouteMap({ center, routes, selectedRouteId, gpsTrack, currentPos
         showsCompass={false}
         initialRegion={region}
       >
-        {selectedRoute && (
+        {selectedRouteCoords && (
           <Polyline
-            coordinates={selectedRoute.points.map((p: RoutePoint) => ({
-              latitude: p.lat,
-              longitude: p.lng,
-            }))}
+            coordinates={selectedRouteCoords}
             strokeColor={Colors.primary + '33'}
             strokeWidth={10}
           />
         )}
 
-        {selectedRoute && (
+        {selectedRouteCoords && (
           <Polyline
-            coordinates={selectedRoute.points.map((p: RoutePoint) => ({
-              latitude: p.lat,
-              longitude: p.lng,
-            }))}
+            coordinates={selectedRouteCoords}
             strokeColor={Colors.primary}
             strokeWidth={4}
             lineCap="round"
@@ -93,23 +99,17 @@ export function RouteMap({ center, routes, selectedRouteId, gpsTrack, currentPos
           />
         )}
 
-        {gpsTrack && gpsTrack.length > 1 && (
+        {gpsTrackCoords && gpsTrackCoords.length > 1 && (
           <Polyline
-            coordinates={gpsTrack.map((p) => ({
-              latitude: p.lat,
-              longitude: p.lng,
-            }))}
+            coordinates={gpsTrackCoords}
             strokeColor="#00BFFF33"
             strokeWidth={8}
           />
         )}
 
-        {gpsTrack && gpsTrack.length > 1 && (
+        {gpsTrackCoords && gpsTrackCoords.length > 1 && (
           <Polyline
-            coordinates={gpsTrack.map((p) => ({
-              latitude: p.lat,
-              longitude: p.lng,
-            }))}
+            coordinates={gpsTrackCoords}
             strokeColor="#00BFFF"
             strokeWidth={3}
             lineCap="round"
@@ -155,6 +155,22 @@ export function RouteMap({ center, routes, selectedRouteId, gpsTrack, currentPos
     </View>
   );
 }
+
+// Custom equality: skip re-render unless something visible changed.
+// Route ids are uniquely generated per generation, so id-equality covers
+// "same route data." gpsTrack length is the only thing that changes during
+// a run (we only ever append). currentPosition lat/lng catch live position
+// movement. center catches start-marker repositioning.
+export const RouteMap = React.memo(RouteMapImpl, (prev, next) => {
+  if (prev.selectedRouteId !== next.selectedRouteId) return false;
+  if (prev.routes.length !== next.routes.length) return false;
+  if ((prev.gpsTrack?.length ?? 0) !== (next.gpsTrack?.length ?? 0)) return false;
+  if (prev.currentPosition?.lat !== next.currentPosition?.lat) return false;
+  if (prev.currentPosition?.lng !== next.currentPosition?.lng) return false;
+  if (prev.center.lat !== next.center.lat) return false;
+  if (prev.center.lng !== next.center.lng) return false;
+  return true;
+});
 
 const styles = StyleSheet.create({
   container: {

@@ -20,12 +20,13 @@ import { StatsView } from '@/components/StatsView';
 import { ProfileDrawer, type DrawerView } from '@/components/ProfileDrawer';
 import { useAppContext } from '@/lib/AppContext';
 import { formatElevation } from '@/lib/units';
-import { useLocationTracking, accuracyToStrength } from '@/lib/useLocationTracking';
+import { useLocationTracking } from '@/lib/useLocationTracking';
 import { saveRunRecord, addPendingRun, getCachedRunHistory } from '@/lib/firestore';
 import { buildGoogleMapsUrl } from '@/lib/route-export';
 import { BottomTabBar } from '@/components/BottomTabBar';
 import { Colors, Fonts } from '@/lib/theme';
-import { generateOSRMRoutes, OSRMUnavailableError, getLastFailureDiagnostics } from '@/lib/osrm';
+import { generateOSRMRoutes, OSRMUnavailableError, getLastFailureDiagnostics, haversineDistance } from '@/lib/osrm';
+import type { RoutePoint } from '@/lib/route-generator';
 import { persistOverpassCache } from '@/lib/overpass-persist';
 import { persistOSRMCache } from '@/lib/osrm-persist';
 import * as Updates from 'expo-updates';
@@ -43,6 +44,19 @@ function failureDiagSuffix(): string {
     ? ` (d=${rr.distance} b=${rr.barrier} h=${rr.highway} o=${rr.offStreet} p=${rr.pendantLoop} t=${rr.backtrack})`
     : '';
   return ` [n=${diag.osrmNullCount} q=${diag.qualityRejectCount}${qBreakdown} w=${diag.wrongDisplayCount}${diag.budgetExpired ? ' BUDGET' : ''} v=${ver}]`;
+}
+
+/** Min haversine distance from a point to any vertex on the polyline.
+ *  Vertex-only (not segment-projected) — fine for OSRM road routes which
+ *  sample vertices ~10m apart, well below the 150m off-route threshold.
+ *  Returns Infinity if the polyline is empty. */
+function pointToPolylineKm(point: RoutePoint, polyline: RoutePoint[]): number {
+  let min = Infinity;
+  for (const v of polyline) {
+    const d = haversineDistance(point, v);
+    if (d < min) min = d;
+  }
+  return min;
 }
 
 function formatTime(seconds: number): string {
@@ -75,6 +89,20 @@ export default function RunScreen() {
   useEffect(() => {
     return () => {
       if (refreshErrorTimeout.current) clearTimeout(refreshErrorTimeout.current);
+    };
+  }, []);
+
+  // Off-route indicator. Passive: shows a chip when the user has been more
+  // than 150m from the planned polyline for at least 30 continuous seconds.
+  // Doesn't change the route or stats — just tells the user. Threshold is
+  // generous enough to ignore typical detours (water fountain, traffic light)
+  // and the 30s grace prevents the chip from flickering on momentary GPS
+  // jumps or single-block deviations.
+  const [isOffRoute, setIsOffRoute] = useState(false);
+  const offRouteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    return () => {
+      if (offRouteTimerRef.current) clearTimeout(offRouteTimerRef.current);
     };
   }, []);
   const runSessionId = useRef(`run-${Date.now()}`);
@@ -121,12 +149,42 @@ export default function RunScreen() {
     transform: [{ scale: 1 + (1 - recordingPing.value) * 0.6 }],
   }));
 
-  // Update GPS strength from tracking accuracy
+  // Off-route detection: re-evaluates only when a new GPS point arrives,
+  // because tracking.stats.currentPosition is reference-stable between ticks
+  // when no new point came in (see useLocationTracking.ts perf fix).
+  const OFF_ROUTE_THRESHOLD_KM = 0.15;
+  const OFF_ROUTE_GRACE_MS = 30000;
   useEffect(() => {
-    if (tracking.stats.accuracy !== null) {
-      ctx.setGpsStrength(accuracyToStrength(tracking.stats.accuracy));
+    const pos = tracking.stats.currentPosition;
+    const route = ctx.selectedRoute?.points;
+    if (!isRunning || !pos || !route || route.length < 2) {
+      if (offRouteTimerRef.current) {
+        clearTimeout(offRouteTimerRef.current);
+        offRouteTimerRef.current = null;
+      }
+      if (isOffRoute) setIsOffRoute(false);
+      return;
     }
-  }, [tracking.stats.accuracy]);
+    const distance = pointToPolylineKm(pos, route);
+    if (distance > OFF_ROUTE_THRESHOLD_KM) {
+      // Off route — start the grace timer if not already running and not
+      // already showing the chip. This is what enforces the 30s of continuous
+      // deviation before we surface the indicator.
+      if (!offRouteTimerRef.current && !isOffRoute) {
+        offRouteTimerRef.current = setTimeout(() => {
+          setIsOffRoute(true);
+          offRouteTimerRef.current = null;
+        }, OFF_ROUTE_GRACE_MS);
+      }
+    } else {
+      // Back on route — drop the indicator and cancel any pending arming.
+      if (offRouteTimerRef.current) {
+        clearTimeout(offRouteTimerRef.current);
+        offRouteTimerRef.current = null;
+      }
+      if (isOffRoute) setIsOffRoute(false);
+    }
+  }, [tracking.stats.currentPosition, ctx.selectedRoute, isRunning, isOffRoute]);
 
   const handleStart = useCallback(async () => {
     setRunState('running');
@@ -439,7 +497,7 @@ export default function RunScreen() {
             )}
           </View>
 
-          {/* Center: recording indicator */}
+          {/* Center: recording indicator + off-route chip */}
           <View style={styles.headerCenter}>
             {hasStarted && (
               <View style={styles.headerChip}>
@@ -448,6 +506,12 @@ export default function RunScreen() {
                   <View style={styles.recordingDot} />
                 </View>
                 <Text style={styles.recordingLabel}>{isPaused ? 'PAUSED' : 'RECORDING'}</Text>
+              </View>
+            )}
+            {isOffRoute && (
+              <View style={styles.offRouteChip}>
+                <Ionicons name="alert-circle" size={12} color={Colors.warning} />
+                <Text style={styles.offRouteLabel}>OFF ROUTE</Text>
               </View>
             )}
           </View>
@@ -499,36 +563,20 @@ export default function RunScreen() {
           {ctx.routes.length >= 1 && !hasStarted && (
             <View style={styles.routeSelector}>
               <Text style={styles.routeCounter}>
-                {(() => {
-                  const r = ctx.selectedRoute;
-                  const ver = (Updates.updateId ?? 'embedded').slice(0, 8);
-                  // id format now: route-{i}-g{N}-r{0|1}-{timestamp}-{rand}
-                  // i=cand index, g=green-pool size, r=refresh flag (1 = refresh,
-                  // 0 = initial), a=anchor count of winning candidate.
-                  // What the values mean together:
-                  //   g=0           → Overpass returned no greens (radius/network)
-                  //   g>0 a=0       → greens exist but corridor filter rejected them
-                  //   r=0 a=0 i=0   → initial generate, direct route won (expected)
-                  //   r=1 a=0 i=0   → refresh, candidate 0 won with no anchors
-                  //                   (means my fix is running but greens unusable)
-                  const m = r?.id?.match(/^route-(\d+)-g(\d+)-r([01])-/);
-                  const i = m ? m[1] : '?';
-                  const g = m ? m[2] : '?';
-                  const rfl = m ? m[3] : '?';
-                  const a = r?.anchorPoints?.length ?? 0;
-                  return `${r?.name || 'Route'} · v=${ver} · i=${i} · a=${a} · g=${g} · r=${rfl}`;
-                })()}
+                {ctx.selectedRoute?.name || 'Route'}
               </Text>
               <View style={styles.routeActions}>
-                <Pressable
-                  onPress={handleRefresh}
-                  disabled={ctx.isGenerating}
-                  hitSlop={8}
-                  style={[styles.routeActionBtn, ctx.isGenerating && { opacity: 0.4 }]}
-                  accessibilityLabel="Generate a different route"
-                >
-                  <Ionicons name="refresh" size={18} color={Colors.mutedForeground} />
-                </Pressable>
+                {ctx.routeStyle !== 'point-to-point' && (
+                  <Pressable
+                    onPress={handleRefresh}
+                    disabled={ctx.isGenerating}
+                    hitSlop={8}
+                    style={[styles.routeActionBtn, ctx.isGenerating && { opacity: 0.4 }]}
+                    accessibilityLabel="Generate a different route"
+                  >
+                    <Ionicons name="refresh" size={18} color={Colors.mutedForeground} />
+                  </Pressable>
+                )}
                 <Pressable onPress={handleToggleFavorite} hitSlop={8} style={styles.routeActionBtn}>
                   <Ionicons
                     name={isFavorited ? 'heart' : 'heart-outline'}
@@ -611,6 +659,7 @@ const styles = StyleSheet.create({
   },
   headerCenter: {
     alignItems: 'center',
+    gap: 6,
   },
   headerBtn: {
     flexDirection: 'row',
@@ -653,6 +702,21 @@ const styles = StyleSheet.create({
     fontFamily: Fonts.sansBold,
     fontSize: 12,
     color: Colors.destructive,
+    letterSpacing: 1.5,
+  },
+  offRouteChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: Colors.card + '99',
+    borderRadius: 9999,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+  },
+  offRouteLabel: {
+    fontFamily: Fonts.sansBold,
+    fontSize: 11,
+    color: Colors.warning,
     letterSpacing: 1.5,
   },
   headerActions: {
