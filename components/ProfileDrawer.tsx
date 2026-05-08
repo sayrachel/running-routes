@@ -126,10 +126,23 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
     }
   };
 
-  const handleLogout = async () => {
-    await ctx.signOutUser();
-    onClose();
-    router.replace('/landing');
+  const handleLogout = () => {
+    Alert.alert(
+      'Log Out?',
+      "You'll need to sign in again to access your favorites and run history.",
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Log Out',
+          style: 'destructive',
+          onPress: async () => {
+            await ctx.signOutUser();
+            onClose();
+            router.replace('/landing');
+          },
+        },
+      ],
+    );
   };
 
   const handleDelete = () => {
