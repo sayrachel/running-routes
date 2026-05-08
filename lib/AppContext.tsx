@@ -127,7 +127,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [prefs, setPrefsRaw] = useState<RunPreferences>({
     lowTraffic: true,
     units: 'imperial',
-    voicePrompts: true,
+    voicePrompts: false,
     hapticPrompts: true,
   });
 
@@ -149,7 +149,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setPrefsRaw((prev) => ({
           ...prev,
           units: map.get(UNITS_STORAGE_KEY) === 'metric' ? 'metric' : prev.units,
-          voicePrompts: map.get(VOICE_PROMPTS_KEY) === '0' ? false : prev.voicePrompts,
+          voicePrompts: map.get(VOICE_PROMPTS_KEY) === '1' ? true : map.get(VOICE_PROMPTS_KEY) === '0' ? false : prev.voicePrompts,
           hapticPrompts: map.get(HAPTIC_PROMPTS_KEY) === '0' ? false : prev.hapticPrompts,
         }));
       })
