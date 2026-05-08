@@ -190,6 +190,54 @@ export async function deleteUserData(userId: string): Promise<void> {
   ]).catch(() => {});
 }
 
+// ─── Guest → Authenticated Migration ────────────────────────
+
+/** Push a guest user's local favorites + run history up to Firestore
+ *  under the new authenticated uid. Called immediately after a guest
+ *  upgrades via Apple Sign-In. Both arrays are best-effort: failures
+ *  are counted and reported but don't abort the rest of the migration.
+ *  Returns counts so the caller can surface a "Synced N runs and M
+ *  favorites" message. */
+export async function migrateGuestDataToFirestore(
+  userId: string,
+  favorites: { routeName: string; distance: number; terrain: 'Loop' | 'Out & Back' | 'Point to Point'; lat: number; lng: number; points?: { lat: number; lng: number }[]; createdAt?: number }[],
+  runHistory: Omit<RunRecord, 'id'>[],
+): Promise<{ favoritesUploaded: number; runsUploaded: number; failures: number }> {
+  let favoritesUploaded = 0;
+  let runsUploaded = 0;
+  let failures = 0;
+
+  for (const fav of favorites) {
+    try {
+      await addFavoriteRoute(userId, {
+        routeName: fav.routeName,
+        distance: fav.distance,
+        terrain: fav.terrain,
+        lat: fav.lat,
+        lng: fav.lng,
+        points: fav.points,
+        createdAt: fav.createdAt ?? Date.now(),
+      });
+      favoritesUploaded++;
+    } catch {
+      failures++;
+    }
+  }
+
+  for (const run of runHistory) {
+    try {
+      // Strip the local-only `id` field if present (Firestore generates its own).
+      const { id: _id, ...runFields } = run as RunRecord;
+      await saveRunRecord(userId, runFields);
+      runsUploaded++;
+    } catch {
+      failures++;
+    }
+  }
+
+  return { favoritesUploaded, runsUploaded, failures };
+}
+
 // ─── Pending Run Queue (offline) ─────────────────────────────
 
 export async function addPendingRun(

@@ -12,7 +12,7 @@ import Animated, {
 } from 'react-native-reanimated';
 import { useAppContext, type FavoriteRoute } from '@/lib/AppContext';
 export type { FavoriteRoute };
-import { getRunHistory, getCachedRunHistory } from '@/lib/firestore';
+import { getRunHistory, getCachedRunHistory, migrateGuestDataToFirestore } from '@/lib/firestore';
 import type { RunRecord } from '@/lib/types';
 import { Colors, Fonts } from '@/lib/theme';
 import { distanceUnit, paceUnit } from '@/lib/units';
@@ -59,6 +59,11 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
   const translateX = useSharedValue(SCREEN_WIDTH);
   const [mounted, setMounted] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
+  // Guest = signed in via "Continue as Guest" but no Firebase auth.
+  // Drives whether the bottom row of the profile menu reads "Sign In to
+  // Sync" (guest, primary tone) or "Log Out" (authenticated, destructive).
+  const isGuest = !ctx.firebaseUid;
   const [view, setView] = useState<DrawerView>('profile');
   const [selectedRun, setSelectedRun] = useState<RunRecord | null>(null);
   const [runHistory, setRunHistory] = useState<RunRecord[]>([]);
@@ -124,6 +129,65 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
     } else {
       onClose();
     }
+  };
+
+  // Promote a guest session into a real Firebase account. Snapshot local
+  // data BEFORE Apple Sign-In so the favorites Firestore listener (which
+  // fires on auth and replaces ctx.favorites with the empty new account)
+  // doesn't wipe our reference. Then upload everything under the new uid;
+  // the listener catches up and the in-memory state syncs back.
+  const handleSignInToSync = async () => {
+    if (isSyncing) return;
+
+    const localFavorites = ctx.favorites.map((f) => ({
+      routeName: f.routeName,
+      distance: f.distance,
+      terrain: f.terrain,
+      lat: f.lat,
+      lng: f.lng,
+      points: f.points,
+      createdAt: f.createdAt,
+    }));
+    const localHistory = await getCachedRunHistory();
+
+    setIsSyncing(true);
+    let user: { uid: string } | null = null;
+    try {
+      user = await ctx.signInWithApple();
+    } catch (err) {
+      setIsSyncing(false);
+      Alert.alert('Sign In Failed', "Couldn't sign in with Apple. Please try again.");
+      return;
+    }
+    if (!user) {
+      // User cancelled the Apple Sign-In sheet — silent no-op.
+      setIsSyncing(false);
+      return;
+    }
+
+    const hasLocalData = localFavorites.length > 0 || localHistory.length > 0;
+    if (!hasLocalData) {
+      setIsSyncing(false);
+      onClose();
+      return;
+    }
+
+    const result = await migrateGuestDataToFirestore(
+      user.uid,
+      localFavorites,
+      localHistory.map(({ id: _id, ...rest }) => rest),
+    );
+    setIsSyncing(false);
+
+    const parts: string[] = [];
+    if (result.runsUploaded > 0) parts.push(`${result.runsUploaded} ${result.runsUploaded === 1 ? 'run' : 'runs'}`);
+    if (result.favoritesUploaded > 0) parts.push(`${result.favoritesUploaded} ${result.favoritesUploaded === 1 ? 'favorite' : 'favorites'}`);
+    const summary = parts.length > 0 ? `Synced ${parts.join(' and ')} to your account.` : 'Signed in.';
+    const message = result.failures > 0
+      ? `${summary} ${result.failures} item${result.failures === 1 ? '' : 's'} couldn't sync — they're still on this device.`
+      : summary;
+
+    Alert.alert("You're synced!", message, [{ text: 'OK', onPress: onClose }]);
   };
 
   const handleLogout = () => {
@@ -317,26 +381,49 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
             {/* Account */}
             <Text style={styles.sectionLabel}>ACCOUNT</Text>
             <View style={styles.menuSection}>
-              <Pressable
-                onPress={handleLogout}
-                style={styles.menuRow}
-              >
-                <Ionicons name="log-out-outline" size={20} color={Colors.mutedForeground} />
-                <Text style={styles.menuLabel}>Log Out</Text>
-              </Pressable>
+              {isGuest ? (
+                // Guest: single CTA to convert local-only session into a real
+                // Firebase account. Delete Account is hidden — there's no
+                // account to delete, just local data we don't want them to
+                // accidentally wipe via this row.
+                <Pressable
+                  onPress={handleSignInToSync}
+                  disabled={isSyncing}
+                  style={styles.menuRow}
+                >
+                  {isSyncing ? (
+                    <ActivityIndicator size="small" color={Colors.primary} />
+                  ) : (
+                    <Ionicons name="cloud-upload-outline" size={20} color={Colors.primary} />
+                  )}
+                  <Text style={[styles.menuLabel, { color: Colors.primary }]}>
+                    {isSyncing ? 'Syncing…' : 'Sign In to Sync'}
+                  </Text>
+                </Pressable>
+              ) : (
+                <>
+                  <Pressable
+                    onPress={handleLogout}
+                    style={styles.menuRow}
+                  >
+                    <Ionicons name="log-out-outline" size={20} color={Colors.mutedForeground} />
+                    <Text style={styles.menuLabel}>Log Out</Text>
+                  </Pressable>
 
-              <Pressable
-                onPress={handleDelete}
-                disabled={isDeleting}
-                style={styles.menuRow}
-              >
-                {isDeleting ? (
-                  <ActivityIndicator size="small" color={Colors.destructive} />
-                ) : (
-                  <Ionicons name="trash-outline" size={20} color={Colors.destructive} />
-                )}
-                <Text style={[styles.menuLabel, { color: Colors.destructive }]}>{isDeleting ? 'Deleting...' : 'Delete Account'}</Text>
-              </Pressable>
+                  <Pressable
+                    onPress={handleDelete}
+                    disabled={isDeleting}
+                    style={styles.menuRow}
+                  >
+                    {isDeleting ? (
+                      <ActivityIndicator size="small" color={Colors.destructive} />
+                    ) : (
+                      <Ionicons name="trash-outline" size={20} color={Colors.destructive} />
+                    )}
+                    <Text style={[styles.menuLabel, { color: Colors.destructive }]}>{isDeleting ? 'Deleting...' : 'Delete Account'}</Text>
+                  </Pressable>
+                </>
+              )}
             </View>
           </ScrollView>
         ) : view === 'run-detail' ? (
