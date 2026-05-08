@@ -2423,12 +2423,20 @@ export async function generateOSRMRoutes(
   // OSRM's alternatives are the only diversification source). Null on
   // initial generate.
   excludePoints?: RoutePoint[] | null,
+  // INTERNAL: tracks retry depth for the auto-retry on quality-driven empty
+  // results. Bumped to 1 by the recursive retry call below when the first
+  // pass yielded no usable candidates. Never set by external callers.
+  _retryAttempt: number = 0,
 ): Promise<GeneratedRoute[]> {
   // Reset failure diagnostics on every call. Populated only on the path
   // that returns [] so the UI can render "n/q/w" counts in the error
   // banner. A successful generation leaves it null.
   lastFailureDiagnostics = null;
-  traceEmit('generate-start', { center, distanceKm, routeType, count, prefs, end: end ?? null });
+  traceEmit('generate-start', { center, distanceKm, routeType, count, prefs, end: end ?? null, retryAttempt: _retryAttempt });
+  // Wall-clock anchor for the retry deadline check at the bottom — bounds
+  // total time across first-pass + retry so the user can't sit on the
+  // spinner past the existing degraded ceiling.
+  const generateStartMs = Date.now();
 
   // Step 1: Fetch enriched green spaces and highway segments in a single
   // Overpass round trip (shared across all candidates).
@@ -2491,9 +2499,17 @@ export async function generateOSRMRoutes(
   // SAFETY_EXTRAS = 11 makes count(1) + extras(11) = 12, hitting the bumped
   // MAX_INTERNAL_CANDIDATES cap. Was 6 (yielding 7 candidates) before the
   // East Village dense-grid q=6 incident.
-  const SAFETY_EXTRAS = 11;
+  // On RETRY (_retryAttempt > 0): smaller pool of 6 candidates. The first
+  // pass already exhausted the 12-candidate budget; retry is a fast targeted
+  // second roll of the dice rather than another full pass. Keeps total
+  // wall-clock bounded — see RETRY_DEADLINE_MS below.
+  const SAFETY_EXTRAS = _retryAttempt === 0 ? 11 : 5;
   const candidateCount = Math.min(MAX_INTERNAL_CANDIDATES, count + SAFETY_EXTRAS);
-  const timeSeed = getSeed() % 100000;
+  // Offset the seed on retry so variant indices yield genuinely different
+  // waypoint geometry from the first pass (Date.now()-based drift typically
+  // produces different values across calls anyway, but the offset guarantees
+  // it under deterministic-seed mode and tightens the no-overlap property).
+  const timeSeed = (getSeed() + _retryAttempt * 99991) % 100000;
   type CandidateSpec = {
     variant: number;
     waypoints: RoutePoint[];
@@ -2674,7 +2690,10 @@ export async function generateOSRMRoutes(
   // well under the 18s resolution budget, big drop in burst pressure.
   // CLAUDE.md note: "Total simultaneous request count matters more than
   // per-candidate math."
-  const launchSpacingMs = osrmMockEnabled ? 0 : 150;
+  // Tighter stagger on retry — first pass already paid the burst-pressure
+  // price, retry runs fewer candidates so total in-flight requests stay
+  // low even at 75ms spacing.
+  const launchSpacingMs = osrmMockEnabled ? 0 : (_retryAttempt === 0 ? 150 : 75);
   for (let idx = 0; idx < candidates.length; idx++) {
     const c = candidates[idx];
     // Candidates with a prefetched result (p2p OSRM-alternatives slots)
@@ -3406,6 +3425,31 @@ export async function generateOSRMRoutes(
   // throttling, the algorithm gates were too tight, or geometry simply
   // couldn't fit the requested mile.
   if (topCandidates.length === 0) {
+    // Auto-retry once when the first pass yielded zero candidates due to
+    // QUALITY rejections (not pure network failure). Candidate generation is
+    // stochastic — a different timeSeed produces different waypoint shapes
+    // that may pass gates the first pass missed. The user-reported East
+    // Village 9mi case ("first generate failed, refresh worked") was exactly
+    // this: same area, same constraints, just an unlucky seed.
+    //
+    // Skip when:
+    //  - already retried (capped at 1)
+    //  - quality rejects = 0 (pure network failure; another pass hits the
+    //    same dead OSRM endpoint and just compounds the wait)
+    //  - elapsed > RETRY_DEADLINE_MS (already burned the budget — retry
+    //    would push total wall-clock past the existing degraded ceiling)
+    const elapsed = Date.now() - generateStartMs;
+    const RETRY_DEADLINE_MS = 12000;
+    if (
+      _retryAttempt === 0 &&
+      qualityRejectCount > 0 &&
+      elapsed < RETRY_DEADLINE_MS
+    ) {
+      traceEmit('auto-retry-start', { elapsed, qualityRejectCount, osrmNullCount });
+      return generateOSRMRoutes(
+        center, distanceKm, routeType, count, prefs, end, excludeAnchors, excludePoints, 1,
+      );
+    }
     lastFailureDiagnostics = {
       osrmNullCount,
       qualityRejectCount,
