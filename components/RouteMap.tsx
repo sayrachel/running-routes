@@ -1,7 +1,8 @@
 import React, { useRef, useEffect, useMemo } from 'react';
 import { View, StyleSheet } from 'react-native';
 import MapView, { Polyline, Marker } from 'react-native-maps';
-import type { GeneratedRoute, RoutePoint } from '@/lib/route-generator';
+import { Ionicons } from '@expo/vector-icons';
+import type { GeneratedRoute, RoutePoint, ManeuverStep } from '@/lib/route-generator';
 import { Colors } from '@/lib/theme';
 
 interface RouteMapProps {
@@ -12,9 +13,13 @@ interface RouteMapProps {
   gpsTrack?: RoutePoint[];
   /** Current user position during a run */
   currentPosition?: RoutePoint | null;
+  /** When set, a directional arrow marker is rendered at the next maneuver
+   *  point — the visual half of turn-by-turn navigation. Pass null when no
+   *  step is active (idle / finished / between routes / off-route). */
+  nextManeuver?: ManeuverStep | null;
 }
 
-function RouteMapImpl({ center, routes, selectedRouteId, gpsTrack, currentPosition }: RouteMapProps) {
+function RouteMapImpl({ center, routes, selectedRouteId, gpsTrack, currentPosition, nextManeuver }: RouteMapProps) {
   const selectedRoute = routes.find((r) => r.id === selectedRouteId) ?? null;
 
   // Convert {lat, lng} → {latitude, longitude} once per route/track change.
@@ -144,6 +149,25 @@ function RouteMapImpl({ center, routes, selectedRouteId, gpsTrack, currentPositi
             </View>
           </View>
         </Marker>
+
+        {nextManeuver && (
+          <Marker
+            coordinate={{ latitude: nextManeuver.location.lat, longitude: nextManeuver.location.lng }}
+            anchor={{ x: 0.5, y: 0.5 }}
+            // Stable id so the marker is reused (not re-mounted) when the
+            // maneuver is the same step across renders. Coord-based key
+            // means a different step gets a fresh marker.
+            identifier={`maneuver-${nextManeuver.location.lat.toFixed(5)},${nextManeuver.location.lng.toFixed(5)}`}
+          >
+            <View style={styles.maneuverContainer}>
+              <Ionicons
+                name={iconForManeuver(nextManeuver)}
+                size={18}
+                color={Colors.primaryForeground}
+              />
+            </View>
+          </Marker>
+        )}
       </MapView>
 
       {routes.length === 0 && !gpsTrack?.length && (
@@ -169,8 +193,25 @@ export const RouteMap = React.memo(RouteMapImpl, (prev, next) => {
   if (prev.currentPosition?.lng !== next.currentPosition?.lng) return false;
   if (prev.center.lat !== next.center.lat) return false;
   if (prev.center.lng !== next.center.lng) return false;
+  // Re-render when the next-maneuver target changes (different turn point)
+  // or when it appears/disappears (started/stopped running, off-route flip).
+  if ((prev.nextManeuver?.location.lat ?? null) !== (next.nextManeuver?.location.lat ?? null)) return false;
+  if ((prev.nextManeuver?.location.lng ?? null) !== (next.nextManeuver?.location.lng ?? null)) return false;
   return true;
 });
+
+function iconForManeuver(step: ManeuverStep): React.ComponentProps<typeof Ionicons>['name'] {
+  const m = step.modifier ?? '';
+  if (m === 'uturn') return 'return-down-back';
+  if (m === 'sharp left') return 'arrow-back';
+  if (m === 'sharp right') return 'arrow-forward';
+  if (m === 'slight left' || m === 'left') return 'arrow-back-outline';
+  if (m === 'slight right' || m === 'right') return 'arrow-forward-outline';
+  if (m === 'straight') return 'arrow-up-outline';
+  if (step.type === 'fork') return 'git-branch-outline';
+  if (step.type === 'roundabout' || step.type === 'rotary') return 'sync-outline';
+  return 'arrow-up-outline';
+}
 
 const styles = StyleSheet.create({
   container: {
@@ -235,6 +276,20 @@ const styles = StyleSheet.create({
     backgroundColor: '#00BFFF',
     borderWidth: 3,
     borderColor: Colors.background,
+  },
+  maneuverContainer: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: Colors.primary,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 2,
+    borderColor: Colors.background,
+    shadowColor: '#000',
+    shadowOpacity: 0.3,
+    shadowRadius: 4,
+    shadowOffset: { width: 0, height: 2 },
   },
   emptyOverlay: {
     ...StyleSheet.absoluteFillObject,

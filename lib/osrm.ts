@@ -1,4 +1,4 @@
-import type { RoutePoint, GeneratedRoute, RoutePreferences } from './route-generator';
+import type { RoutePoint, GeneratedRoute, RoutePreferences, ManeuverStep } from './route-generator';
 import { fetchGreenSpacesAndHighways } from './overpass';
 import type { GreenSpace } from './overpass';
 import { scoreRoute, computeGreenSpaceProximity, computeRunPathProximity, computeHighwayProximity, computeWaterfrontProximity, countStartPasses, reversalCount, turnCount } from './route-scoring';
@@ -1508,6 +1508,15 @@ interface OSRMStep {
     coordinates: [number, number][];
     type: string;
   };
+  /** OSRM maneuver schema — only the fields the turn-by-turn UI consumes.
+   *  `location` is [lng, lat] (GeoJSON convention). `type` covers
+   *  turn/depart/arrive/continue/fork/etc.; `modifier` (left/right/sharp
+   *  left/...) is absent for depart/arrive. */
+  maneuver?: {
+    type: string;
+    modifier?: string;
+    location: [number, number];
+  };
 }
 
 interface OSRMLeg {
@@ -1545,6 +1554,11 @@ interface ResolvedCandidate {
    *  rejection. Geometric step-3.5 fallback assigns a high penalty so it
    *  loses to any real candidate. */
   qualityPenalty: number;
+  /** OSRM maneuver list flattened from all legs. Attached to the final
+   *  GeneratedRoute so the in-run banner / voice prompts / map arrow can
+   *  drive turn-by-turn without a fresh routing call. Undefined for the
+   *  step-3.5 geometric fallback when steps weren't fetched. */
+  steps?: ManeuverStep[];
 }
 
 /**
@@ -2343,6 +2357,35 @@ export function pickRouteName(
   return pool[Math.abs((index + Math.floor(lat * 10)) % pool.length)];
 }
 
+/**
+ * Flatten an OSRMRoute's legs into a single ManeuverStep[] for the in-run
+ * turn-by-turn UI. Drops `depart` (origin isn't a maneuver to announce) and
+ * `arrive` (destination isn't either — the run is already finishing). What
+ * remains is the actual list of turns/forks the user needs to make. Returns
+ * undefined when the route has no maneuver data so callers can branch on
+ * "passive tracing only".
+ */
+export function extractManeuvers(osrmRoute: OSRMRoute): ManeuverStep[] | undefined {
+  if (!osrmRoute.legs || osrmRoute.legs.length === 0) return undefined;
+  const out: ManeuverStep[] = [];
+  for (const leg of osrmRoute.legs) {
+    for (const step of leg.steps) {
+      if (!step.maneuver) continue;
+      const t = step.maneuver.type;
+      if (t === 'arrive' || t === 'depart') continue;
+      const [lng, lat] = step.maneuver.location;
+      out.push({
+        type: t,
+        modifier: step.maneuver.modifier,
+        location: { lat, lng },
+        name: step.name ?? '',
+        distanceM: step.distance,
+      });
+    }
+  }
+  return out.length > 0 ? out : undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Main route generation pipeline
 // ---------------------------------------------------------------------------
@@ -2988,7 +3031,7 @@ export async function generateOSRMRoutes(
       // wrong-display fallback pool so the algorithm has something to return
       // even when geometry simply can't fit the requested mile (LES 6mi-
       // sized cases).
-      const candidateRecord: ResolvedCandidate = { index: i, variant: candidates[i].variant, points, distKm, estimatedTime, fromOSRM: true, anchors: candidates[i].anchors, qualityPenalty };
+      const candidateRecord: ResolvedCandidate = { index: i, variant: candidates[i].variant, points, distKm, estimatedTime, fromOSRM: true, anchors: candidates[i].anchors, qualityPenalty, steps: extractManeuvers(osrmRoute) };
       const adjustUnitsForCheck = useAdjustment ? adjustUnits : null;
       if (adjustUnitsForCheck && !roundedDisplayMatches(distKm, distanceKm, adjustUnitsForCheck)) {
         wrongDisplayFallback.push(candidateRecord);
@@ -3200,6 +3243,7 @@ export async function generateOSRMRoutes(
           fromOSRM: true,
           anchors: [],
           qualityPenalty: 0.5, // step-3.5 emergency fallback — no anchors, but real OSRM geometry
+          steps: extractManeuvers(chosen.route),
         };
         // Same right-display gate as step 3. If the bearing trials couldn't
         // converge to the requested mile/km, send the result to the wrong-
@@ -3401,6 +3445,7 @@ export async function generateOSRMRoutes(
       difficulty,
       anchorPoints: candidate.anchors.map((a) => a.point),
       routeStyle: routeType,
+      steps: candidate.steps,
     };
   });
 }

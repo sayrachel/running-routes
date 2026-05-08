@@ -16,6 +16,8 @@ import type { FavoriteRouteRecord } from './types';
 
 const DISTANCE_STORAGE_KEY = '@running_routes_last_distance_v3';
 const UNITS_STORAGE_KEY = '@running_routes_units';
+const VOICE_PROMPTS_KEY = '@running_routes_voice_prompts';
+const HAPTIC_PROMPTS_KEY = '@running_routes_haptic_prompts';
 
 export type RouteStyle = 'loop' | 'point-to-point' | 'out-and-back';
 
@@ -28,6 +30,10 @@ export interface User {
 export interface RunPreferences {
   lowTraffic: boolean;
   units: UnitSystem;
+  /** Speak turn-by-turn prompts during the run. Default ON. */
+  voicePrompts: boolean;
+  /** Vibrate at each maneuver point during the run. Default ON. */
+  hapticPrompts: boolean;
 }
 
 export interface FavoriteRoute {
@@ -121,21 +127,33 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [prefs, setPrefsRaw] = useState<RunPreferences>({
     lowTraffic: true,
     units: 'imperial',
+    voicePrompts: true,
+    hapticPrompts: true,
   });
 
-  // Persist units preference
+  // Persist all toggleable prefs alongside units. Each key is independent so
+  // a partial migration (older builds only know units) won't reset the new
+  // toggles to defaults.
   const setPrefs = useCallback((v: RunPreferences) => {
     setPrefsRaw(v);
     AsyncStorage.setItem(UNITS_STORAGE_KEY, v.units).catch(() => {});
+    AsyncStorage.setItem(VOICE_PROMPTS_KEY, v.voicePrompts ? '1' : '0').catch(() => {});
+    AsyncStorage.setItem(HAPTIC_PROMPTS_KEY, v.hapticPrompts ? '1' : '0').catch(() => {});
   }, []);
 
-  // Load persisted units on mount
+  // Load persisted prefs on mount.
   useEffect(() => {
-    AsyncStorage.getItem(UNITS_STORAGE_KEY).then((val) => {
-      if (val === 'imperial' || val === 'metric') {
-        setPrefsRaw((prev) => ({ ...prev, units: val }));
-      }
-    }).catch(() => {});
+    AsyncStorage.multiGet([UNITS_STORAGE_KEY, VOICE_PROMPTS_KEY, HAPTIC_PROMPTS_KEY])
+      .then((entries) => {
+        const map = new Map(entries);
+        setPrefsRaw((prev) => ({
+          ...prev,
+          units: map.get(UNITS_STORAGE_KEY) === 'metric' ? 'metric' : prev.units,
+          voicePrompts: map.get(VOICE_PROMPTS_KEY) === '0' ? false : prev.voicePrompts,
+          hapticPrompts: map.get(HAPTIC_PROMPTS_KEY) === '0' ? false : prev.hapticPrompts,
+        }));
+      })
+      .catch(() => {});
   }, []);
   const [routes, setRoutes] = useState<GeneratedRoute[]>([]);
   const [selectedRoute, setSelectedRoute] = useState<GeneratedRoute | null>(null);

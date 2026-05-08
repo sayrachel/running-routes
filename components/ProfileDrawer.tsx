@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, Pressable, ScrollView, StyleSheet, Dimensions, Share, ActivityIndicator, Linking, Alert } from 'react-native';
+import { View, Text, Pressable, ScrollView, StyleSheet, Dimensions, Share, ActivityIndicator, Linking, Alert, Switch } from 'react-native';
 
 import { useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -17,7 +17,7 @@ import type { RunRecord } from '@/lib/types';
 import { Colors, Fonts } from '@/lib/theme';
 import { distanceUnit, paceUnit } from '@/lib/units';
 
-export type DrawerView = 'profile' | 'history' | 'favorites' | 'run-detail' | 'contact' | 'terms' | 'privacy' | 'units';
+export type DrawerView = 'profile' | 'history' | 'favorites' | 'run-detail' | 'contact' | 'terms' | 'privacy' | 'units' | 'audio';
 
 const SCREEN_WIDTH = Dimensions.get('window').width;
 
@@ -119,7 +119,7 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
     if (view === 'run-detail') {
       setView('history');
       setSelectedRun(null);
-    } else if (view === 'terms' || view === 'privacy' || view === 'units' || view === 'contact') {
+    } else if (view === 'terms' || view === 'privacy' || view === 'units' || view === 'contact' || view === 'audio') {
       setView('profile');
     } else if (view !== 'profile' && initialView && initialView !== 'profile') {
       // Opened directly to history/favorites — back closes the drawer
@@ -246,7 +246,7 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
 
   if (!mounted) return null;
 
-  const viewTitle = view === 'history' ? 'History' : view === 'favorites' ? 'Favorites' : view === 'contact' ? 'Contact Us' : view === 'terms' ? 'Terms of Service' : view === 'privacy' ? 'Privacy Policy' : view === 'units' ? 'Units' : view === 'run-detail' && selectedRun ? selectedRun.routeName : 'Settings';
+  const viewTitle = view === 'history' ? 'History' : view === 'favorites' ? 'Favorites' : view === 'contact' ? 'Contact Us' : view === 'terms' ? 'Terms of Service' : view === 'privacy' ? 'Privacy Policy' : view === 'units' ? 'Units' : view === 'audio' ? 'Voice & Haptics' : view === 'run-detail' && selectedRun ? selectedRun.routeName : 'Settings';
 
   const formatRunDate = (timestamp: number) => {
     const d = new Date(timestamp);
@@ -337,6 +337,11 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
               <Pressable style={styles.menuRow} onPress={() => setView('units')}>
                 <Ionicons name="speedometer-outline" size={20} color={Colors.mutedForeground} />
                 <Text style={styles.menuLabel}>Units</Text>
+                <Ionicons name="chevron-forward" size={16} color={Colors.mutedForeground} />
+              </Pressable>
+              <Pressable style={styles.menuRow} onPress={() => setView('audio')}>
+                <Ionicons name="volume-medium-outline" size={20} color={Colors.mutedForeground} />
+                <Text style={styles.menuLabel}>Voice & Haptics</Text>
                 <Ionicons name="chevron-forward" size={16} color={Colors.mutedForeground} />
               </Pressable>
             </View>
@@ -455,6 +460,46 @@ export function ProfileDrawer({ visible, onClose, onPreviewFavorite, initialView
                   <Ionicons name="checkmark" size={20} color={Colors.primary} />
                 )}
               </Pressable>
+            </View>
+          </ScrollView>
+        ) : view === 'audio' ? (
+          <ScrollView
+            style={styles.scrollContent}
+            contentContainerStyle={styles.scrollContentInner}
+            showsVerticalScrollIndicator={false}
+          >
+            <Text style={styles.sectionLabel}>DURING A RUN</Text>
+            <View style={styles.menuSection}>
+              <View style={styles.menuRow}>
+                <Ionicons name="megaphone-outline" size={20} color={Colors.mutedForeground} />
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.menuLabel}>Voice prompts</Text>
+                  <Text style={styles.menuSublabel}>
+                    Spoken turn-by-turn directions through your headphones
+                  </Text>
+                </View>
+                <Switch
+                  value={ctx.prefs.voicePrompts}
+                  onValueChange={(v) => ctx.setPrefs({ ...ctx.prefs, voicePrompts: v })}
+                  trackColor={{ false: Colors.muted, true: Colors.primary }}
+                  thumbColor={Colors.background}
+                />
+              </View>
+              <View style={styles.menuRow}>
+                <Ionicons name="phone-portrait-outline" size={20} color={Colors.mutedForeground} />
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.menuLabel}>Haptic buzz at turns</Text>
+                  <Text style={styles.menuSublabel}>
+                    Short vibration when you reach each maneuver
+                  </Text>
+                </View>
+                <Switch
+                  value={ctx.prefs.hapticPrompts}
+                  onValueChange={(v) => ctx.setPrefs({ ...ctx.prefs, hapticPrompts: v })}
+                  trackColor={{ false: Colors.muted, true: Colors.primary }}
+                  thumbColor={Colors.background}
+                />
+              </View>
             </View>
           </ScrollView>
         ) : view === 'contact' ? (
@@ -851,6 +896,12 @@ const styles = StyleSheet.create({
     fontFamily: Fonts.sansSemiBold,
     fontSize: 14,
     color: Colors.foreground,
+  },
+  menuSublabel: {
+    fontFamily: Fonts.sans,
+    fontSize: 12,
+    color: Colors.mutedForeground,
+    marginTop: 2,
   },
   menuValue: {
     fontFamily: Fonts.sans,

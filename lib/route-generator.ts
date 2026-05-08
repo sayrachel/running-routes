@@ -3,6 +3,26 @@ export interface RoutePoint {
   lng: number
 }
 
+/** Compact representation of an OSRM maneuver step, attached to a route so
+ *  the in-run turn-by-turn UI doesn't need a fresh routing call. Stripped
+ *  before persisting to firestore (regenerable, large). */
+export interface ManeuverStep {
+  /** Type of maneuver: "turn", "depart", "arrive", "continue", "fork", etc.
+   *  See OSRM step maneuver schema. */
+  type: string
+  /** Direction of the turn: "left" | "right" | "sharp left" | etc. Absent for
+   *  depart/arrive. */
+  modifier?: string
+  /** Coordinate of the maneuver point (where the turn happens). */
+  location: RoutePoint
+  /** Street name OSM has for this step. Empty string when unnamed (frequent
+   *  on park paths and pedestrian alleys); UI falls back to a bare turn icon. */
+  name: string
+  /** Distance in meters covered by THIS step (from its start to the next
+   *  maneuver). The banner uses this to compute "in X meters". */
+  distanceM: number
+}
+
 export interface GeneratedRoute {
   id: string
   name: string
@@ -20,6 +40,10 @@ export interface GeneratedRoute {
   // style. Optional because routes loaded from firestore (favorites, run
   // history) predate this field.
   routeStyle?: "loop" | "out-and-back" | "point-to-point"
+  // Turn-by-turn maneuver list, in order. Drives the in-run banner / voice
+  // prompts / map arrow. Optional because firestore-loaded routes predate it
+  // and because the run UI degrades to "passive tracing" when missing.
+  steps?: ManeuverStep[]
 }
 
 function toRad(deg: number): number {

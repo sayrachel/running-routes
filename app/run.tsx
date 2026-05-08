@@ -28,6 +28,10 @@ import { Colors, Fonts } from '@/lib/theme';
 import { generateOSRMRoutes, OSRMUnavailableError, getLastFailureDiagnostics, haversineDistance } from '@/lib/osrm';
 import { findMatchingHistoricalRoute } from '@/lib/route-history';
 import { isDevUser } from '@/lib/dev-mode';
+import { INITIAL_TURN_STATE, updateTurnByTurn, type TurnByTurnState } from '@/lib/turn-by-turn';
+import { prepareAudioSession, resetSpokenPrompts, maybeFireCues, speakOffCourse } from '@/lib/audio-cues';
+import { ManeuverBanner } from '@/components/ManeuverBanner';
+import type { ManeuverStep } from '@/lib/route-generator';
 import type { RoutePoint } from '@/lib/route-generator';
 import { persistOverpassCache } from '@/lib/overpass-persist';
 import { persistOSRMCache } from '@/lib/osrm-persist';
@@ -103,6 +107,31 @@ export default function RunScreen() {
   // jumps or single-block deviations.
   const [isOffRoute, setIsOffRoute] = useState(false);
   const offRouteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Turn-by-turn state. The internal debounce/commit state lives in a ref so
+  // GPS samples don't trigger re-renders just to update it; the UI-facing
+  // values (current step + distance) live in React state and re-render the
+  // ManeuverBanner when they change.
+  const turnStateRef = useRef<TurnByTurnState>(INITIAL_TURN_STATE);
+  const [navStep, setNavStep] = useState<ManeuverStep | null>(null);
+  const [navDistanceM, setNavDistanceM] = useState<number | null>(null);
+
+  // Audio session setup happens once per mount. Idempotent — safe even if
+  // the user never starts a run.
+  useEffect(() => {
+    prepareAudioSession();
+  }, []);
+
+  // Reset turn-by-turn state and the spoken-prompt cache whenever the route
+  // changes (initial gen, refresh, history fallback). Otherwise prompts
+  // already fired on the previous route would be marked "spoken" and the
+  // new route's identical-coord steps (rare but possible) would skip them.
+  useEffect(() => {
+    turnStateRef.current = INITIAL_TURN_STATE;
+    setNavStep(null);
+    setNavDistanceM(null);
+    resetSpokenPrompts();
+  }, [ctx.selectedRoute?.id]);
   useEffect(() => {
     return () => {
       if (offRouteTimerRef.current) clearTimeout(offRouteTimerRef.current);
@@ -188,6 +217,42 @@ export default function RunScreen() {
       if (isOffRoute) setIsOffRoute(false);
     }
   }, [tracking.stats.currentPosition, ctx.selectedRoute, isRunning, isOffRoute]);
+
+  // Turn-by-turn update on each new GPS sample. Skips when not running, when
+  // the route has no steps (mock OSRM / firestore-loaded routes), or when
+  // currently flagged off-route (banner instructions would be misleading
+  // until the user is back on track). Fires haptic + voice prompts via
+  // maybeFireCues — that helper deduplicates per step+threshold so this
+  // effect is safe to run on every GPS tick.
+  useEffect(() => {
+    const pos = tracking.stats.currentPosition;
+    const steps = ctx.selectedRoute?.steps;
+    if (!isRunning || !pos || !steps || steps.length === 0 || isOffRoute) return;
+    const result = updateTurnByTurn(turnStateRef.current, pos, tracking.stats.accuracy, steps);
+    turnStateRef.current = result.newState;
+    setNavStep(result.currentStep);
+    setNavDistanceM(result.distanceToManeuverM);
+    if (result.currentStep && result.distanceToManeuverM !== null) {
+      maybeFireCues({
+        step: result.currentStep,
+        distanceM: result.distanceToManeuverM,
+        advanced: result.advanced,
+        voiceEnabled: ctx.prefs.voicePrompts,
+        hapticEnabled: ctx.prefs.hapticPrompts,
+      });
+    }
+  }, [tracking.stats.currentPosition, tracking.stats.accuracy, ctx.selectedRoute, isRunning, isOffRoute, ctx.prefs.voicePrompts, ctx.prefs.hapticPrompts]);
+
+  // Off-course voice cue — fires once on the false→true edge of isOffRoute.
+  // The visual chip (rendered separately) stays up the whole time the user
+  // is off-route; this is the audible nudge.
+  const wasOffRouteRef = useRef(false);
+  useEffect(() => {
+    if (isOffRoute && !wasOffRouteRef.current) {
+      speakOffCourse(ctx.prefs.voicePrompts);
+    }
+    wasOffRouteRef.current = isOffRoute;
+  }, [isOffRoute, ctx.prefs.voicePrompts]);
 
   const handleStart = useCallback(async () => {
     // Optimistically flip to 'running' so the StartButton morphs immediately —
@@ -498,6 +563,7 @@ export default function RunScreen() {
               selectedRouteId={ctx.selectedRoute?.id || null}
               gpsTrack={hasStarted ? coordinates : undefined}
               currentPosition={hasStarted ? currentPosition : undefined}
+              nextManeuver={hasStarted && !isOffRoute ? navStep : null}
             />
             {/* Dark overlay to dim the map behind the bottom sheet */}
             {!hasStarted && (
@@ -556,6 +622,13 @@ export default function RunScreen() {
             </View>
           </View>
         </View>
+
+        {/* Turn-by-turn banner — only when actively running, route has step
+          * data, and we're not currently flagged off-route (instructions
+          * would be misleading until the user is back on the polyline). */}
+        {hasStarted && !isFinished && !isOffRoute && navStep && navDistanceM !== null && (
+          <ManeuverBanner step={navStep} distanceM={navDistanceM} units={ctx.prefs.units} />
+        )}
 
         {/* Return-to-summary pill — shown when finished but viewing the map */}
         {isFinished && !showStats && (
