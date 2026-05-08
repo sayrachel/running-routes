@@ -32,9 +32,10 @@ export default function LandingScreen() {
       const user = await ctx.signInWithApple();
       if (user) {
         handleSuccess();
-      } else {
-        setError('Sign-in was cancelled. Please try again.');
       }
+      // null = user dismissed the Apple sheet (intentional cancel). Silent
+      // no-op — surfacing this as an error misled users who deliberately
+      // backed out and made the screen feel broken.
     } catch (err: any) {
       const msg = err?.message || 'Apple sign-in failed. Please try again.';
       setError(msg);

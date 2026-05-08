@@ -5,6 +5,19 @@ import type { RoutePoint } from './route-generator';
 
 const BACKGROUND_LOCATION_TASK = 'background-location-tracking';
 
+/** Thrown by `startTracking` when the user denies the foreground location
+ *  permission. Caller should surface a permission alert rather than letting
+ *  the run start silently — the recording chip would tick with no GPS data
+ *  captured, which historically led users to finish a 30-min run with 0.0 km
+ *  recorded. Distinct from generic errors (web/native unavailability) so the
+ *  caller can branch on it. */
+export class LocationPermissionDeniedError extends Error {
+  constructor() {
+    super('Location permission denied');
+    this.name = 'LocationPermissionDeniedError';
+  }
+}
+
 /** Haversine distance in km */
 function haversineDistance(p1: RoutePoint, p2: RoutePoint): number {
   const R = 6371;
@@ -230,8 +243,7 @@ export function useLocationTracking() {
     // Request permissions
     const { status: fgStatus } = await Location.requestForegroundPermissionsAsync();
     if (fgStatus !== 'granted') {
-      console.warn('Foreground location permission denied');
-      return;
+      throw new LocationPermissionDeniedError();
     }
 
     // Start foreground watching

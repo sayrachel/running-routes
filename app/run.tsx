@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { View, Text, Pressable, StyleSheet, Linking, ActivityIndicator } from 'react-native';
+import { View, Text, Pressable, StyleSheet, Linking, ActivityIndicator, Alert } from 'react-native';
 import { BlurView } from 'expo-blur';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as StoreReview from 'expo-store-review';
@@ -20,7 +20,7 @@ import { StatsView } from '@/components/StatsView';
 import { ProfileDrawer, type DrawerView } from '@/components/ProfileDrawer';
 import { useAppContext } from '@/lib/AppContext';
 import { formatElevation } from '@/lib/units';
-import { useLocationTracking } from '@/lib/useLocationTracking';
+import { useLocationTracking, LocationPermissionDeniedError } from '@/lib/useLocationTracking';
 import { saveRunRecord, addPendingRun, getCachedRunHistory } from '@/lib/firestore';
 import { buildGoogleMapsUrl } from '@/lib/route-export';
 import { BottomTabBar } from '@/components/BottomTabBar';
@@ -187,11 +187,27 @@ export default function RunScreen() {
   }, [tracking.stats.currentPosition, ctx.selectedRoute, isRunning, isOffRoute]);
 
   const handleStart = useCallback(async () => {
+    // Optimistically flip to 'running' so the StartButton morphs immediately —
+    // the permission prompt below can take 1–3 seconds the first time. Revert
+    // on failure so the user isn't left with a recording chip pulsing over a
+    // run that was never actually tracking.
     setRunState('running');
     try {
       await tracking.startTracking();
-    } catch {
-      // Location tracking may not be available (e.g. on web)
+    } catch (err) {
+      setRunState('idle');
+      if (err instanceof LocationPermissionDeniedError) {
+        Alert.alert(
+          'Location Access Needed',
+          'Run Routes needs location access to track your run. Enable it in Settings to continue.',
+          [
+            { text: 'Cancel', style: 'cancel' },
+            { text: 'Open Settings', onPress: () => Linking.openSettings() },
+          ],
+        );
+        return;
+      }
+      console.warn('Tracking start failed:', err);
     }
   }, [tracking]);
 
