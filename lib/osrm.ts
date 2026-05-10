@@ -421,7 +421,14 @@ export function overlapSegmentRatio(
  */
 export function trimPendantLoops(points: RoutePoint[]): RoutePoint[] {
   if (points.length < 5) return points;
-  const MAX_PASSES = 8;
+  // 2 passes (down from 8). Even with per-pass body caps, real OSRM closed
+  // loops in dense grids expose nested "exit street → small loop → return
+  // street" patterns. Each pass looks innocuous (~150-250m body) but 8
+  // passes compound to 60% of the route gone — East Village 3mi went from
+  // 4.75km to 1.85km that way and got distance-rejected. Two passes cover
+  // the legitimate multi-pendant case (the test fixture has two stacked
+  // pendants) without leaving headroom for nested-pattern cascade.
+  const MAX_PASSES = 2;
   let current = points;
   for (let pass = 0; pass < MAX_PASSES; pass++) {
     const next = trimOnePendantLoop(current);
@@ -433,12 +440,50 @@ export function trimPendantLoops(points: RoutePoint[]): RoutePoint[] {
 
 function trimOnePendantLoop(points: RoutePoint[]): RoutePoint[] {
   const TOL_KM = 0.020;
+  // Bridge edge must be a real path segment, not OSRM's input-to-snap closure
+  // noise. For a closed-loop request OSRM emits geometry as
+  // [input, snap, ...loop body..., snap, input] where the snap point is
+  // OSRM's nearest-road projection of the (identical) start/end input. The
+  // first edge (input→snap) is sub-meter to ~5m and the last edge (snap→input)
+  // mirrors it — exactly the bridge-in/bridge-out signature this detector
+  // looks for, but with the entire loop as the "body". Without this guard the
+  // (i=0, j=N-2) match cuts the polyline down to a single point. Any real
+  // pendant loop has a bridge that's a real edge (typically 50m+); requiring
+  // bridge ≥ TOL_KM (20m) excludes the snap noise without missing real cases.
+  const MIN_BRIDGE_KM = TOL_KM;
+  // Body cap. The detector's job is to remove SMALL aesthetic stubs —
+  // a square hanging off a stem. When the body is most of the route, what
+  // looks like "a pendant attached to a stem" is actually "the entire loop
+  // attached to a short connector street to the user's start". Closed-loop
+  // routes naturally have this pattern: exit street (50-150m) → big loop →
+  // return on the same street. Trimming would strip the loop and leave just
+  // the exit-street segment — exactly the East Village 3mi failure mode where
+  // the algorithm reported "no routes found" because every candidate's body
+  // exceeded the implicit cap of "infinity" and got chopped to start-only.
+  //
+  // A real aesthetic pendant is bounded — a single block-perimeter square is
+  // ~700m but most observed pendants are 200-400m. Fraction-only caps don't
+  // hold up against MAX_PASSES iteration: the first cut shrinks the route,
+  // the next pass's body-fraction recomputes against the smaller total, and
+  // the same exit-street-then-loop pattern fires again, cascading until the
+  // route is gone. We require BOTH a fraction cap AND an absolute cap so the
+  // pass-N body has to clear an absolute floor regardless of denominator.
+  const MAX_BODY_FRAC = 0.30;
+  const MAX_BODY_KM = 0.300;
   const MIN_BODY_SEGS = 2;
+  let totalKm = 0;
+  for (let k = 1; k < points.length; k++) totalKm += haversineDistance(points[k - 1], points[k]);
   for (let i = 0; i < points.length - 1; i++) {
     for (let j = i + 1 + MIN_BODY_SEGS; j < points.length - 1; j++) {
       const startMatches = haversineDistance(points[i], points[j + 1]) < TOL_KM;
       const endMatches = haversineDistance(points[i + 1], points[j]) < TOL_KM;
       if (startMatches && endMatches) {
+        const bridgeKm = haversineDistance(points[i], points[i + 1]);
+        if (bridgeKm < MIN_BRIDGE_KM) continue;
+        let bodyKm = 0;
+        for (let k = i + 1; k < j; k++) bodyKm += haversineDistance(points[k], points[k + 1]);
+        if (bodyKm > MAX_BODY_KM) continue;
+        if (totalKm > 0 && bodyKm / totalKm > MAX_BODY_FRAC) continue;
         // Drop bridge-in (i→i+1), loop body (i+1..j), and bridge-out (j→j+1).
         // P[i] ≈ P[j+1] is the same intersection; we keep the first copy and
         // resume from P[j+2] so the polyline reconnects without a duplicate
@@ -492,6 +537,18 @@ export function countPendantLoops(points: RoutePoint[]): number {
   // overlapSegmentRatio's 12m to absorb OSRM sub-meter wobble between
   // outbound and inbound traversals of the same street.
   const TOL_KM = 0.020;
+  // Bridge edge must be a real path segment — see trimOnePendantLoop for the
+  // full rationale. OSRM's closed-loop output looks like
+  // [input, snap, ...body..., snap, input] where (input, snap) is sub-meter
+  // to ~5m. Without the guard countPendantLoops returns 1 for every closed
+  // loop and the candidate-evaluation safety net rejects them all.
+  const MIN_BRIDGE_KM = TOL_KM;
+  // Body caps — see trimOnePendantLoop. A short connector street into a big
+  // loop has the topology of a "pendant" but the body is the route itself.
+  // Counting it as a defect would reject every closed loop whose start is
+  // not directly on the loop perimeter.
+  const MAX_BODY_FRAC = 0.30;
+  const MAX_BODY_KM = 0.300;
   // Loop body must have at least 2 segments between bridge-in and bridge-out.
   // A 1-segment body is just a degenerate stub (already caught by countStubs
   // when the U-turn is sharp). A 2+ segment body is a real polygon.
@@ -502,6 +559,8 @@ export function countPendantLoops(points: RoutePoint[]): number {
   // double-count the inner segments of a multi-segment bridge or stacked
   // pendant loops.
   const consumed = new Array<boolean>(points.length).fill(false);
+  let totalKm = 0;
+  for (let k = 1; k < points.length; k++) totalKm += haversineDistance(points[k - 1], points[k]);
 
   for (let i = 0; i < points.length - 1; i++) {
     if (consumed[i]) continue;
@@ -510,6 +569,12 @@ export function countPendantLoops(points: RoutePoint[]): number {
       const startMatches = haversineDistance(points[i], points[j + 1]) < TOL_KM;
       const endMatches = haversineDistance(points[i + 1], points[j]) < TOL_KM;
       if (startMatches && endMatches) {
+        const bridgeKm = haversineDistance(points[i], points[i + 1]);
+        if (bridgeKm < MIN_BRIDGE_KM) continue;
+        let bodyKm = 0;
+        for (let k = i + 1; k < j; k++) bodyKm += haversineDistance(points[k], points[k + 1]);
+        if (bodyKm > MAX_BODY_KM) continue;
+        if (totalKm > 0 && bodyKm / totalKm > MAX_BODY_FRAC) continue;
         count++;
         for (let k = i; k <= j; k++) consumed[k] = true;
         break;

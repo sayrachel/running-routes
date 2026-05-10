@@ -264,6 +264,43 @@ describe('countPendantLoops', () => {
     const route = [a, b, a, { lat: 40.701, lng: -73.999 }, { lat: 40.702, lng: -73.999 }];
     expect(countPendantLoops(route)).toBe(0);
   });
+
+  it('does not flag the OSRM input-to-snap closure on a closed loop', () => {
+    // OSRM emits closed-loop geometry as [input, snap, ...body..., snap, input]
+    // where the snap point is its nearest-road projection of the (identical)
+    // start/end input. The first edge (input→snap) is sub-meter to ~5m and
+    // the last edge mirrors it — exactly the bridge-in/bridge-out signature
+    // the detector looks for, with the entire loop as the "body". Without a
+    // minimum-bridge guard, every closed loop would report 1+ pendant.
+    const start = NYC;
+    const snap = destinationPoint(start, 0, 0.005); // 5m N — typical OSRM snap distance
+    // 30-point loop body between the snap points (large body, ~99% of route).
+    const body: RoutePoint[] = [];
+    for (let i = 1; i <= 30; i++) {
+      const bearing = (360 / 30) * i;
+      body.push(destinationPoint(start, bearing, 0.5));
+    }
+    const route = [start, snap, ...body, snap, start];
+    expect(countPendantLoops(route)).toBe(0);
+  });
+
+  it('does not flag a closed loop with a short connector street', () => {
+    // Real-world East Village 3mi case: the runner's start is not directly
+    // on the loop perimeter, so OSRM emits geometry like [start, ...exit
+    // street ~80m..., ...big loop..., ...return street same ~80m..., start].
+    // Topologically a "pendant" with the whole loop as the body. The detector
+    // must not count it — body fraction sees the loop is most of the route.
+    const start = NYC;
+    const exitStreetEnd = destinationPoint(start, 0, 0.080); // 80m N exit
+    // Big loop body — 4km perimeter approximated by a 30-point circle.
+    const body: RoutePoint[] = [];
+    for (let i = 1; i <= 30; i++) {
+      const bearing = (360 / 30) * i;
+      body.push(destinationPoint(exitStreetEnd, bearing, 0.6));
+    }
+    const route = [start, exitStreetEnd, ...body, exitStreetEnd, start];
+    expect(countPendantLoops(route)).toBe(0);
+  });
 });
 
 describe('trimPendantLoops', () => {
@@ -326,6 +363,61 @@ describe('trimPendantLoops', () => {
     // and in the same positions (we only excised the middle pendant).
     expect(trimmed[0]).toEqual(route[0]);
     expect(trimmed[trimmed.length - 1]).toEqual(route[route.length - 1]);
+  });
+
+  it('does not gut a closed loop with OSRM input-to-snap closure', () => {
+    // Same shape as the countPendantLoops regression test: OSRM closed-loop
+    // output looks like [input, snap, ...loop body..., snap, input]. The
+    // pre-fix trimmer matched (i=0, j=N-2) and returned 1 point, gutting
+    // the route from 4.95km to 0km. Every closed-loop candidate then failed
+    // the distance hard-reject and the user got "no routes found".
+    const start = NYC;
+    const snap = destinationPoint(start, 0, 0.005);
+    const body: RoutePoint[] = [];
+    for (let i = 1; i <= 30; i++) {
+      const bearing = (360 / 30) * i;
+      body.push(destinationPoint(start, bearing, 0.5));
+    }
+    const route = [start, snap, ...body, snap, start];
+    const trimmed = trimPendantLoops(route);
+    // The pre-fix behavior returned [start] (length 1). Anything close to
+    // the original length is fine — the point is that we don't gut it.
+    expect(trimmed.length).toBeGreaterThanOrEqual(route.length - 5);
+  });
+
+  it('does not cascade-trim a closed loop with nested exit-street patterns', () => {
+    // Real OSRM output in dense grids exposes nested "exit street → small
+    // loop → return street" patterns at multiple scales. Each pass
+    // individually looks innocuous but 8 passes compound to 60% of the
+    // route gone. Reducing MAX_PASSES to 2 caps the worst-case shrinkage at
+    // ~2 small pendants worth — enough to handle the unit-test "two stacked"
+    // case without leaving headroom for cascade.
+    // Simulated nested pattern: a closed loop with 6 small "exit-street + 1
+    // block + return" sub-patterns, each ~150m body.
+    const start = NYC;
+    const route: RoutePoint[] = [start];
+    let cur = start;
+    for (let i = 0; i < 6; i++) {
+      const exit = destinationPoint(cur, 90, 0.080);
+      const corner = destinationPoint(exit, 0, 0.075);
+      const back = destinationPoint(corner, 270, 0.075);
+      route.push(exit, corner, back, exit, cur);
+      cur = destinationPoint(cur, 90, 0.200);
+      route.push(cur);
+    }
+    route.push(start);
+    const totalKm = route.reduce(
+      (sum, _, i) => i === 0 ? 0 : sum + Math.sqrt((route[i].lat - route[i-1].lat) ** 2 + (route[i].lng - route[i-1].lng) ** 2) * 111,
+      0
+    );
+    const trimmed = trimPendantLoops(route);
+    const trimmedKm = trimmed.reduce(
+      (sum, _, i) => i === 0 ? 0 : sum + Math.sqrt((trimmed[i].lat - trimmed[i-1].lat) ** 2 + (trimmed[i].lng - trimmed[i-1].lng) ** 2) * 111,
+      0
+    );
+    // Pre-fix behavior cascaded over 8 passes and trimmed 60%+. With MAX_PASSES
+    // = 2 the cascade is bounded — at most 2 sub-patterns trimmed.
+    expect(trimmedKm / totalKm).toBeGreaterThan(0.60);
   });
 });
 
