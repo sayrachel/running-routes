@@ -16,11 +16,18 @@ Production hits the **free public** `router.project-osrm.org` endpoint. It is ra
 - **Tail latency on public OSRM is real.** Typical 200-700ms, busy 1-2s, occasional 3-5s spikes. `OSRM_TIMEOUT_MS` is currently 8s. Don't tighten it without a way to measure the resulting null-rate against real users.
 - **NEVER let the algorithm display non-OSRM geometry as a route.** The straight-line-waypoints-as-route bug (Build 21) happened because a fallback branch pushed raw input waypoints when OSRM returned null. If OSRM fails for a candidate: reject it. If all candidates fail: surface "No routes found" rather than draw lines through buildings.
 
-### Pre-flight checklist for any change that touches OSRM call patterns (volume, timeout, hedging, caching)
+### Pre-flight checklist for any change that touches OSRM call patterns (volume, timeout, hedging, caching) or quality gates
 
-1. Run `npm test` and `npm run quality -- --synthetic`. Baselines: 268/268 unit tests, 32/33 synthetic harness.
-2. **Manually generate ≥5 routes against public OSRM** from the actual app (or a dev build) before committing the change. Cover: a quick repeat (cache hit case), a fresh location (cold case), and a hard case (water-bounded grid like LES or DUMBO). If any route renders as straight lines or obviously degenerate triangles — STOP and investigate; the harness will not catch this.
-3. Don't ship a perf claim ("X% faster", "wall-clock from A to B") that wasn't measured against the production endpoint. Local/mock numbers are NOT a proxy.
+1. Run `npm test` and `npm run quality -- --synthetic`. Baselines: ~357/357 unit tests, ~59/60 synthetic harness (the 1 fail is `nyc-les-1mi-loop-quiet`, pre-existing).
+2. **Run `npm run quality:real`** — exercises every fixture against `router.project-osrm.org` and diffs against `lib/__tests__/fixtures/real-osrm-baseline.json`. Catches the harness/prod gap that `--synthetic` is structurally blind to (real-OSRM dense-grid pathologies, tail latency, rate limiting). Takes ~5 minutes (3s per fixture spacing). Exit code 1 on any regressed fixture. If a regression is real (the algorithm legitimately got worse for a fixture), fix it. If a regression is intended (the algorithm legitimately got better and the baseline is stale), refresh with `npm run quality:real:record`.
+3. **Manually generate ≥5 routes against public OSRM** from the actual app (or a dev build) before committing the change. Cover: a quick repeat (cache hit case), a fresh location (cold case), and a hard case (water-bounded grid like LES or DUMBO). If any route renders as straight lines or obviously degenerate triangles — STOP and investigate; even `quality:real` may not catch this.
+4. Don't ship a perf claim ("X% faster", "wall-clock from A to B") that wasn't measured against the production endpoint. Local/mock numbers are NOT a proxy.
+
+### Real-OSRM CI workflow
+
+- `npm run quality:real` — runs all fixtures against public OSRM, diffs metrics against the committed baseline. Per-fixture verdict is one of UNCHANGED / IMPROVED / REGRESSED / NEW / MISSING. Tolerances: ±0.30mi distance error, ±0.05 retrace/overlap, ±1.0 turns/km, ±1.0 aspect, ±0.05 PP, ±2.0 cluster. Discrete-count metrics (stubs, pendant loops, anchors) flag any change.
+- `npm run quality:real:record` — overwrites `lib/__tests__/fixtures/real-osrm-baseline.json` with current results. Run this only after a deliberate algorithm improvement; commit the new baseline alongside the algorithm change so reviewers can see the per-fixture impact.
+- The baseline is stored deterministically (rounded to 2 decimal places). Public-OSRM responses are NOT byte-stable across days, so small unrounded jitter is expected and the tolerances above are sized to absorb it.
 
 ## Key Files
 

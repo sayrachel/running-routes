@@ -1,7 +1,7 @@
 import type { RoutePoint, GeneratedRoute, RoutePreferences, ManeuverStep } from './route-generator';
 import { fetchGreenSpacesAndHighways } from './overpass';
 import type { GreenSpace } from './overpass';
-import { scoreRoute, computeGreenSpaceProximity, computeRunPathProximity, computeHighwayProximity, computeWaterfrontProximity, countStartPasses, reversalCount, turnCount, bboxAspectRatio } from './route-scoring';
+import { scoreRoute, computeGreenSpaceProximity, computeRunPathProximity, computeHighwayProximity, computeWaterfrontProximity, countStartPasses, reversalCount, turnCount, bboxAspectRatio, polsbyPopper, maxTurnDensityInWindow } from './route-scoring';
 import { emit as traceEmit } from './debug-trace';
 import { isPopularRunningPark } from './popular-running-parks';
 
@@ -48,6 +48,8 @@ export interface FailureDiagnostics {
     backtrack: number;
     aspect: number;
     turnDensity: number;
+    polsbyPopper: number;
+    turnCluster: number;
   };
 }
 let lastFailureDiagnostics: FailureDiagnostics | null = null;
@@ -2830,7 +2832,7 @@ export async function generateOSRMRoutes(
   // backtrack, or distance.
   const rejectReasons = {
     distance: 0, barrier: 0, highway: 0, offStreet: 0, pendantLoop: 0, backtrack: 0,
-    aspect: 0, turnDensity: 0,
+    aspect: 0, turnDensity: 0, polsbyPopper: 0, turnCluster: 0,
   };
   // Hard rejection only for "completely unusable" cases: distance way off,
   // crosses a clear barrier, or routes along highways. Soft thresholds on
@@ -3082,6 +3084,25 @@ export async function generateOSRMRoutes(
         traceEmit('candidate-rejected', { i, reason: 'turn-density', turnsPerKm });
         continue;
       }
+      // SOFT METRIC: Polsby-Popper isoperimetric ratio (polyline area /
+      // perimeter²). Perfect circle = 1.0; square = 0.785; long thin
+      // rectangles, snakes, through-lines fall to 0.05–0.20. Used as a
+      // qualityPenalty contributor (NOT a hard reject) because real-OSRM
+      // street-grid geometry naturally lowers PP with every sharp corner —
+      // a clean dense-grid loop in mock at PP 0.20 may correspond to a
+      // real-OSRM PP 0.10, and a hard threshold either rejects everything
+      // or catches nothing. The penalty form lets the chooser prefer
+      // higher-PP candidates without false-negatives.
+      const polsbyP = (isOutAndBack || routeType === 'point-to-point')
+        ? 1
+        : polsbyPopper(points);
+      // SOFT METRIC: localized turn cluster (max turns/km in any 500m
+      // window). Same rationale as PP — real-OSRM geometry can produce
+      // dense local windows even on healthy loops (corners cluster around
+      // intersections), so we feed this into qualityPenalty rather than
+      // hard-reject.
+      const maxTurnCluster = (isOutAndBack || distKm < 0.5) ? 0
+        : maxTurnDensityInWindow(points, 0.5);
       // Quality score: 0 = perfect, higher = worse. Out-and-back is exempt
       // from retrace/overlap. Components:
       //   retrace + overlap: visible polyline ugliness
@@ -3119,6 +3140,21 @@ export async function generateOSRMRoutes(
       // 2.6 t/km route pays ~0.06 (effectively zero, doesn't override
       // distance/anchoring). Out-and-back exempt.
       const turnPenalty = isOutAndBack ? 0 : excessTurns * 0.10;
+      // Polsby-Popper soft penalty: linear from PP=0.5 (no penalty) down
+      // to PP=0 (max 0.30 penalty). Catches "this candidate's polyline
+      // doesn't enclose meaningful area" without a hard threshold.
+      // Sized so a healthy 2:1 rect (PP ≈ 0.7) pays nothing, a squished
+      // oval (PP ≈ 0.3) pays 0.12, a snake (PP ≈ 0.1) pays 0.24.
+      // Out-and-back exempt (1-D by construction).
+      const polsbyPenalty = isOutAndBack ? 0
+        : Math.max(0, (0.5 - polsbyP) * 0.6);
+      // Localized turn cluster soft penalty. Floor at 8 t/km in any 500m
+      // window (legitimate dense intersections). Above that, 0.05 per
+      // excess t/km so a 14 t/km cluster pays 0.30, a 10 t/km cluster
+      // pays 0.10. Out-and-back exempt.
+      const clusterFloor = 8;
+      const clusterExcess = Math.max(0, maxTurnCluster - clusterFloor);
+      const clusterPenalty = isOutAndBack ? 0 : clusterExcess * 0.05;
       const qualityPenalty = Math.max(0,
         (isOutAndBack ? 0 : retraced) +
         (isOutAndBack ? 0 : overlap) +
@@ -3143,10 +3179,12 @@ export async function generateOSRMRoutes(
         // Per-km so longer routes aren't penalized for proportionally
         // more turns. ~0.05 per U-turn per km.
         reversalsPerKm * 0.05 +
-        turnPenalty -
+        turnPenalty +
+        polsbyPenalty +
+        clusterPenalty -
         anchorBonus
       );
-      traceEmit('candidate-evaluated', { i, distKm, distRatio, hwProximity, retraced, overlap, stubs, startPasses, reversalsPerKm, turnsPerKm, turnPenalty, roundingPenalty, aspectRatio, qualityPenalty });
+      traceEmit('candidate-evaluated', { i, distKm, distRatio, hwProximity, retraced, overlap, stubs, startPasses, reversalsPerKm, turnsPerKm, turnPenalty, roundingPenalty, aspectRatio, polsbyP, maxTurnCluster, qualityPenalty });
       // Final gate: rounded-display match. The user-facing distance label is
       // an integer mile (or km, in metric). A 5mi request that returns a
       // 5.6mi route shows "6 mi" — the user reads it as the wrong route even

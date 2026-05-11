@@ -15,7 +15,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { generateOSRMRoutes, retraceRatio, overlapSegmentRatio, haversineDistance, calculateSearchRadius, dumpOSRMCache, loadOSRMCache, setOSRMCacheMax, setOSRMMock, setDeterministicSeed, countStubs, countPendantLoops, setOSRMBase, clearOSRMCache } from '../osrm';
 import { fetchGreenSpacesAndHighways, dumpOverpassCaches, loadOverpassCaches, prefillOverpassCaches } from '../overpass';
-import { computeGreenSpaceProximity, turnCount, bboxAspectRatio } from '../route-scoring';
+import { computeGreenSpaceProximity, turnCount, bboxAspectRatio, polsbyPopper, maxTurnDensityInWindow } from '../route-scoring';
 import type { RoutePoint, RoutePreferences } from '../route-generator';
 import { enableTrace, flushTrace, type TraceEvent } from '../debug-trace';
 import { syntheticForCenter } from './fixtures/synthetic-green-spaces';
@@ -205,6 +205,13 @@ interface Thresholds {
   // Hard cap on turn density for loops ≥2mi. Production hard-rejects at
   // turnsPerKm > 7.0; harness threshold matches.
   maxTurnsPerKm: number;
+  // Min Polsby-Popper isoperimetric ratio. Production rejects loops < 0.15;
+  // harness threshold matches. Lower = less circular (snake, through-line,
+  // squished oval). OAB and p2p are 1-D, exempt below.
+  minPolsbyPopper: number;
+  // Max localized turn density (turns/km in any 500m sliding window).
+  // Production rejects loops > 14; harness threshold matches.
+  maxTurnClusterPerKm: number;
 }
 
 const DEFAULT_THRESHOLDS: Thresholds = {
@@ -215,6 +222,8 @@ const DEFAULT_THRESHOLDS: Thresholds = {
   maxPendantLoops: 0,
   maxAspectRatio: 5,
   maxTurnsPerKm: 7.0,
+  minPolsbyPopper: 0.15,
+  maxTurnClusterPerKm: 14,
 };
 
 interface RouteMetrics {
@@ -253,13 +262,21 @@ interface RouteMetrics {
   /** Per-reason count of how many candidates were rejected during step 3.
    *  A high `backtrack` count combined with `chosenFromFallback=true` is
    *  the smoking gun for "hard-reject too aggressive for this area". */
-  rejectionCounts: { distance: number; barrier: number; highway: number; backtrack: number; pendantLoop: number; osrmNull: number; aspect: number; turnDensity: number };
+  rejectionCounts: { distance: number; barrier: number; highway: number; backtrack: number; pendantLoop: number; osrmNull: number; aspect: number; turnDensity: number; polsbyPopper: number; turnCluster: number };
   /** Turns per km — number of ≥45° heading changes per route km. */
   turnsPerKm: number;
   /** Bbox aspect ratio: max(NS, EW) / min(NS, EW). Catches degenerate-shape
    *  loops (through-line, squished oval, snake-shape weaving). Loops only;
    *  OAB and p2p are intentionally 1-D. */
   aspectRatio: number;
+  /** Polsby-Popper isoperimetric ratio: 4π·area / perimeter². 1.0 = circle,
+   *  0.785 = square, ≤ 0.15 = degenerate (snake, through-line). Catches
+   *  shapes that bbox aspect doesn't (snake within a moderate-aspect bbox). */
+  polsbyPopper: number;
+  /** Max localized turn density: turns/km in any 500m sliding window.
+   *  Catches localized zigzag clusters that average out under global
+   *  turnsPerKm. */
+  maxTurnCluster: number;
 }
 
 interface FixtureResult {
@@ -353,6 +370,18 @@ function applyThresholds(f: Fixture, m: RouteMetrics): string[] {
       `turns/km ${m.turnsPerKm.toFixed(1)} > ${t.maxTurnsPerKm} — zigzag/staircase pattern`
     );
   }
+  // Polsby-Popper and max-turn-cluster are SOFT metrics in production
+  // (qualityPenalty contributors, not hard rejects). The harness tracks
+  // them in metrics output for visibility but doesn't fail on either —
+  // mock-OSRM smooth wobble produces PP ~0.15-0.34 even for healthy
+  // loops, and real-OSRM street-grid sharp corners drive PP lower
+  // still, so a hard threshold is either useless or false-positives
+  // legitimate routes. The penalty form lets the chooser prefer
+  // higher-PP / lower-cluster candidates without rejecting outright.
+  // `t.minPolsbyPopper` and `t.maxTurnClusterPerKm` retained for future
+  // use should we get real-OSRM PP distributions to threshold against.
+  void t.minPolsbyPopper;
+  void t.maxTurnClusterPerKm;
   // Step-3.5-fired-when-anchored check. The classic mode of regression that
   // pure metric thresholds miss: the chosen route's distance/retrace/stubs
   // can all look fine on their own, but it came from the geometric bearing-
@@ -364,7 +393,8 @@ function applyThresholds(f: Fixture, m: RouteMetrics): string[] {
     const breakdown = `backtrack=${m.rejectionCounts.backtrack}, pendant-loop=${m.rejectionCounts.pendantLoop}, ` +
       `distance=${m.rejectionCounts.distance}, barrier=${m.rejectionCounts.barrier}, ` +
       `highway=${m.rejectionCounts.highway}, osrm-null=${m.rejectionCounts.osrmNull}, ` +
-      `aspect=${m.rejectionCounts.aspect}, turn-density=${m.rejectionCounts.turnDensity}`;
+      `aspect=${m.rejectionCounts.aspect}, turn-density=${m.rejectionCounts.turnDensity}, ` +
+      `polsby-popper=${m.rejectionCounts.polsbyPopper}, turn-cluster=${m.rejectionCounts.turnCluster}`;
     failures.push(
       `step-3.5 fallback fired despite Overpass data — anchored candidates rejected (${breakdown})`
     );
@@ -466,7 +496,7 @@ async function runFixture(f: Fixture, captureTrace: boolean, useSynthetic: boole
     // the algorithm dropped to geometric bearing-trial routing because every
     // step-3 candidate was rejected. That's the "Sidestreet Shuffle" anchorless
     // rectangle pattern in the East Village 4mi screenshot.
-    const rejectionCounts = { distance: 0, barrier: 0, highway: 0, backtrack: 0, pendantLoop: 0, osrmNull: 0, aspect: 0, turnDensity: 0 };
+    const rejectionCounts = { distance: 0, barrier: 0, highway: 0, backtrack: 0, pendantLoop: 0, osrmNull: 0, aspect: 0, turnDensity: 0, polsbyPopper: 0, turnCluster: 0 };
     let chosenFromFallback = false;
     for (const e of trace) {
       if (e.event === 'fallback-start') chosenFromFallback = true;
@@ -480,6 +510,8 @@ async function runFixture(f: Fixture, captureTrace: boolean, useSynthetic: boole
         else if (reason === 'osrm-null') rejectionCounts.osrmNull++;
         else if (reason === 'aspect') rejectionCounts.aspect++;
         else if (reason === 'turn-density') rejectionCounts.turnDensity++;
+        else if (reason === 'polsby-popper') rejectionCounts.polsbyPopper++;
+        else if (reason === 'turn-cluster') rejectionCounts.turnCluster++;
       }
     }
     const metrics: RouteMetrics = {
@@ -498,6 +530,8 @@ async function runFixture(f: Fixture, captureTrace: boolean, useSynthetic: boole
       rejectionCounts,
       turnsPerKm: actualKm > 0 ? turnCount(points) / actualKm : 0,
       aspectRatio: bboxAspectRatio(points),
+      polsbyPopper: polsbyPopper(points),
+      maxTurnCluster: actualKm > 0.5 ? maxTurnDensityInWindow(points, 0.5) : 0,
     };
     const failures = applyThresholds(f, metrics);
     return {
@@ -540,6 +574,8 @@ function fmtRow(r: FixtureResult): string {
     `pend=${m.pendantLoops}  ` +
     `t/km=${m.turnsPerKm.toFixed(1)}  ` +
     `aspect=${m.aspectRatio.toFixed(1)}  ` +
+    `pp=${m.polsbyPopper.toFixed(2)}  ` +
+    `tc=${m.maxTurnCluster.toFixed(0)}  ` +
     `green=${(m.greenProximity * 100).toFixed(0)}%  ` +
     `anch=${m.anchorCount}  ` +
     `pts=${m.pointCount}`;
@@ -547,9 +583,10 @@ function fmtRow(r: FixtureResult): string {
   // happened — otherwise it's noise on every clean PASS row.
   const rc = m.rejectionCounts;
   const totalRejects = rc.distance + rc.barrier + rc.highway + rc.backtrack
-    + rc.pendantLoop + rc.osrmNull + rc.aspect + rc.turnDensity;
+    + rc.pendantLoop + rc.osrmNull + rc.aspect + rc.turnDensity
+    + rc.polsbyPopper + rc.turnCluster;
   const rejectStr = totalRejects > 0
-    ? `  rej={bt=${rc.backtrack},pl=${rc.pendantLoop},d=${rc.distance},h=${rc.highway},b=${rc.barrier},n=${rc.osrmNull},as=${rc.aspect},td=${rc.turnDensity}}`
+    ? `  rej={bt=${rc.backtrack},pl=${rc.pendantLoop},d=${rc.distance},h=${rc.highway},b=${rc.barrier},n=${rc.osrmNull},as=${rc.aspect},td=${rc.turnDensity},pp=${rc.polsbyPopper},tc=${rc.turnCluster}}`
     : '';
   const tail = r.failures.length ? `  -- ${r.failures.join('; ')}` : '';
   return `${tag}  ${dataTag}${pad(r.fixture.name, 32)}  ${summary}${rejectStr}${tail}`;
@@ -592,6 +629,145 @@ function saveSnapshot(): SnapshotCounts {
   };
   fs.writeFileSync(SNAPSHOT_PATH, JSON.stringify(snap, null, 2));
   return { enriched: snap.enriched.length, highway: snap.highway.length, osrm: osrm.routes.length };
+}
+
+// ---------------------------------------------------------------------------
+// Baseline machinery: capture a snapshot of "good" per-fixture metrics, then
+// diff a future run against it. Catches subtle regressions that pass-rate
+// alone misses — e.g. a chosen route that still passes thresholds but lost
+// 0.05 PP and gained 1.5 t/km vs the baseline. Designed for `--osrm-base`
+// against a real backend (public OSRM, local OSRM); mock OSRM is byte-stable
+// and doesn't need this.
+// ---------------------------------------------------------------------------
+
+interface BaselineEntry {
+  pass: boolean;
+  distanceMi: number;
+  retraceRatio: number;
+  overlapRatio: number;
+  stubs: number;
+  pendantLoops: number;
+  turnsPerKm: number;
+  aspectRatio: number;
+  polsbyPopper: number;
+  maxTurnCluster: number;
+  anchorCount: number;
+  chosenFromFallback: boolean;
+}
+type BaselineFile = Record<string, BaselineEntry>;
+
+function metricsToBaseline(m: RouteMetrics, pass: boolean): BaselineEntry {
+  return {
+    pass,
+    distanceMi: round2(m.distanceMi),
+    retraceRatio: round2(m.retraceRatio),
+    overlapRatio: round2(m.overlapRatio),
+    stubs: m.stubs,
+    pendantLoops: m.pendantLoops,
+    turnsPerKm: round2(m.turnsPerKm),
+    aspectRatio: round2(m.aspectRatio),
+    polsbyPopper: round2(m.polsbyPopper),
+    maxTurnCluster: round2(m.maxTurnCluster),
+    anchorCount: m.anchorCount,
+    chosenFromFallback: m.chosenFromFallback,
+  };
+}
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+interface DiffResult {
+  lines: string[];
+  regressed: number;
+  improved: number;
+  unchanged: number;
+  newFixtures: number;
+  missing: number;
+}
+
+/** Tolerances above which a per-metric change counts as regression / improvement. */
+const DIFF_TOLERANCE = {
+  distanceMi: 0.30,        // mile delta
+  retraceRatio: 0.05,
+  overlapRatio: 0.05,
+  turnsPerKm: 1.0,
+  aspectRatio: 1.0,
+  polsbyPopper: 0.05,
+  maxTurnCluster: 2.0,
+};
+
+function diffAgainstBaseline(results: FixtureResult[], baseline: BaselineFile): DiffResult {
+  const lines: string[] = [];
+  let regressed = 0, improved = 0, unchanged = 0, newFixtures = 0, missing = 0;
+  const seenInBaseline = new Set<string>();
+
+  for (const r of results) {
+    if (r.skipped || !r.metrics) continue;
+    const name = r.fixture.name;
+    const cur = metricsToBaseline(r.metrics, r.pass);
+    const base = baseline[name];
+    if (!base) {
+      lines.push(`NEW       ${pad(name, 36)}  (no baseline entry)`);
+      newFixtures++;
+      continue;
+    }
+    seenInBaseline.add(name);
+    const deltas: { tag: 'WORSE' | 'BETTER'; field: string; delta: string }[] = [];
+    const checks: { field: keyof typeof DIFF_TOLERANCE; cur: number; base: number; betterIsLower: boolean }[] = [
+      { field: 'distanceMi', cur: Math.abs(cur.distanceMi - r.fixture.distanceMi), base: Math.abs(base.distanceMi - r.fixture.distanceMi), betterIsLower: true },
+      { field: 'retraceRatio', cur: cur.retraceRatio, base: base.retraceRatio, betterIsLower: true },
+      { field: 'overlapRatio', cur: cur.overlapRatio, base: base.overlapRatio, betterIsLower: true },
+      { field: 'turnsPerKm', cur: cur.turnsPerKm, base: base.turnsPerKm, betterIsLower: true },
+      { field: 'aspectRatio', cur: cur.aspectRatio, base: base.aspectRatio, betterIsLower: true },
+      { field: 'polsbyPopper', cur: cur.polsbyPopper, base: base.polsbyPopper, betterIsLower: false },
+      { field: 'maxTurnCluster', cur: cur.maxTurnCluster, base: base.maxTurnCluster, betterIsLower: true },
+    ];
+    for (const c of checks) {
+      const tol = DIFF_TOLERANCE[c.field];
+      const delta = c.cur - c.base;
+      if (Math.abs(delta) <= tol) continue;
+      const isWorse = c.betterIsLower ? delta > 0 : delta < 0;
+      deltas.push({
+        tag: isWorse ? 'WORSE' : 'BETTER',
+        field: c.field,
+        delta: `${c.base.toFixed(2)}→${c.cur.toFixed(2)}`,
+      });
+    }
+    // Discrete-count regressions are always significant — don't apply a tolerance.
+    if (cur.stubs > base.stubs) deltas.push({ tag: 'WORSE', field: 'stubs', delta: `${base.stubs}→${cur.stubs}` });
+    else if (cur.stubs < base.stubs) deltas.push({ tag: 'BETTER', field: 'stubs', delta: `${base.stubs}→${cur.stubs}` });
+    if (cur.pendantLoops > base.pendantLoops) deltas.push({ tag: 'WORSE', field: 'pendant', delta: `${base.pendantLoops}→${cur.pendantLoops}` });
+    else if (cur.pendantLoops < base.pendantLoops) deltas.push({ tag: 'BETTER', field: 'pendant', delta: `${base.pendantLoops}→${cur.pendantLoops}` });
+    if (cur.anchorCount < base.anchorCount) deltas.push({ tag: 'WORSE', field: 'anchors', delta: `${base.anchorCount}→${cur.anchorCount}` });
+    else if (cur.anchorCount > base.anchorCount) deltas.push({ tag: 'BETTER', field: 'anchors', delta: `${base.anchorCount}→${cur.anchorCount}` });
+    if (!cur.chosenFromFallback && base.chosenFromFallback) deltas.push({ tag: 'BETTER', field: 'fallback', delta: 'true→false' });
+    else if (cur.chosenFromFallback && !base.chosenFromFallback) deltas.push({ tag: 'WORSE', field: 'fallback', delta: 'false→true' });
+    if (cur.pass !== base.pass) {
+      deltas.push({ tag: cur.pass ? 'BETTER' : 'WORSE', field: 'pass', delta: `${base.pass}→${cur.pass}` });
+    }
+    const worse = deltas.filter((d) => d.tag === 'WORSE');
+    const better = deltas.filter((d) => d.tag === 'BETTER');
+    if (worse.length > 0) {
+      regressed++;
+      const summary = worse.map((d) => `${d.field}=${d.delta}`).join(' ');
+      const goodTail = better.length > 0 ? `  (also better: ${better.map((d) => `${d.field}=${d.delta}`).join(' ')})` : '';
+      lines.push(`REGRESS   ${pad(name, 36)}  ${summary}${goodTail}`);
+    } else if (better.length > 0) {
+      improved++;
+      const summary = better.map((d) => `${d.field}=${d.delta}`).join(' ');
+      lines.push(`IMPROVE   ${pad(name, 36)}  ${summary}`);
+    } else {
+      unchanged++;
+    }
+  }
+  for (const name of Object.keys(baseline)) {
+    if (!seenInBaseline.has(name)) {
+      lines.push(`MISSING   ${pad(name, 36)}  (in baseline but not run)`);
+      missing++;
+    }
+  }
+  return { lines, regressed, improved, unchanged, newFixtures, missing };
 }
 
 async function main() {
@@ -652,6 +828,31 @@ async function main() {
     }
     dumpPath = next;
   }
+  // --baseline <path>: compare each fixture's metrics to a baseline JSON
+  // file and emit a per-fixture diff report (PASS / REGRESSED / IMPROVED /
+  // NEW / MISSING). Use with --osrm-base for real-OSRM CI.
+  // --write-baseline <path>: write the current results as the new baseline
+  // (replaces the file). Use after a deliberate algorithm improvement.
+  const baselineIdx = argv.indexOf('--baseline');
+  let baselinePath: string | null = null;
+  if (baselineIdx >= 0) {
+    const next = argv[baselineIdx + 1];
+    if (!next || next.startsWith('--')) {
+      console.error(`--baseline requires a file path`);
+      process.exit(2);
+    }
+    baselinePath = next;
+  }
+  const writeBaselineIdx = argv.indexOf('--write-baseline');
+  let writeBaselinePath: string | null = null;
+  if (writeBaselineIdx >= 0) {
+    const next = argv[writeBaselineIdx + 1];
+    if (!next || next.startsWith('--')) {
+      console.error(`--write-baseline requires a file path`);
+      process.exit(2);
+    }
+    writeBaselinePath = next;
+  }
 
   const fixtures = only ? FIXTURES.filter((f) => f.name.includes(only!)) : FIXTURES;
   if (fixtures.length === 0) {
@@ -707,6 +908,38 @@ async function main() {
   if (record) {
     const saved = saveSnapshot();
     console.log(`\nSaved snapshot: ${saved.enriched} green / ${saved.highway} highway / ${saved.osrm} OSRM entries`);
+  }
+
+  // Baseline write: snapshot current metrics as the new "expected good"
+  // state. Run after a deliberate improvement; commit the baseline file.
+  if (writeBaselinePath) {
+    const baseline: BaselineFile = {};
+    for (const r of results) {
+      if (!r.metrics || r.skipped) continue;
+      baseline[r.fixture.name] = metricsToBaseline(r.metrics, r.pass);
+    }
+    fs.writeFileSync(writeBaselinePath, JSON.stringify(baseline, null, 2) + '\n');
+    console.log(`\nWrote baseline (${Object.keys(baseline).length} fixtures) → ${writeBaselinePath}`);
+  }
+
+  // Baseline compare: per-fixture diff report. Catches the case the mock
+  // harness can't see — a real-OSRM-driven regression where pass-rate is
+  // unchanged but the chosen route's shape metrics quietly degraded.
+  if (baselinePath) {
+    let baseline: BaselineFile = {};
+    if (fs.existsSync(baselinePath)) {
+      baseline = JSON.parse(fs.readFileSync(baselinePath, 'utf8'));
+    } else {
+      console.warn(`\nBaseline file not found: ${baselinePath}. Skipping diff (use --write-baseline to create one).`);
+    }
+    if (Object.keys(baseline).length > 0) {
+      const diffReport = diffAgainstBaseline(results, baseline);
+      console.log('\n--- Baseline diff ---');
+      for (const line of diffReport.lines) console.log(line);
+      console.log(`\n${diffReport.regressed} regressed, ${diffReport.improved} improved, ` +
+        `${diffReport.unchanged} unchanged, ${diffReport.newFixtures} new, ${diffReport.missing} missing.`);
+      if (diffReport.regressed > 0) process.exit(1);
+    }
   }
 
   if (dumpPath) {

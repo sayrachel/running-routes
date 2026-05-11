@@ -1,4 +1,4 @@
-import { scoreRoute, computeGreenSpaceProximity, bboxAspectRatio } from '../route-scoring';
+import { scoreRoute, computeGreenSpaceProximity, bboxAspectRatio, polsbyPopper, maxTurnDensityInWindow } from '../route-scoring';
 import type { GreenSpace } from '../overpass';
 import type { RoutePoint } from '../route-generator';
 
@@ -199,5 +199,154 @@ describe('bboxAspectRatio', () => {
     // tall as it is wide, aspect ≈ 2.
     expect(polarAspect).toBeGreaterThan(1.8);
     expect(polarAspect).toBeLessThan(2.2);
+  });
+});
+
+describe('polsbyPopper', () => {
+  // Polsby-Popper: 4π·area / perimeter². Always 0–1, with 1 = circle.
+  // Constructions below use NYC latitude where 1km ≈ 0.009 deg lat,
+  // 0.0119 deg lng (cos(40.73°) ≈ 0.757).
+
+  it('approximates 1.0 for a high-resolution circle', () => {
+    // 32-vertex regular polygon approximating a 1km-radius circle.
+    const center = { lat: 40.73, lng: -73.985 };
+    const N = 32;
+    const points = [];
+    for (let i = 0; i <= N; i++) {
+      const angle = (i / N) * 2 * Math.PI;
+      const dyKm = Math.cos(angle);
+      const dxKm = Math.sin(angle);
+      points.push({
+        lat: center.lat + dyKm / 111,
+        lng: center.lng + dxKm / (111 * Math.cos((40.73 * Math.PI) / 180)),
+      });
+    }
+    const pp = polsbyPopper(points);
+    // 32-vertex polygon falls slightly short of a true circle (PP = 1.0).
+    expect(pp).toBeGreaterThan(0.97);
+    expect(pp).toBeLessThan(1.01);
+  });
+
+  it('square loop returns ≈ 0.785 (π/4)', () => {
+    const square = [
+      { lat: 40.73,         lng: -73.985 },
+      { lat: 40.73,         lng: -73.985 + 0.0119 },
+      { lat: 40.73 + 0.009, lng: -73.985 + 0.0119 },
+      { lat: 40.73 + 0.009, lng: -73.985 },
+      { lat: 40.73,         lng: -73.985 },
+    ];
+    const pp = polsbyPopper(square);
+    expect(pp).toBeGreaterThan(0.75);
+    expect(pp).toBeLessThan(0.82);
+  });
+
+  it('2:1 rectangle returns ≈ 0.7', () => {
+    const rect = [
+      { lat: 40.73,         lng: -73.985 },
+      { lat: 40.73,         lng: -73.985 + 0.0238 },
+      { lat: 40.73 + 0.009, lng: -73.985 + 0.0238 },
+      { lat: 40.73 + 0.009, lng: -73.985 },
+      { lat: 40.73,         lng: -73.985 },
+    ];
+    const pp = polsbyPopper(rect);
+    expect(pp).toBeGreaterThan(0.65);
+    expect(pp).toBeLessThan(0.75);
+  });
+
+  it('through-line shape returns < 0.15', () => {
+    const throughLine = [
+      { lat: 40.7335,         lng: -73.985 },
+      { lat: 40.7335,         lng: -73.985 + 0.018 },
+      { lat: 40.7335 - 0.0005, lng: -73.985 + 0.018 },
+      { lat: 40.7335 - 0.0005, lng: -73.985 },
+      { lat: 40.7335,         lng: -73.985 },
+    ];
+    expect(polsbyPopper(throughLine)).toBeLessThan(0.15);
+  });
+
+  it('snake-shape (winding within a single corridor) returns < 0.20', () => {
+    // 1.5km long, 200m corridor wide, with 4 N-S "switchbacks".
+    const snake = [
+      { lat: 40.730, lng: -73.985 },
+      { lat: 40.730, lng: -73.985 + 0.005 },
+      { lat: 40.732, lng: -73.985 + 0.005 },
+      { lat: 40.732, lng: -73.985 + 0.010 },
+      { lat: 40.730, lng: -73.985 + 0.010 },
+      { lat: 40.730, lng: -73.985 + 0.015 },
+      { lat: 40.732, lng: -73.985 + 0.015 },
+      { lat: 40.732, lng: -73.985 + 0.018 },
+      { lat: 40.730, lng: -73.985 + 0.018 },
+      { lat: 40.730, lng: -73.985 },
+    ];
+    expect(polsbyPopper(snake)).toBeLessThan(0.20);
+  });
+
+  it('returns 0 for fewer than 3 points', () => {
+    expect(polsbyPopper([])).toBe(0);
+    expect(polsbyPopper([{ lat: 40, lng: -73 }, { lat: 40.001, lng: -73.001 }])).toBe(0);
+  });
+});
+
+describe('maxTurnDensityInWindow', () => {
+  // Helpers below construct 100m segments at NYC latitude.
+  // 100m N ≈ 0.0009 deg lat; 100m E ≈ 0.0012 deg lng.
+  const STEP_LAT = 0.0009;
+  const STEP_LNG = 0.0012;
+
+  it('returns 0 for routes shorter than the window', () => {
+    const tiny = [
+      { lat: 40.73, lng: -73.985 },
+      { lat: 40.73 + STEP_LAT, lng: -73.985 },
+    ];
+    expect(maxTurnDensityInWindow(tiny, 0.5)).toBe(0);
+  });
+
+  it('returns 0 for a straight line of any length', () => {
+    const straight = [];
+    for (let i = 0; i < 30; i++) {
+      straight.push({ lat: 40.73, lng: -73.985 + i * STEP_LNG });
+    }
+    expect(maxTurnDensityInWindow(straight, 0.5)).toBe(0);
+  });
+
+  it('reports high density for a localized cluster', () => {
+    // 5 turns within ~400m at the start, then 1.5km of straight.
+    // Each "turn" is a 90° corner: east 100m, north 100m, east 100m, etc.
+    const cluster = [
+      { lat: 40.73, lng: -73.985 },
+      { lat: 40.73, lng: -73.985 + STEP_LNG },                  // E 100m
+      { lat: 40.73 + STEP_LAT, lng: -73.985 + STEP_LNG },        // N 100m  (turn 1)
+      { lat: 40.73 + STEP_LAT, lng: -73.985 + 2 * STEP_LNG },    // E 100m  (turn 2)
+      { lat: 40.73 + 2 * STEP_LAT, lng: -73.985 + 2 * STEP_LNG }, // N 100m (turn 3)
+      { lat: 40.73 + 2 * STEP_LAT, lng: -73.985 + 3 * STEP_LNG }, // E 100m (turn 4)
+      { lat: 40.73 + 3 * STEP_LAT, lng: -73.985 + 3 * STEP_LNG }, // N 100m (turn 5)
+    ];
+    // Append 1500m of straight east continuation from the cluster end.
+    const last = cluster[cluster.length - 1];
+    for (let i = 1; i <= 15; i++) {
+      cluster.push({ lat: last.lat, lng: last.lng + i * STEP_LNG });
+    }
+    const max = maxTurnDensityInWindow(cluster, 0.5);
+    // 5 turns in <500m → at least 5/0.5 = 10 t/km in some window.
+    expect(max).toBeGreaterThanOrEqual(8);
+  });
+
+  it('reports low density when turns are spread evenly', () => {
+    // 6 turns spread over 3km — each window has ≤ 2 turns.
+    const spread = [];
+    let lat = 40.73, lng = -73.985;
+    spread.push({ lat, lng });
+    for (let i = 0; i < 6; i++) {
+      // 500m east, then a small N step (the turn), so the bearing flips back ~90°.
+      for (let s = 0; s < 5; s++) {
+        lng += STEP_LNG;
+        spread.push({ lat, lng });
+      }
+      lat += STEP_LAT;
+      spread.push({ lat, lng });
+    }
+    const max = maxTurnDensityInWindow(spread, 0.5);
+    // ~1 turn per window of 500m → ~2 t/km max
+    expect(max).toBeLessThanOrEqual(4);
   });
 });

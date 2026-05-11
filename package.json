@@ -9,7 +9,9 @@
     "web": "expo start --web",
     "test": "jest",
     "quality": "tsx lib/__tests__/route-quality-harness.ts",
-    "quality:record": "tsx lib/__tests__/route-quality-harness.ts --record"
+    "quality:record": "tsx lib/__tests__/route-quality-harness.ts --record",
+    "quality:real": "tsx lib/__tests__/route-quality-harness.ts --osrm-base http://router.project-osrm.org/route/v1/foot --baseline lib/__tests__/fixtures/real-osrm-baseline.json --no-snapshot",
+    "quality:real:record": "tsx lib/__tests__/route-quality-harness.ts --osrm-base http://router.project-osrm.org/route/v1/foot --write-baseline lib/__tests__/fixtures/real-osrm-baseline.json --no-snapshot"
   },
   "jest": {
     "preset": "jest-expo",

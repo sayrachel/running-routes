@@ -325,6 +325,132 @@ export function bboxAspectRatio(points: RoutePoint[]): number {
 }
 
 /**
+ * Polsby-Popper isoperimetric ratio: 4π·area / perimeter². A polyline-shape
+ * goodness metric.
+ *
+ * Reference shapes (any size):
+ *   - Perfect circle          → 1.0
+ *   - Square loop             → 0.785
+ *   - 2:1 rectangle           → 0.698
+ *   - Long thin rectangle     → 0.4 and below
+ *   - Through-line / snake    → ~0.05–0.15
+ *
+ * Catches a class of degenerate shapes that bbox aspect ratio doesn't:
+ * snakes that wind back and forth within a moderate-aspect bbox have low
+ * Polsby-Popper because the polyline doesn't enclose meaningful 2D area
+ * relative to its perimeter. A figure-8 or barbell will have moderate-to-low
+ * Polsby-Popper depending on lobe sizes (signed-area cancellation).
+ *
+ * Implementation: shoelace formula for signed area (closed by treating
+ * points[N-1]→points[0] as the closing edge, even if start ≠ end), |area|
+ * for the "encloses *some* region" interpretation. Distances in the
+ * equirectangular projection at the centroid latitude — accurate enough
+ * within a few km, much faster than per-segment haversine math.
+ *
+ * Out-and-back routes are 1-D and have area ≈ 0 by construction —
+ * callers must skip OAB.
+ */
+export function polsbyPopper(points: RoutePoint[]): number {
+  if (points.length < 3) return 0;
+  let latSum = 0;
+  for (const p of points) latSum += p.lat;
+  const refLat = latSum / points.length;
+  const cosLat = Math.max(0.01, Math.cos((refLat * Math.PI) / 180));
+  // Project lat/lng → km in a local equirectangular frame.
+  const xy: [number, number][] = points.map((p) => [
+    p.lng * KM_PER_DEG_LAT * cosLat,
+    p.lat * KM_PER_DEG_LAT,
+  ]);
+  // Shoelace signed area, closing the polyline if needed.
+  let signedArea = 0;
+  let perimeter = 0;
+  for (let i = 0; i < xy.length; i++) {
+    const [x1, y1] = xy[i];
+    const [x2, y2] = xy[(i + 1) % xy.length];
+    signedArea += x1 * y2 - x2 * y1;
+    perimeter += Math.hypot(x2 - x1, y2 - y1);
+  }
+  const area = Math.abs(signedArea) / 2;
+  if (perimeter === 0) return 0;
+  return (4 * Math.PI * area) / (perimeter * perimeter);
+}
+
+/**
+ * Maximum local turn density: walks a sliding window of `windowKm` along the
+ * polyline and returns the highest turns/km observed in any window.
+ *
+ * Catches localized zigzag clusters that the global `turnCount / distKm`
+ * gate misses. Example: a 5km route with 5 turns clustered in 500m and 0
+ * elsewhere averages 1 t/km globally (clean) but the cluster window peaks
+ * at 10 t/km — visibly broken in that section even though the rest of the
+ * run is fine.
+ *
+ * Counts turns the same way as `turnCount` (≥45° heading change over a
+ * 25m back/forward lookahead window). Walks the polyline cumulative-distance
+ * once, accumulating a queue of recent turn positions per the windowKm
+ * advancing front.
+ *
+ * Returns 0 for routes shorter than `windowKm` or with fewer than 4 points.
+ */
+export function maxTurnDensityInWindow(
+  points: RoutePoint[],
+  windowKm: number = 0.5,
+  thresholdDeg: number = 45
+): number {
+  if (points.length < 4) return 0;
+
+  // Compute cumulative distance once.
+  const cum: number[] = new Array(points.length);
+  cum[0] = 0;
+  for (let i = 1; i < points.length; i++) {
+    cum[i] = cum[i - 1] + haversineDistance(points[i - 1], points[i]);
+  }
+  const total = cum[points.length - 1];
+  if (total < windowKm) return 0;
+
+  // Detect turn positions (in km along the polyline) using the same logic
+  // as turnCount: 25m back/forward bearing, ≥45° change.
+  const lookbackKm = 0.025;
+  const minSpacingKm = 0.04;
+  const turnPositions: number[] = [];
+  let nextSample = lookbackKm;
+  for (let i = 1; i < points.length - 1; i++) {
+    if (cum[i] < nextSample) continue;
+    if (cum[i] > total - lookbackKm) break;
+    let iBack = i;
+    while (iBack > 0 && cum[i] - cum[iBack] < lookbackKm) iBack--;
+    let iFwd = i;
+    while (iFwd < points.length - 1 && cum[iFwd] - cum[i] < lookbackKm) iFwd++;
+    if (iBack < i && iFwd > i) {
+      const bBack = bearingFrom(points[iBack], points[i]);
+      const bFwd = bearingFrom(points[i], points[iFwd]);
+      if (angleDiff(bBack, bFwd) >= thresholdDeg) {
+        turnPositions.push(cum[i]);
+        nextSample = cum[i] + minSpacingKm;
+        continue;
+      }
+    }
+    nextSample = cum[i] + 0.02;
+  }
+
+  if (turnPositions.length === 0) return 0;
+
+  // Sliding window: for each turn position, count turns within
+  // [pos, pos + windowKm]. The max over all windows is the answer.
+  // O(n) two-pointer because turnPositions is sorted by construction.
+  let maxCount = 0;
+  let r = 0;
+  for (let l = 0; l < turnPositions.length; l++) {
+    while (r < turnPositions.length && turnPositions[r] - turnPositions[l] < windowKm) {
+      r++;
+    }
+    const count = r - l;
+    if (count > maxCount) maxCount = count;
+  }
+  return maxCount / windowKm;
+}
+
+/**
  * Compute what fraction of route points are within proximity of a green space.
  * Samples every ~20th point to avoid expensive computation on dense routes.
  *
