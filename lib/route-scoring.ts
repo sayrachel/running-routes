@@ -284,6 +284,47 @@ export function turnCount(
 }
 
 /**
+ * Aspect ratio of the route's bounding box: max(NS, EW) / min(NS, EW).
+ *
+ * Catches degenerate-shape loops that pass every existing detector but read on
+ * the map as "not a loop": through-line starts (outbound and closing along the
+ * same axis through start), squished ovals, snake-shape routes weaving along a
+ * single corridor, long-stem lollipops where the stem dominates the bbox.
+ *
+ * Reference shapes (3mi loop ≈ 4.83km perimeter):
+ *   - Square loop ~1.2km × 1.2km            → aspect 1
+ *   - Healthy rectangle ~1.6km × 0.8km      → aspect 2
+ *   - Squished oval that reads as a line    → aspect 5+
+ *   - Through-line start (1.5km E-W × 60m)  → aspect ~25
+ *
+ * Out-and-back routes are intentionally 1-D — callers must skip OAB.
+ */
+export function bboxAspectRatio(points: RoutePoint[]): number {
+  if (points.length < 2) return 1;
+  let minLat = points[0].lat, maxLat = points[0].lat;
+  let minLng = points[0].lng, maxLng = points[0].lng;
+  let latSum = 0;
+  for (const p of points) {
+    if (p.lat < minLat) minLat = p.lat;
+    if (p.lat > maxLat) maxLat = p.lat;
+    if (p.lng < minLng) minLng = p.lng;
+    if (p.lng > maxLng) maxLng = p.lng;
+    latSum += p.lat;
+  }
+  const refLat = latSum / points.length;
+  const cosLat = Math.max(0.01, Math.cos((refLat * Math.PI) / 180));
+  const nsKm = (maxLat - minLat) * KM_PER_DEG_LAT;
+  const ewKm = (maxLng - minLng) * KM_PER_DEG_LAT * cosLat;
+  // Floor on the denominator: a sub-10m extent in either axis is below GPS
+  // noise and would inflate aspect to absurd values without telling us
+  // anything new — anything that thin is degenerate regardless of the exact
+  // ratio. 0.01km = 10m matches the toFixed(4) precision floor used elsewhere.
+  const maxAxis = Math.max(nsKm, ewKm);
+  const minAxis = Math.max(0.01, Math.min(nsKm, ewKm));
+  return maxAxis / minAxis;
+}
+
+/**
  * Compute what fraction of route points are within proximity of a green space.
  * Samples every ~20th point to avoid expensive computation on dense routes.
  *

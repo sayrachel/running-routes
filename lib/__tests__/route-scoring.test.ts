@@ -1,4 +1,4 @@
-import { scoreRoute, computeGreenSpaceProximity } from '../route-scoring';
+import { scoreRoute, computeGreenSpaceProximity, bboxAspectRatio } from '../route-scoring';
 import type { GreenSpace } from '../overpass';
 import type { RoutePoint } from '../route-generator';
 
@@ -98,5 +98,106 @@ describe('computeGreenSpaceProximity', () => {
     const greenSpaces = [makeGS(10.0, 10.0)];
     const score = computeGreenSpaceProximity(routePoints, greenSpaces);
     expect(score).toBe(0);
+  });
+});
+
+describe('bboxAspectRatio', () => {
+  // 1km in NYC ≈ 0.009 deg lat, 0.0119 deg lng (cos(40.73°) ≈ 0.757)
+  // We construct synthetic polylines whose bbox has known dimensions and
+  // verify aspect = max(NS, EW) / min(NS, EW) within tolerance.
+
+  it('square loop returns aspect ≈ 1', () => {
+    // 1km × 1km square at NYC latitude
+    const square: RoutePoint[] = [
+      { lat: 40.73,         lng: -73.985 },
+      { lat: 40.73,         lng: -73.985 + 0.0119 },
+      { lat: 40.73 + 0.009, lng: -73.985 + 0.0119 },
+      { lat: 40.73 + 0.009, lng: -73.985 },
+      { lat: 40.73,         lng: -73.985 },
+    ];
+    expect(bboxAspectRatio(square)).toBeLessThan(1.1);
+  });
+
+  it('healthy 2:1 rectangular loop returns aspect ≈ 2', () => {
+    const rect: RoutePoint[] = [
+      { lat: 40.73,          lng: -73.985 },
+      { lat: 40.73,          lng: -73.985 + 0.0238 },
+      { lat: 40.73 + 0.009,  lng: -73.985 + 0.0238 },
+      { lat: 40.73 + 0.009,  lng: -73.985 },
+      { lat: 40.73,          lng: -73.985 },
+    ];
+    const aspect = bboxAspectRatio(rect);
+    expect(aspect).toBeGreaterThan(1.8);
+    expect(aspect).toBeLessThan(2.2);
+  });
+
+  it('through-line shape (1.5km E-W × 60m N-S) returns aspect > 20', () => {
+    // Models the East Village 3mi case: outbound + closing along the same
+    // E-W axis through start, with only a 60m drop to a parallel street.
+    const throughLine: RoutePoint[] = [
+      { lat: 40.7335,         lng: -73.985 },
+      { lat: 40.7335,         lng: -73.985 + 0.018 },  // 1.5km east
+      { lat: 40.7335 - 0.0005, lng: -73.985 + 0.018 }, // 55m south
+      { lat: 40.7335 - 0.0005, lng: -73.985 },         // 1.5km west
+      { lat: 40.7335,         lng: -73.985 },          // back to start
+    ];
+    expect(bboxAspectRatio(throughLine)).toBeGreaterThan(20);
+  });
+
+  it('squished oval (3:1 aspect) returns aspect ≈ 3', () => {
+    // Five-vertex oval: 1.5km × 0.5km
+    const oval: RoutePoint[] = [
+      { lat: 40.73,          lng: -73.985 },
+      { lat: 40.73,          lng: -73.985 + 0.018 },
+      { lat: 40.73 + 0.0045, lng: -73.985 + 0.018 },
+      { lat: 40.73 + 0.0045, lng: -73.985 },
+      { lat: 40.73,          lng: -73.985 },
+    ];
+    const aspect = bboxAspectRatio(oval);
+    expect(aspect).toBeGreaterThan(2.7);
+    expect(aspect).toBeLessThan(3.3);
+  });
+
+  it('handles polylines with sub-10m extent (degenerate min axis is floored)', () => {
+    // Two points 1km apart with effectively zero N-S extent.
+    const line: RoutePoint[] = [
+      { lat: 40.73, lng: -73.985 },
+      { lat: 40.73, lng: -73.985 + 0.012 },
+    ];
+    // EW ≈ 1km, NS = 0, floor at 0.01km → aspect ≤ 100, ≥ ~95
+    const aspect = bboxAspectRatio(line);
+    expect(aspect).toBeGreaterThan(50);
+  });
+
+  it('returns 1 for fewer than 2 points', () => {
+    expect(bboxAspectRatio([])).toBe(1);
+    expect(bboxAspectRatio([{ lat: 40, lng: -73 }])).toBe(1);
+  });
+
+  it('uses cos(lat) correction so equator and high-latitude shapes score symmetrically', () => {
+    // Two square loops with the same lat/lng deltas at very different
+    // latitudes should NOT register as the same aspect — cos correction
+    // shrinks EW extent at higher latitudes.
+    const equatorSquare: RoutePoint[] = [
+      { lat: 0,       lng: 0 },
+      { lat: 0,       lng: 0.01 },
+      { lat: 0.01,    lng: 0.01 },
+      { lat: 0.01,    lng: 0 },
+      { lat: 0,       lng: 0 },
+    ];
+    const polarSquare: RoutePoint[] = [
+      { lat: 60,      lng: 0 },
+      { lat: 60,      lng: 0.01 },
+      { lat: 60.01,   lng: 0.01 },
+      { lat: 60.01,   lng: 0 },
+      { lat: 60,      lng: 0 },
+    ];
+    const equatorAspect = bboxAspectRatio(equatorSquare);
+    const polarAspect = bboxAspectRatio(polarSquare);
+    expect(equatorAspect).toBeCloseTo(1, 1);
+    // At lat 60°, EW shrinks by cos(60°) = 0.5 — polar polyline is twice as
+    // tall as it is wide, aspect ≈ 2.
+    expect(polarAspect).toBeGreaterThan(1.8);
+    expect(polarAspect).toBeLessThan(2.2);
   });
 });

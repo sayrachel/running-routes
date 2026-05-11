@@ -15,7 +15,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { generateOSRMRoutes, retraceRatio, overlapSegmentRatio, haversineDistance, calculateSearchRadius, dumpOSRMCache, loadOSRMCache, setOSRMCacheMax, setOSRMMock, setDeterministicSeed, countStubs, countPendantLoops, setOSRMBase, clearOSRMCache } from '../osrm';
 import { fetchGreenSpacesAndHighways, dumpOverpassCaches, loadOverpassCaches, prefillOverpassCaches } from '../overpass';
-import { computeGreenSpaceProximity, turnCount } from '../route-scoring';
+import { computeGreenSpaceProximity, turnCount, bboxAspectRatio } from '../route-scoring';
 import type { RoutePoint, RoutePreferences } from '../route-generator';
 import { enableTrace, flushTrace, type TraceEvent } from '../debug-trace';
 import { syntheticForCenter } from './fixtures/synthetic-green-spaces';
@@ -118,6 +118,12 @@ const FIXTURES: Fixture[] = [
   // these only meaningfully run with --osrm-base pointing at local OSRM.
   { name: 'nyc-east-village-2mi-loop',  center: { lat: 40.7280, lng: -73.9920 }, distanceMi: 2, routeType: 'loop',       prefs: { lowTraffic: true } },
   { name: 'nyc-east-village-3mi-loop',  center: { lat: 40.7280, lng: -73.9920 }, distanceMi: 3, routeType: 'loop',       prefs: { lowTraffic: true } },
+  // East Village / Gramercy border — matches the user's May 2026 blue-dot
+  // location (3rd Ave / 14th St) for the "Quiet Lanes 3mi through-line"
+  // bug. The existing east-village-3mi fixture is 600m southwest, in a
+  // different street pattern that doesn't reproduce the same OSRM output.
+  { name: 'nyc-gramercy-3mi-loop-quiet', center: { lat: 40.7335, lng: -73.984 }, distanceMi: 3, routeType: 'loop',       prefs: { lowTraffic: true } },
+  { name: 'nyc-gramercy-4mi-loop-quiet', center: { lat: 40.7335, lng: -73.984 }, distanceMi: 4, routeType: 'loop',       prefs: { lowTraffic: true } },
   { name: 'nyc-east-village-4mi-loop',  center: { lat: 40.7280, lng: -73.9920 }, distanceMi: 4, routeType: 'loop',       prefs: { lowTraffic: false } },
   { name: 'nyc-east-village-4mi-loop-quiet', center: { lat: 40.7280, lng: -73.9920 }, distanceMi: 4, routeType: 'loop',  prefs: { lowTraffic: true } },
   { name: 'nyc-east-village-6mi-loop',  center: { lat: 40.7280, lng: -73.9920 }, distanceMi: 6, routeType: 'loop',       prefs: { lowTraffic: false } },
@@ -137,6 +143,36 @@ const FIXTURES: Fixture[] = [
   { name: 'nyc-chelsea-5mi-loop',       center: { lat: 40.7470, lng: -74.0020 }, distanceMi: 5, routeType: 'loop',       prefs: { lowTraffic: false } },
   { name: 'nyc-brooklyn-heights-3mi',   center: { lat: 40.6960, lng: -73.9940 }, distanceMi: 3, routeType: 'loop',       prefs: { lowTraffic: true } },
   { name: 'nyc-dumbo-3mi-loop',         center: { lat: 40.7030, lng: -73.9890 }, distanceMi: 3, routeType: 'loop',       prefs: { lowTraffic: false } },
+
+  // Cross-city shape-quality coverage. The May 2026 user-reported "Quiet
+  // Lanes 3mi East Village" through-line bug pointed at the bboxAspectRatio
+  // gate; these fixtures exercise the same class of geometry-driven failure
+  // in OTHER neighborhoods so a future change can't regress just one area
+  // and pass NYC-only coverage.
+  //
+  // Coastal start (Brighton Beach, Brooklyn): water on the south side
+  // forces any loop to extend mostly N-S — a degenerate loop here would
+  // have aspect 4-6 along the E-W axis instead. If the chooser ships such
+  // a loop the user sees a horizontal line through their start; the gate
+  // should hard-reject and we should see this fixture either pass with a
+  // legitimate non-degenerate loop or skip cleanly.
+  { name: 'bk-brighton-beach-3mi-loop', center: { lat: 40.5780, lng: -73.9610 }, distanceMi: 3, routeType: 'loop',       prefs: { lowTraffic: false } },
+  { name: 'bk-brighton-beach-4mi-loop', center: { lat: 40.5780, lng: -73.9610 }, distanceMi: 4, routeType: 'loop',       prefs: { lowTraffic: true } },
+  // Park Slope brownstone grid (Brooklyn): tight regular street grid with
+  // many quiet residential blocks — historically prone to zigzag/staircase
+  // patterns where every block forces a turn decision. Stresses turnsPerKm
+  // gate independent of Manhattan grid bias.
+  { name: 'bk-park-slope-3mi-loop-quiet', center: { lat: 40.6690, lng: -73.9810 }, distanceMi: 3, routeType: 'loop',     prefs: { lowTraffic: true } },
+  { name: 'bk-park-slope-4mi-loop-quiet', center: { lat: 40.6690, lng: -73.9810 }, distanceMi: 4, routeType: 'loop',     prefs: { lowTraffic: true } },
+  // Cambridge MA, dense residential grid west of MIT — non-NYC dense-grid
+  // coverage. Mirrors the "single-corridor weaving" failure mode if the
+  // algorithm picks E-W only routes along Mass Ave.
+  { name: 'bos-cambridge-3mi-loop-quiet', center: { lat: 42.3650, lng: -71.1030 }, distanceMi: 3, routeType: 'loop',     prefs: { lowTraffic: true } },
+  // SF coastal start (Marina): water on the north side, hills inland —
+  // similar geometric-constraint pressure as Brighton Beach but with hills
+  // forcing additional avoidance behavior in OSRM.
+  { name: 'sf-marina-3mi-loop-quiet',   center: { lat: 37.8030, lng: -122.4400 }, distanceMi: 3, routeType: 'loop',      prefs: { lowTraffic: true } },
+  { name: 'sf-marina-4mi-loop-quiet',   center: { lat: 37.8030, lng: -122.4400 }, distanceMi: 4, routeType: 'loop',      prefs: { lowTraffic: true } },
 ];
 
 interface Thresholds {
@@ -162,6 +198,13 @@ interface Thresholds {
   // the harness threshold of 0 catches any case where the chosen route
   // somehow still has one (e.g. step-3.5 fallback).
   maxPendantLoops: number;
+  // Hard cap on bbox aspect ratio for loops. Production hard-rejects at >5;
+  // harness threshold matches so any chosen loop with aspect >5 indicates
+  // either a gate bypass or a metric mismatch. OAB exempt (intentionally 1-D).
+  maxAspectRatio: number;
+  // Hard cap on turn density for loops ≥2mi. Production hard-rejects at
+  // turnsPerKm > 7.0; harness threshold matches.
+  maxTurnsPerKm: number;
 }
 
 const DEFAULT_THRESHOLDS: Thresholds = {
@@ -170,6 +213,8 @@ const DEFAULT_THRESHOLDS: Thresholds = {
   maxOverlapRatio: 0.10,
   maxStubs: 0,
   maxPendantLoops: 0,
+  maxAspectRatio: 5,
+  maxTurnsPerKm: 7.0,
 };
 
 interface RouteMetrics {
@@ -208,12 +253,13 @@ interface RouteMetrics {
   /** Per-reason count of how many candidates were rejected during step 3.
    *  A high `backtrack` count combined with `chosenFromFallback=true` is
    *  the smoking gun for "hard-reject too aggressive for this area". */
-  rejectionCounts: { distance: number; barrier: number; highway: number; backtrack: number; pendantLoop: number; osrmNull: number };
-  /** Turns per km — number of ≥45° heading changes per route km. Reported
-   *  for measurement only (no threshold yet); tracking turn density to size
-   *  a future scoring penalty for zigzag/staircase routes that pass distance
-   *  + retrace + overlap thresholds but are exhausting to actually run. */
+  rejectionCounts: { distance: number; barrier: number; highway: number; backtrack: number; pendantLoop: number; osrmNull: number; aspect: number; turnDensity: number };
+  /** Turns per km — number of ≥45° heading changes per route km. */
   turnsPerKm: number;
+  /** Bbox aspect ratio: max(NS, EW) / min(NS, EW). Catches degenerate-shape
+   *  loops (through-line, squished oval, snake-shape weaving). Loops only;
+   *  OAB and p2p are intentionally 1-D. */
+  aspectRatio: number;
 }
 
 interface FixtureResult {
@@ -287,6 +333,26 @@ function applyThresholds(f: Fixture, m: RouteMetrics): string[] {
       `${m.pendantLoops} pendant loops (max ${t.maxPendantLoops}) — closed sub-loop attached by single bridge, unrunnable as one path`
     );
   }
+  // Bbox aspect ratio: degenerate-shape catch (through-line, squished
+  // oval, snake-shape weaving). Production gate matches; failure here
+  // means a gate bypass or a candidate that survived for distance reasons.
+  // OAB and p2p exempt (intentionally 1-D).
+  if (f.routeType !== 'out-and-back' && f.routeType !== 'point-to-point'
+      && m.aspectRatio > t.maxAspectRatio) {
+    failures.push(
+      `bbox aspect ${m.aspectRatio.toFixed(1)} > ${t.maxAspectRatio} — ` +
+      `loop is degenerate-shape (through-line, squished oval, or snake)`
+    );
+  }
+  // Turn density: >6 turns/km on a ≥2mi loop is exhausting to run.
+  // Skipped for short loops (1mi loops can't get below ~5 t/km even when clean)
+  // and OAB.
+  if (f.routeType !== 'out-and-back' && f.distanceMi >= 2
+      && m.turnsPerKm > t.maxTurnsPerKm) {
+    failures.push(
+      `turns/km ${m.turnsPerKm.toFixed(1)} > ${t.maxTurnsPerKm} — zigzag/staircase pattern`
+    );
+  }
   // Step-3.5-fired-when-anchored check. The classic mode of regression that
   // pure metric thresholds miss: the chosen route's distance/retrace/stubs
   // can all look fine on their own, but it came from the geometric bearing-
@@ -297,7 +363,8 @@ function applyThresholds(f: Fixture, m: RouteMetrics): string[] {
   if (m.chosenFromFallback && m.hasOverpassData) {
     const breakdown = `backtrack=${m.rejectionCounts.backtrack}, pendant-loop=${m.rejectionCounts.pendantLoop}, ` +
       `distance=${m.rejectionCounts.distance}, barrier=${m.rejectionCounts.barrier}, ` +
-      `highway=${m.rejectionCounts.highway}, osrm-null=${m.rejectionCounts.osrmNull}`;
+      `highway=${m.rejectionCounts.highway}, osrm-null=${m.rejectionCounts.osrmNull}, ` +
+      `aspect=${m.rejectionCounts.aspect}, turn-density=${m.rejectionCounts.turnDensity}`;
     failures.push(
       `step-3.5 fallback fired despite Overpass data — anchored candidates rejected (${breakdown})`
     );
@@ -399,7 +466,7 @@ async function runFixture(f: Fixture, captureTrace: boolean, useSynthetic: boole
     // the algorithm dropped to geometric bearing-trial routing because every
     // step-3 candidate was rejected. That's the "Sidestreet Shuffle" anchorless
     // rectangle pattern in the East Village 4mi screenshot.
-    const rejectionCounts = { distance: 0, barrier: 0, highway: 0, backtrack: 0, pendantLoop: 0, osrmNull: 0 };
+    const rejectionCounts = { distance: 0, barrier: 0, highway: 0, backtrack: 0, pendantLoop: 0, osrmNull: 0, aspect: 0, turnDensity: 0 };
     let chosenFromFallback = false;
     for (const e of trace) {
       if (e.event === 'fallback-start') chosenFromFallback = true;
@@ -411,6 +478,8 @@ async function runFixture(f: Fixture, captureTrace: boolean, useSynthetic: boole
         else if (reason === 'backtrack') rejectionCounts.backtrack++;
         else if (reason === 'pendant-loop') rejectionCounts.pendantLoop++;
         else if (reason === 'osrm-null') rejectionCounts.osrmNull++;
+        else if (reason === 'aspect') rejectionCounts.aspect++;
+        else if (reason === 'turn-density') rejectionCounts.turnDensity++;
       }
     }
     const metrics: RouteMetrics = {
@@ -428,6 +497,7 @@ async function runFixture(f: Fixture, captureTrace: boolean, useSynthetic: boole
       chosenFromFallback,
       rejectionCounts,
       turnsPerKm: actualKm > 0 ? turnCount(points) / actualKm : 0,
+      aspectRatio: bboxAspectRatio(points),
     };
     const failures = applyThresholds(f, metrics);
     return {
@@ -469,15 +539,17 @@ function fmtRow(r: FixtureResult): string {
     `stubs=${m.stubs}  ` +
     `pend=${m.pendantLoops}  ` +
     `t/km=${m.turnsPerKm.toFixed(1)}  ` +
+    `aspect=${m.aspectRatio.toFixed(1)}  ` +
     `green=${(m.greenProximity * 100).toFixed(0)}%  ` +
     `anch=${m.anchorCount}  ` +
     `pts=${m.pointCount}`;
   // Show per-reason rejection breakdown only when something interesting
   // happened — otherwise it's noise on every clean PASS row.
   const rc = m.rejectionCounts;
-  const totalRejects = rc.distance + rc.barrier + rc.highway + rc.backtrack + rc.pendantLoop + rc.osrmNull;
+  const totalRejects = rc.distance + rc.barrier + rc.highway + rc.backtrack
+    + rc.pendantLoop + rc.osrmNull + rc.aspect + rc.turnDensity;
   const rejectStr = totalRejects > 0
-    ? `  rej={bt=${rc.backtrack},pl=${rc.pendantLoop},d=${rc.distance},h=${rc.highway},b=${rc.barrier},n=${rc.osrmNull}}`
+    ? `  rej={bt=${rc.backtrack},pl=${rc.pendantLoop},d=${rc.distance},h=${rc.highway},b=${rc.barrier},n=${rc.osrmNull},as=${rc.aspect},td=${rc.turnDensity}}`
     : '';
   const tail = r.failures.length ? `  -- ${r.failures.join('; ')}` : '';
   return `${tag}  ${dataTag}${pad(r.fixture.name, 32)}  ${summary}${rejectStr}${tail}`;

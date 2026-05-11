@@ -48,7 +48,7 @@ function failureDiagSuffix(email: string | null | undefined): string {
   if (!diag) return ` [v=${ver}]`;
   const rr = diag.rejectReasons;
   const qBreakdown = diag.qualityRejectCount > 0
-    ? ` (d=${rr.distance} b=${rr.barrier} h=${rr.highway} o=${rr.offStreet} p=${rr.pendantLoop} t=${rr.backtrack})`
+    ? ` (d=${rr.distance} b=${rr.barrier} h=${rr.highway} o=${rr.offStreet} p=${rr.pendantLoop} t=${rr.backtrack} a=${rr.aspect} tu=${rr.turnDensity})`
     : '';
   return ` [n=${diag.osrmNullCount} q=${diag.qualityRejectCount}${qBreakdown} w=${diag.wrongDisplayCount}${diag.budgetExpired ? ' BUDGET' : ''} v=${ver}]`;
 }

@@ -626,7 +626,7 @@ export default function SetupScreen() {
           const ver = (Updates.updateId ?? 'embedded').slice(0, 8);
           const rr = diag?.rejectReasons;
           const qBreakdown = rr && diag!.qualityRejectCount > 0
-            ? ` (d=${rr.distance} b=${rr.barrier} h=${rr.highway} o=${rr.offStreet} p=${rr.pendantLoop} t=${rr.backtrack})`
+            ? ` (d=${rr.distance} b=${rr.barrier} h=${rr.highway} o=${rr.offStreet} p=${rr.pendantLoop} t=${rr.backtrack} a=${rr.aspect} tu=${rr.turnDensity})`
             : '';
           detail = diag
             ? ` [n=${diag.osrmNullCount} q=${diag.qualityRejectCount}${qBreakdown} w=${diag.wrongDisplayCount}${diag.budgetExpired ? ' BUDGET' : ''} v=${ver}]`

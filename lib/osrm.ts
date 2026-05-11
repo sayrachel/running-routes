@@ -1,7 +1,7 @@
 import type { RoutePoint, GeneratedRoute, RoutePreferences, ManeuverStep } from './route-generator';
 import { fetchGreenSpacesAndHighways } from './overpass';
 import type { GreenSpace } from './overpass';
-import { scoreRoute, computeGreenSpaceProximity, computeRunPathProximity, computeHighwayProximity, computeWaterfrontProximity, countStartPasses, reversalCount, turnCount } from './route-scoring';
+import { scoreRoute, computeGreenSpaceProximity, computeRunPathProximity, computeHighwayProximity, computeWaterfrontProximity, countStartPasses, reversalCount, turnCount, bboxAspectRatio } from './route-scoring';
 import { emit as traceEmit } from './debug-trace';
 import { isPopularRunningPark } from './popular-running-parks';
 
@@ -46,6 +46,8 @@ export interface FailureDiagnostics {
     offStreet: number;
     pendantLoop: number;
     backtrack: number;
+    aspect: number;
+    turnDensity: number;
   };
 }
 let lastFailureDiagnostics: FailureDiagnostics | null = null;
@@ -2828,6 +2830,7 @@ export async function generateOSRMRoutes(
   // backtrack, or distance.
   const rejectReasons = {
     distance: 0, barrier: 0, highway: 0, offStreet: 0, pendantLoop: 0, backtrack: 0,
+    aspect: 0, turnDensity: 0,
   };
   // Hard rejection only for "completely unusable" cases: distance way off,
   // crosses a clear barrier, or routes along highways. Soft thresholds on
@@ -3030,6 +3033,55 @@ export async function generateOSRMRoutes(
         traceEmit('candidate-rejected', { i, reason: 'backtrack', retraced, overlap });
         continue;
       }
+      const isOutAndBack = routeType === 'out-and-back';
+      const targetMi = distanceKm * 0.621371;
+      const actualMi = distKm * 0.621371;
+      // HARD REJECT: degenerate-shape loops. The user-reported 3mi East
+      // Village "Quiet Lanes" case (May 2026) was a clean closed loop on
+      // every existing metric (low retrace/overlap, zero stubs, valid
+      // distance) but visibly read as a "through line": outbound and
+      // closing legs both ran along E 14th St on opposite sides of start,
+      // bbox aspect ~25. Generalizes to squished ovals, snake-shape
+      // routes weaving along a single corridor, long-stem lollipops where
+      // the stem dominates the bbox. Threshold of 5: a healthy city loop
+      // (1.6km × 0.8km rectangle) is aspect 2; aspect 5+ reads as a "line"
+      // not a loop on the map. Out-and-back exempt (intentionally 1-D);
+      // point-to-point exempt (start-end pair can be far apart along one
+      // axis, naturally high aspect).
+      const aspectRatio = (isOutAndBack || routeType === 'point-to-point')
+        ? 1
+        : bboxAspectRatio(points);
+      if (!isOutAndBack && routeType !== 'point-to-point' && aspectRatio > 5) {
+        qualityRejectCount++;
+        rejectReasons.aspect++;
+        traceEmit('candidate-rejected', { i, reason: 'aspect', aspectRatio });
+        continue;
+      }
+      // HARD REJECT: extreme turn density. The user complaint pattern
+      // (May 2026) is "way too many turns" on routes that pass every
+      // other metric. The qualityPenalty already includes a per-km turn
+      // penalty above the floor, but in dense grids where every candidate
+      // has 4+ t/km that penalty doesn't decisively eliminate the worst
+      // offenders. Hard absolute cap: turnsPerKm > 7.0 is a turn every
+      // ~140m on average — clearly broken pattern even for the densest
+      // urban grid (natural NYC street-grid loops sit at 4-6 t/km even
+      // when clean). Threshold tuned so that legitimate dense-grid
+      // candidates survive, only egregious zigzag/staircase patterns get
+      // rejected. Only applies to routes ≥2mi where the cap leaves room
+      // for the baseline turns of a small loop (1mi loops can't get
+      // below ~5 t/km even when clean). Out-and-back exempt; the return
+      // leg doubles the turn count from a "unique decisions" standpoint.
+      const turnsPerKm = isOutAndBack || distKm < 0.1 ? 0 : turnCount(points) / distKm;
+      // 1.95mi tolerance instead of literal 2: targetMi is computed by
+      // round-tripping the user's mile request through km
+      // (2 * 1.60934 → 3.21868 → 1.99999...), which falls just below 2.0
+      // and silently disables the gate for exact-2mi user requests.
+      if (!isOutAndBack && targetMi >= 1.95 && turnsPerKm > 7.0) {
+        qualityRejectCount++;
+        rejectReasons.turnDensity++;
+        traceEmit('candidate-rejected', { i, reason: 'turn-density', turnsPerKm });
+        continue;
+      }
       // Quality score: 0 = perfect, higher = worse. Out-and-back is exempt
       // from retrace/overlap. Components:
       //   retrace + overlap: visible polyline ugliness
@@ -3038,7 +3090,6 @@ export async function generateOSRMRoutes(
       //     a "4 mi route" returns 3 mi the user feels misled
       //   - anchorBonus: small thumb on the scale toward named green
       //     spaces, but small enough that distance / cleanliness still wins
-      const isOutAndBack = routeType === 'out-and-back';
       const anchorBonus = candidates[i].anchors.length >= 2 ? 0.10
         : candidates[i].anchors.length === 1 ? 0.05
         : 0;
@@ -3049,8 +3100,6 @@ export async function generateOSRMRoutes(
       // so a candidate that rounds correctly wins even if it's slightly
       // dirtier than one that doesn't. Empirically lifted random-seed
       // pass rate from ~5/15 to ~7/15 across the NYC harness fixtures.
-      const targetMi = distanceKm * 0.621371;
-      const actualMi = distKm * 0.621371;
       const roundedDelta = Math.abs(Math.round(actualMi) - Math.round(targetMi));
       const roundingPenalty = roundedDelta * 0.4;
       // Topology penalties: discourage barbells (multi-lobe routes joined
@@ -3059,19 +3108,11 @@ export async function generateOSRMRoutes(
       // a U-turn.
       const startPasses = isOutAndBack ? 0 : countStartPasses(points);
       const reversalsPerKm = isOutAndBack || distKm < 0.1 ? 0 : reversalCount(points) / distKm;
-      // Turn density: penalize zigzag/staircase routes that pass retrace +
-      // overlap + stubs cleanly but force a turn every block. The user
-      // complaint pattern (May 2026) was 4mi East Village routes at ~5
-      // turns/km — visibly fine on every other metric, exhausting to run.
-      // Floor scales inversely with target distance: a closed loop has a
-      // baseline minimum turn count (~4 for any rectangle), so t/km is
-      // mathematically higher for short loops regardless of zigzag — 1mi
-      // loops can't get below ~5 t/km even when clean. Empirical floor:
-      // max(2.0, 6.0 / targetMi). Out-and-back exempt (its return leg
-      // doubles the turn count from the perspective of unique decisions).
-      const targetMiForFloor = distanceKm * 0.621371;
+      // Turn density penalty (in addition to the hard cap above): scales
+      // inversely with target distance because short loops have a higher
+      // baseline (1mi loops can't get below ~5 t/km even when clean).
+      const targetMiForFloor = targetMi;
       const turnFloor = Math.max(2.0, 6.0 / Math.max(0.5, targetMiForFloor));
-      const turnsPerKm = isOutAndBack || distKm < 0.1 ? 0 : turnCount(points) / distKm;
       const excessTurns = Math.max(0, turnsPerKm - turnFloor);
       // 0.10 per excess turn/km. Sized so a 4mi East Village at 5 t/km pays
       // ~0.30 (loses to a cleaner candidate when one exists), but a clean
@@ -3105,7 +3146,7 @@ export async function generateOSRMRoutes(
         turnPenalty -
         anchorBonus
       );
-      traceEmit('candidate-evaluated', { i, distKm, distRatio, hwProximity, retraced, overlap, stubs, startPasses, reversalsPerKm, turnsPerKm, turnPenalty, roundingPenalty, qualityPenalty });
+      traceEmit('candidate-evaluated', { i, distKm, distRatio, hwProximity, retraced, overlap, stubs, startPasses, reversalsPerKm, turnsPerKm, turnPenalty, roundingPenalty, aspectRatio, qualityPenalty });
       // Final gate: rounded-display match. The user-facing distance label is
       // an integer mile (or km, in metric). A 5mi request that returns a
       // 5.6mi route shows "6 mi" — the user reads it as the wrong route even
@@ -3311,12 +3352,29 @@ export async function generateOSRMRoutes(
         ? 0
         : computeOffStreetRatio(chosen.route, greenSpaces);
       const fallbackOffStreet = fallbackOffStreetRatio > 0.10;
+      // Same shape gates as step 3. Without these, step 3.5 would happily
+      // ship the exact "Quiet Lanes through-line" pattern that motivated
+      // the gates in the first place — the bearing-trial chooser only
+      // optimizes for distance fit, never for shape. Loops only (OAB is
+      // intentionally 1-D; p2p is start-end constrained).
+      const fallbackIsLoop = routeType !== 'out-and-back' && routeType !== 'point-to-point';
+      const fallbackAspect = fallbackIsLoop ? bboxAspectRatio(points) : 1;
+      const fallbackAspectBad = fallbackIsLoop && fallbackAspect > 5;
+      const fallbackTargetMi = distanceKm * 0.621371;
+      const fallbackTurnsPerKm = fallbackIsLoop && fallbackDistKm > 0.1
+        ? turnCount(points) / fallbackDistKm : 0;
+      // 1.95 tolerance — see step-3 turn-density gate for rationale.
+      const fallbackTurnsBad = fallbackIsLoop && fallbackTargetMi >= 1.95 && fallbackTurnsPerKm > 7.0;
       if (fallbackPendant > 0) {
         traceEmit('candidate-rejected', { i: -1, reason: 'pendant-loop', pendantLoops: fallbackPendant, source: 'fallback-post-trim-residual' });
       } else if (fallbackDistanceOutOfBand) {
         traceEmit('candidate-rejected', { i: -1, reason: 'distance', distKm: fallbackDistKm, distRatio: fallbackDistRatio, target: distanceKm, source: 'fallback' });
       } else if (fallbackOffStreet) {
         traceEmit('candidate-rejected', { i: -1, reason: 'off-street', offStreetRatio: fallbackOffStreetRatio, source: 'fallback' });
+      } else if (fallbackAspectBad) {
+        traceEmit('candidate-rejected', { i: -1, reason: 'aspect', aspectRatio: fallbackAspect, source: 'fallback' });
+      } else if (fallbackTurnsBad) {
+        traceEmit('candidate-rejected', { i: -1, reason: 'turn-density', turnsPerKm: fallbackTurnsPerKm, source: 'fallback' });
       } else {
         const fallbackRecord: ResolvedCandidate = {
           index: 0,
