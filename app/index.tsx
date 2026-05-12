@@ -49,7 +49,12 @@ function haversineDistanceMiles(lat1: number, lng1: number, lat2: number, lng2: 
 
 /** Continuous slider for distance selection.
  *  Thumb follows finger smoothly; displayed value snaps to whole numbers.
- *  First half of track: 1–5. Second half: 5–max. */
+ *  Three-segment piecewise linear (imperial example with maxValue=20):
+ *    [0%, 50%]   → 1–5  mi (fine control on short runs)
+ *    [50%, 75%]  → 5–10 mi (mid-range, half-marathon territory)
+ *    [75%, 100%] → 10–20 mi (long runs)
+ *  Effect: 10mi sits at the visual midpoint between 5 and 20 — most users
+ *  pick distances ≤10, so the lower half of the slider gets denser ticks. */
 function DistanceSlider({
   value,
   onChange,
@@ -72,20 +77,41 @@ function DistanceSlider({
   const lastRounded = useRef(value);
   const [dragging, setDragging] = useState(false);
 
-  const midpoint = Math.min(5, maxValue);
+  // Three breakpoints, scaled to maxValue so the same shape works for both
+  // imperial (1/5/10/20) and metric (1/8/16/32). Ratios chosen so the user
+  // -reported preference holds: middle marker at the visual midpoint between
+  // mid and max (10 sits at 75% on the 1–20 imperial slider).
+  const lowBp = Math.min(5, maxValue);
+  const midBp = Math.min(Math.round(maxValue / 2), maxValue);
+
   const valToFrac = (v: number) => {
-    if (v <= midpoint) return ((v - 1) / (midpoint - 1)) * 0.5;
-    return 0.5 + ((v - midpoint) / (maxValue - midpoint)) * 0.5;
+    if (v <= 1) return 0;
+    if (v >= maxValue) return 1;
+    if (v <= lowBp) return ((v - 1) / (lowBp - 1)) * 0.5;
+    if (v <= midBp) return 0.5 + ((v - lowBp) / (midBp - lowBp)) * 0.25;
+    return 0.75 + ((v - midBp) / (maxValue - midBp)) * 0.25;
   };
   const fracToVal = (f: number) => {
-    if (f <= 0.5) return 1 + (f / 0.5) * (midpoint - 1);
-    return midpoint + ((f - 0.5) / 0.5) * (maxValue - midpoint);
+    if (f <= 0.5) return 1 + (f / 0.5) * (lowBp - 1);
+    if (f <= 0.75) return lowBp + ((f - 0.5) / 0.25) * (midBp - lowBp);
+    return midBp + ((f - 0.75) / 0.25) * (maxValue - midBp);
   };
 
-  const [rawFraction, setRawFraction] = useState(() => valToFrac(value));
+  // Persisted distance from a previous build with a higher cap (e.g. 31mi
+  // saved when the cap was 30) renders the thumb past the right edge until
+  // the user touches the slider. Clamp the displayed value AND notify the
+  // parent so the persisted value gets rewritten to the new cap.
+  const displayValue = Math.max(1, Math.min(maxValue, value));
+  useEffect(() => {
+    if (value !== displayValue && !disabled) {
+      lastRounded.current = displayValue;
+      onChange(displayValue);
+    }
+  }, [value, displayValue, onChange, disabled]);
 
-  // Piecewise linear: [0, 0.5] → [1, midpoint], [0.5, 1] → [midpoint, maxValue]
-  const fraction = dragging ? rawFraction : valToFrac(value);
+  const [rawFraction, setRawFraction] = useState(() => valToFrac(displayValue));
+
+  const fraction = dragging ? rawFraction : valToFrac(displayValue);
 
   const processTouch = useCallback((pageX: number) => {
     if (disabled) return;
@@ -105,13 +131,13 @@ function DistanceSlider({
   const handleGrant = useCallback((e: any) => {
     if (disabled) return;
     setDragging(true);
-    lastRounded.current = value;
+    lastRounded.current = displayValue;
     onDragStart?.();
     sliderRef.current?.measure((_x: number, _y: number, width: number, _h: number, px: number) => {
       trackLayout.current = { pageX: px, width };
       processTouch(e.nativeEvent.pageX);
     });
-  }, [processTouch, disabled, onDragStart, value]);
+  }, [processTouch, disabled, onDragStart, displayValue]);
 
   const handleRelease = useCallback(() => {
     setDragging(false);
@@ -121,7 +147,7 @@ function DistanceSlider({
   return (
     <View style={disabled ? { opacity: 0.45 } : undefined}>
       <View style={styles.sliderValueRow}>
-        <Text style={styles.sliderValue}>{value}</Text>
+        <Text style={styles.sliderValue}>{displayValue}</Text>
         <Text style={styles.sliderUnit}>{unit}</Text>
       </View>
       <View
@@ -140,9 +166,10 @@ function DistanceSlider({
         <View style={[styles.sliderThumb, { left: `${fraction * 100}%` }]} />
       </View>
       <View style={styles.sliderRangeLabels}>
-        <Text style={styles.sliderLabelText}>1</Text>
-        <Text style={styles.sliderLabelText}>{midpoint}</Text>
-        <Text style={styles.sliderLabelText}>{maxValue}</Text>
+        <Text style={[styles.sliderLabelText, { left: '0%' }]}>1</Text>
+        <Text style={[styles.sliderLabelText, styles.sliderLabelCentered, { left: '50%' }]}>{lowBp}</Text>
+        <Text style={[styles.sliderLabelText, styles.sliderLabelCentered, { left: '75%' }]}>{midBp}</Text>
+        <Text style={[styles.sliderLabelText, { right: 0 }]}>{maxValue}</Text>
       </View>
     </View>
   );
@@ -1364,14 +1391,18 @@ const styles = StyleSheet.create({
     top: 5,
   },
   sliderRangeLabels: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
+    position: 'relative',
+    height: 14,
     marginTop: 2,
   },
   sliderLabelText: {
+    position: 'absolute',
     fontFamily: Fonts.sans,
     fontSize: 9,
     color: Colors.mutedForeground,
+  },
+  sliderLabelCentered: {
+    transform: [{ translateX: -6 }],
   },
   fixedButtonArea: {
     borderTopWidth: 1,

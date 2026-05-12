@@ -899,19 +899,19 @@ export function hasRoutedBarrierCrossing(
 
   // --- Heuristic 3: Sparse long edge (tunnel/ferry/unwalkable way) ---
   // OSRM with overview=full returns the OSM way's full node list. Walkable
-  // infrastructure is densely noded — Manhattan blocks ~80–250m, foot-
-  // walkable bridges (Brooklyn, Williamsburg, GW) sample at ~50m on the
-  // walkway. A single polyline edge >500m almost always means OSRM routed
-  // through an OSM way that has no intermediate nodes, which in practice
-  // is a car tunnel (Lincoln, Holland, Queens-Midtown — sometimes mistagged
-  // as foot-routable) or a ferry segment. Heuristics 1 and 2 missed the
-  // user-reported Manhattan→Hoboken loop because the tunnel was rendered
-  // as just two endpoints (so the dense-sample straight-line scan didn't
-  // hit it) and Hoboken sat within the 8km drift cap. This catches that
-  // case directly.
+  // infrastructure is reasonably noded, but real-world OSM data is uneven —
+  // some legitimate edges exceed 500m even on foot-walkable infra (long
+  // park paths with sparse intersections, some bridge segments). A 0.5km
+  // threshold rejected 100% of 12 candidates on a real-OSRM 20mi NYC loop
+  // (user-reported "Q=12 B=12"). Tunnels we actually want to catch are
+  // 1.5–2.6km single segments (Lincoln 2.4km, Holland 2.6km, Brooklyn-
+  // Battery 2.8km). 1.2km threshold sits comfortably between legit edges
+  // and tunnel-class single segments — catches the user-reported Manhattan
+  // →Hoboken case (those tunnels are 2km+ each) without rejecting routes
+  // that include normally-noded long greenway sections.
   for (let i = 1; i < routePoints.length; i++) {
     const edgeKm = haversineDistance(routePoints[i - 1], routePoints[i]);
-    if (edgeKm > 0.5) {
+    if (edgeKm > 1.2) {
       console.log(`[BarrierCheck] Sparse long edge: ${edgeKm.toFixed(3)}km between consecutive polyline points`);
       return true;
     }
