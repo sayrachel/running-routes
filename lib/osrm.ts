@@ -2977,8 +2977,20 @@ export async function generateOSRMRoutes(
         continue;
       }
       const hwProximity = computeHighwayProximity(points, highwayPoints);
-      // HARD REJECT: route runs alongside major highways
-      if (hwProximity > 0.15) {
+      // HARD REJECT: route runs alongside major highways. Was 0.15 (15%
+      // of route within 100m of a major-road centerpoint), but with the
+      // old centroid-only highway dataset, long highways like the BQE
+      // were represented by a single point — many sampled route positions
+      // weren't "near" the BQE even when running directly along it. The
+      // user-reported Williamsburg "Sidestreet Shuffle" hit 19mi and
+      // included a long stretch alongside I-278; the centroid was km
+      // away so hwProximity barely registered. With highway data now
+      // densified (every ~150m along each way), the same proximity
+      // measurement is much more accurate, and the previous 15% gate
+      // would have caught the BQE case. Tightening to 8% as a margin
+      // because runners tolerate near-zero exposure to interstates and
+      // 8% of a 30km route is still ~2.4km — generous floor.
+      if (hwProximity > 0.08) {
         qualityRejectCount++;
         rejectReasons.highway++;
         traceEmit('candidate-rejected', { i, reason: 'highway', hwProximity });
@@ -3434,12 +3446,22 @@ export async function generateOSRMRoutes(
       // baseline to drift from.
       const fallbackBarrier = fallbackIsLoop &&
         hasRoutedBarrierCrossing(points, greenSpaces, center, distanceKm);
+      // Same highway-proximity gate as step 3. Step 3.5 was missing this
+      // (alongside the barrier check, fixed earlier) — when every step-3
+      // candidate failed the highway gate, step 3.5 would happily ship a
+      // route with the same problem since none of its other gates check
+      // for highway adjacency.
+      const fallbackHwProximity = fallbackIsLoop
+        ? computeHighwayProximity(points, highwayPoints) : 0;
+      const fallbackHighwayBad = fallbackIsLoop && fallbackHwProximity > 0.08;
       if (fallbackPendant > 0) {
         traceEmit('candidate-rejected', { i: -1, reason: 'pendant-loop', pendantLoops: fallbackPendant, source: 'fallback-post-trim-residual' });
       } else if (fallbackDistanceOutOfBand) {
         traceEmit('candidate-rejected', { i: -1, reason: 'distance', distKm: fallbackDistKm, distRatio: fallbackDistRatio, target: distanceKm, source: 'fallback' });
       } else if (fallbackBarrier) {
         traceEmit('candidate-rejected', { i: -1, reason: 'barrier', distKm: fallbackDistKm, source: 'fallback' });
+      } else if (fallbackHighwayBad) {
+        traceEmit('candidate-rejected', { i: -1, reason: 'highway', hwProximity: fallbackHwProximity, source: 'fallback' });
       } else if (fallbackOffStreet) {
         traceEmit('candidate-rejected', { i: -1, reason: 'off-street', offStreetRatio: fallbackOffStreetRatio, source: 'fallback' });
       } else if (fallbackAspectBad) {

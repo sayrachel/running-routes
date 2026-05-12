@@ -493,16 +493,41 @@ function parseGreenSpaceElements(elements: any[]): GreenSpace[] {
 
 /** Build deduplicated highway centers from the highway subset of an Overpass response. */
 function parseHighwayElements(elements: any[]): RoutePoint[] {
+  // Use the way's full geometry (out geom;) and sample along it. Was just
+  // the centroid (out center;), which for a 5km BQE segment is a single
+  // point at the geometric middle — the proximity check missed routes
+  // running along the BQE in Williamsburg because the nearest highway
+  // "point" was 1km+ away. Sampling at ~150m gives every long highway
+  // ~30+ representative points, so the proximity scan can actually find
+  // a route running alongside it. Endpoints always included so the joins
+  // between adjacent ways stay covered.
+  const SAMPLE_KM = 0.15;
   const points: RoutePoint[] = [];
   for (const el of elements) {
-    if (el.center?.lat != null && el.center?.lon != null) {
+    const geom: Array<{ lat: number; lon: number }> | undefined = el.geometry;
+    if (geom && geom.length > 0) {
+      let acc = 0;
+      points.push({ lat: geom[0].lat, lng: geom[0].lon });
+      for (let i = 1; i < geom.length; i++) {
+        const prev = { lat: geom[i - 1].lat, lng: geom[i - 1].lon };
+        const cur = { lat: geom[i].lat, lng: geom[i].lon };
+        acc += haversineDistance(prev, cur);
+        if (acc >= SAMPLE_KM || i === geom.length - 1) {
+          points.push(cur);
+          acc = 0;
+        }
+      }
+    } else if (el.center?.lat != null && el.center?.lon != null) {
+      // Fallback for elements without geometry (shouldn't happen with
+      // out geom; but defensive against partial Overpass responses).
       points.push({ lat: el.center.lat, lng: el.center.lon });
     }
   }
-  // Deduplicate within 100m
+  // Deduplicate within 50m. Tighter than the previous 100m because we now
+  // have many more points per way and want to keep the spatial resolution.
   const deduped: RoutePoint[] = [];
   for (const p of points) {
-    if (!deduped.some((d) => haversineDistance(d, p) < 0.1)) deduped.push(p);
+    if (!deduped.some((d) => haversineDistance(d, p) < 0.05)) deduped.push(p);
   }
   return deduped;
 }
@@ -580,7 +605,7 @@ export async function fetchHighwaySegments(
 
   const radiusMeters = Math.round(radiusKm * 1000);
   const a = `around:${radiusMeters},${center.lat},${center.lng}`;
-  const query = `[out:json][timeout:4];(${highwaySubQuery(a)});out center;`;
+  const query = `[out:json][timeout:4];(${highwaySubQuery(a)});out geom;`;
 
   try {
     const res = await fetchOverpassRace(query);
@@ -668,7 +693,7 @@ export async function fetchGreenSpacesAndHighways(
   // data is used to penalize routes near major roads; missing highway
   // data degrades quality slightly but doesn't block generation.
   const greenQuery = `[out:json][timeout:10];(${greenSpaceSubQuery(a)});out center bb tags;`;
-  const highwayQuery = `[out:json][timeout:10];(${highwaySubQuery(a)});out center;`;
+  const highwayQuery = `[out:json][timeout:10];(${highwaySubQuery(a)});out geom;`;
 
   // Wrap the actual fetch in a promise we can register before awaiting.
   // The .finally below removes the entry whether the fetch succeeded or
