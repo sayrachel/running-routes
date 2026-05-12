@@ -979,7 +979,7 @@ export default function SetupScreen() {
                 onChange={() => {}}
                 disabled
                 unit={distanceUnit(localPrefs.units)}
-                maxValue={localPrefs.units === 'metric' ? 50 : 30}
+                maxValue={localPrefs.units === 'metric' ? 32 : 20}
               />
             ) : (
               <DistanceSlider
@@ -988,7 +988,7 @@ export default function SetupScreen() {
                 onDragStart={() => setSliderActive(true)}
                 onDragEnd={() => setSliderActive(false)}
                 unit={distanceUnit(localPrefs.units)}
-                maxValue={localPrefs.units === 'metric' ? 50 : 30}
+                maxValue={localPrefs.units === 'metric' ? 32 : 20}
               />
             )}
           </View>

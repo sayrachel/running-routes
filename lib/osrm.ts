@@ -897,6 +897,26 @@ export function hasRoutedBarrierCrossing(
     }
   }
 
+  // --- Heuristic 3: Sparse long edge (tunnel/ferry/unwalkable way) ---
+  // OSRM with overview=full returns the OSM way's full node list. Walkable
+  // infrastructure is densely noded — Manhattan blocks ~80–250m, foot-
+  // walkable bridges (Brooklyn, Williamsburg, GW) sample at ~50m on the
+  // walkway. A single polyline edge >500m almost always means OSRM routed
+  // through an OSM way that has no intermediate nodes, which in practice
+  // is a car tunnel (Lincoln, Holland, Queens-Midtown — sometimes mistagged
+  // as foot-routable) or a ferry segment. Heuristics 1 and 2 missed the
+  // user-reported Manhattan→Hoboken loop because the tunnel was rendered
+  // as just two endpoints (so the dense-sample straight-line scan didn't
+  // hit it) and Hoboken sat within the 8km drift cap. This catches that
+  // case directly.
+  for (let i = 1; i < routePoints.length; i++) {
+    const edgeKm = haversineDistance(routePoints[i - 1], routePoints[i]);
+    if (edgeKm > 0.5) {
+      console.log(`[BarrierCheck] Sparse long edge: ${edgeKm.toFixed(3)}km between consecutive polyline points`);
+      return true;
+    }
+  }
+
   return false;
 }
 
@@ -3403,10 +3423,23 @@ export async function generateOSRMRoutes(
         ? turnCount(points) / fallbackDistKm : 0;
       // 1.95 tolerance — see step-3 turn-density gate for rationale.
       const fallbackTurnsBad = fallbackIsLoop && fallbackTargetMi >= 1.95 && fallbackTurnsPerKm > 7.0;
+      // Same barrier-crossing check as step 3 (line ~2953). Step 3.5 was
+      // historically missing it, so when every step-3 candidate failed the
+      // barrier gate (typical for long loops in geographically constrained
+      // starts like Manhattan, where most bearings hit a river), the
+      // bearing-trial fallback would happily ship a route that crossed the
+      // Hudson via Lincoln/Holland Tunnel — visible to the user as straight
+      // diagonal lines across water. Loops only; out-and-back is exempt for
+      // the same reason as step 3 and point-to-point doesn't have a center
+      // baseline to drift from.
+      const fallbackBarrier = fallbackIsLoop &&
+        hasRoutedBarrierCrossing(points, greenSpaces, center, distanceKm);
       if (fallbackPendant > 0) {
         traceEmit('candidate-rejected', { i: -1, reason: 'pendant-loop', pendantLoops: fallbackPendant, source: 'fallback-post-trim-residual' });
       } else if (fallbackDistanceOutOfBand) {
         traceEmit('candidate-rejected', { i: -1, reason: 'distance', distKm: fallbackDistKm, distRatio: fallbackDistRatio, target: distanceKm, source: 'fallback' });
+      } else if (fallbackBarrier) {
+        traceEmit('candidate-rejected', { i: -1, reason: 'barrier', distKm: fallbackDistKm, source: 'fallback' });
       } else if (fallbackOffStreet) {
         traceEmit('candidate-rejected', { i: -1, reason: 'off-street', offStreetRatio: fallbackOffStreetRatio, source: 'fallback' });
       } else if (fallbackAspectBad) {
