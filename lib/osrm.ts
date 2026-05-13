@@ -961,7 +961,7 @@ export function calculateSearchRadius(
 // Green-space-first waypoint selection
 // ---------------------------------------------------------------------------
 
-export type CandidateStrategy = 'large-parks' | 'named-paths' | 'balanced' | 'macro-snap';
+export type CandidateStrategy = 'large-parks' | 'named-paths' | 'balanced' | 'macro-snap' | 'corridor-loop';
 
 /**
  * Score a green space for waypoint selection.
@@ -1596,6 +1596,143 @@ function generateMacroSnapLoop(
   if (reordered !== intermediate) {
     // Re-pair anchors with the reordered points. An anchor matches a
     // point iff lat/lng coincide; geometric-only vertices have no anchor.
+    const newAnchors: GreenSpace[] = [];
+    for (const pt of reordered) {
+      const matched = anchors.find((a) =>
+        a.point.lat === pt.lat && a.point.lng === pt.lng
+      );
+      if (matched) newAnchors.push(matched);
+    }
+    return { waypoints: [center, ...reordered, center], anchors: newAnchors };
+  }
+  return { waypoints, anchors };
+}
+
+/**
+ * Corridor-loop strategy (CLAUDE.md #38). Picks linear corridor anchors
+ * (greenways, waterfronts, bridges, named cycleways/footways) in each
+ * cardinal direction so every leg of the loop runs ALONG a corridor
+ * instead of weaving through dense grid.
+ *
+ * The user-reported East Village 16mi pattern: macro-snap got the Brooklyn
+ * lobe clean (via Williamsburg Bridge corridor) but the Manhattan side
+ * still block-weaved through SoHo because the Manhattan-side vertex
+ * snapped to a park (Washington Sq, dense weaving back) instead of the
+ * Hudson River Greenway (clean linear extension). Macro-snap has corridor
+ * preference (#36 0.5x discount) but it only flips ties — when the closest
+ * anchor to the macro vertex is a park, the park still wins.
+ *
+ * Corridor-loop guarantees corridors get used: it filters the anchor pool
+ * to corridors-only first, then assigns one to each cardinal direction by
+ * angular fit. Routes generated this way naturally have lobes per leg
+ * (each leg traverses or extends along a corridor) rather than grid fill.
+ *
+ * Falls back to geometric vertex when no corridor exists in a given
+ * direction (rare in NYC but possible elsewhere).
+ */
+function generateCorridorLoop(
+  center: RoutePoint,
+  distanceKm: number,
+  variant: number,
+  greenSpaces: GreenSpace[],
+): { waypoints: RoutePoint[]; anchors: GreenSpace[] } {
+  // Same vertex-count math as macro-snap so the two strategies produce
+  // candidates at comparable target distances.
+  const targetMi = distanceKm * 0.621371;
+  const numLoopWaypoints = targetMi >= 22 ? 4 : targetMi >= 14 ? 3 : 2;
+  const loopPerimeterFactor =
+    numLoopWaypoints === 4 ? 6.243 :
+    numLoopWaypoints === 3 ? 5.464 :
+    LOOP_TRIANGLE_PERIMETER;
+  const waypointDist = distanceKm / (loopPerimeterFactor * ROUTING_OVERHEAD);
+
+  // Filter to corridor-only anchors. Linear features extend over distance
+  // (a runner traversing them gets clean linear progress) vs parks
+  // (point destinations that OSRM weaves to/from).
+  const LINEAR_KINDS = new Set<GreenSpace['kind']>([
+    'cycleway', 'footway', 'path', 'route', 'waterfront',
+  ]);
+  const corridors = greenSpaces.filter((gs) => LINEAR_KINDS.has(gs.kind));
+
+  // If too few corridors, this strategy can't work — fall back to
+  // macro-snap (which itself falls back to geometric if needed).
+  if (corridors.length < numLoopWaypoints) {
+    return generateMacroSnapLoop(center, distanceKm, variant, greenSpaces);
+  }
+
+  // Bearings spaced for variety, same seed math as macro-snap.
+  const seedBearing = (variant * 137) % 360;
+  const arc = 360; // full 360° spread for corridor-loop; corridors don't
+                    // benefit from the 330° asymmetry that prevented closing-
+                    // leg overlap in macro-snap.
+  const step = arc / numLoopWaypoints;
+
+  // Tolerance for "corridor in this direction": ±60° from target bearing.
+  // Corridors don't always sit exactly on the planned compass — the user's
+  // start might not have a corridor due south but does have one to the SW.
+  // 60° tolerance lets us catch those without crossing into the next
+  // cardinal direction.
+  const SEARCH_ARC_DEG = 60;
+  // Distance band: corridor anchor should be roughly at waypointDist from
+  // center (where a macro-snap vertex would land). 0.4×–1.6× allows for
+  // varied corridor positions while keeping the loop perimeter on target.
+  const MIN_DIST_KM = waypointDist * 0.4;
+  const MAX_DIST_KM = waypointDist * 1.6;
+
+  const usedAnchorIdx = new Set<number>();
+  const waypoints: RoutePoint[] = [center];
+  const anchors: GreenSpace[] = [];
+
+  for (let k = 0; k < numLoopWaypoints; k++) {
+    const targetBearing = (seedBearing + k * step) % 360;
+
+    // Score each corridor: lower is better. Components:
+    //   - bearing fit: angular distance from target bearing (0 = perfect)
+    //   - distance fit: |dist - waypointDist| / waypointDist
+    //   - tier bonus: tier-1 corridors (named) get a small discount
+    let bestIdx = -1;
+    let bestScore = Infinity;
+    for (let idx = 0; idx < corridors.length; idx++) {
+      if (usedAnchorIdx.has(idx)) continue;
+      const c = corridors[idx];
+      const cBearing = bearingFrom(center, c.point);
+      const cDist = haversineDistance(center, c.point);
+      const bearingFit = angleDiff(cBearing, targetBearing);
+      if (bearingFit > SEARCH_ARC_DEG) continue;
+      if (cDist < MIN_DIST_KM || cDist > MAX_DIST_KM) continue;
+      const distFit = Math.abs(cDist - waypointDist) / waypointDist;
+      const tierBonus = c.tier === 1 ? -0.1 : 0;
+      // Combined score: bearing fit dominates (degrees ÷ 60 normalized to
+      // [0,1]), distance fit secondary (weighted 0.5), tier as small thumb.
+      const score = (bearingFit / 60) + distFit * 0.5 + tierBonus;
+      if (score < bestScore) {
+        bestScore = score;
+        bestIdx = idx;
+      }
+    }
+
+    if (bestIdx !== -1) {
+      const c = corridors[bestIdx];
+      // Need to find the original index in greenSpaces array for usedAnchorIdx
+      // (we filtered to `corridors` for iteration but `usedAnchorIdx` is keyed
+      // by `corridors` index — that's fine, both use the same filtered list).
+      waypoints.push(c.point);
+      anchors.push(c);
+      usedAnchorIdx.add(bestIdx);
+    } else {
+      // No corridor in this direction — fall back to a geometric vertex at
+      // the target bearing. Allows corridor-loop to succeed even when
+      // corridor coverage is sparse in one cardinal direction.
+      waypoints.push(destinationPoint(center, targetBearing, waypointDist));
+    }
+  }
+
+  waypoints.push(center);
+
+  // Reorder for lowest U-turn (same as macro-snap, CLAUDE.md #37).
+  const intermediate = waypoints.slice(1, -1);
+  const reordered = reorderForLowestUTurn(center, intermediate);
+  if (reordered !== intermediate) {
     const newAnchors: GreenSpace[] = [];
     for (const pt of reordered) {
       const matched = anchors.find((a) =>
@@ -2727,11 +2864,14 @@ export function fabricateElevationGain(distKm: number, variant: number): number 
 }
 
 /** Candidate strategies for variety. With 12-candidate pools each strategy
- *  gets ~3 attempts. 'macro-snap' is the loop-shape-first strategy (CLAUDE.md
- *  #34): plans the loop shape via compass bearings then snaps each vertex to
- *  the nearest scenic anchor. Competes against the existing strategies; if
- *  it consistently wins on long-loop quality, can be promoted to primary. */
-const STRATEGIES: CandidateStrategy[] = ['large-parks', 'named-paths', 'balanced', 'macro-snap'];
+ *  gets ~2-3 attempts. 'macro-snap' is the loop-shape-first strategy
+ *  (CLAUDE.md #34). 'corridor-loop' (CLAUDE.md #38) is the linear-corridor-
+ *  first strategy: picks corridor anchors (greenways, waterfronts, bridges,
+ *  named cycleways/footways) in each cardinal direction so every leg of the
+ *  loop runs along a corridor instead of weaving through dense grid.
+ *  Compete against the existing strategies; chooser picks the best by
+ *  quality. */
+const STRATEGIES: CandidateStrategy[] = ['large-parks', 'named-paths', 'balanced', 'macro-snap', 'corridor-loop'];
 
 /**
  * Generate real walking routes using the OSRM public API.
@@ -2918,18 +3058,25 @@ export async function generateOSRMRoutes(
         }
       }
     } else if (routeType === 'out-and-back') {
-      // macro-snap is loop-only — out-and-back has 1-D geometry, no shape
-      // to plan macro-first. Fall through to the existing strategies.
-      const obStrategy = strategy === 'macro-snap' ? 'balanced' : strategy;
+      // macro-snap and corridor-loop are loop-only — out-and-back has 1-D
+      // geometry, no shape to plan macro-first. Fall through.
+      const obStrategy = (strategy === 'macro-snap' || strategy === 'corridor-loop')
+        ? 'balanced' : strategy;
       const result = generateGreenSpaceOutAndBack(center, distanceKm, prefs, variant, availableGreenSpaces, obStrategy);
       waypoints = result.waypoints;
       anchors = result.anchors;
     } else {
-      // Loop. macro-snap plans the loop SHAPE first then snaps to anchors —
-      // see CLAUDE.md #34. Other strategies pick anchors first then connect.
-      const result = strategy === 'macro-snap'
-        ? generateMacroSnapLoop(center, distanceKm, variant, availableGreenSpaces)
-        : generateGreenSpaceLoop(center, distanceKm, prefs, variant, availableGreenSpaces, strategy);
+      // Loop. macro-snap plans the loop SHAPE first then snaps to anchors
+      // (#34); corridor-loop picks corridor anchors directly in cardinal
+      // directions (#38); other strategies pick anchors first then connect.
+      let result;
+      if (strategy === 'macro-snap') {
+        result = generateMacroSnapLoop(center, distanceKm, variant, availableGreenSpaces);
+      } else if (strategy === 'corridor-loop') {
+        result = generateCorridorLoop(center, distanceKm, variant, availableGreenSpaces);
+      } else {
+        result = generateGreenSpaceLoop(center, distanceKm, prefs, variant, availableGreenSpaces, strategy);
+      }
       waypoints = result.waypoints;
       anchors = result.anchors;
     }
