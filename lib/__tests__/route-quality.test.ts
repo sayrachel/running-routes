@@ -17,6 +17,7 @@ import {
   angleDiff,
   estimateCircuitDistance,
   scoreGreenSpace,
+  maxTurnSeverity,
 } from '../osrm';
 import { computeHighwayProximity, computeWaterfrontProximity, computeGreenSpaceProximity, computeRunPathProximity, scoreRoute, countStartPasses, reversalCount, turnCount } from '../route-scoring';
 import type { RoutePoint } from '../route-generator';
@@ -739,18 +740,18 @@ describe('selectGreenSpaceWaypoints', () => {
     }
   });
 
-  it('orders waypoints by bearing to form a loop (not zigzag)', () => {
+  it('orders waypoints so no consecutive transition requires a U-turn', () => {
     const parks = makeParksAround(NYC);
     const result = selectGreenSpaceWaypoints(NYC, parks, 8, false, 1, 'balanced');
 
     if (result && result.waypoints.length > 3) {
-      // Inner waypoints (excluding center bookends) should have monotonically
-      // increasing bearings — this means the route goes around in one direction
-      const inner = result.waypoints.slice(1, -1);
-      const bearings = inner.map((wp) => bearingFrom(NYC, wp));
-      for (let i = 1; i < bearings.length; i++) {
-        expect(bearings[i]).toBeGreaterThan(bearings[i - 1]);
-      }
+      // The previous contract was "bearing-monotonic" (waypoints sorted by
+      // compass bearing from center). That order isn't always optimal — for
+      // some pick configurations it forces a U-turn at one of the
+      // intermediate waypoints. The new contract (CLAUDE.md #37): waypoints
+      // are reordered to minimize max turn severity, so no transition
+      // requires OSRM to reverse direction. Check the property directly.
+      expect(maxTurnSeverity(result.waypoints)).toBeLessThan(170);
     }
   });
 
@@ -1368,15 +1369,14 @@ describe('route quality simulation', () => {
             }
           });
 
-          it('waypoints ordered by bearing (no zigzag)', () => {
+          it('waypoints ordered to avoid U-turn transitions', () => {
             const result = selectGreenSpaceWaypoints(center, greenSpaces, dist, false, 1, 'balanced');
             if (!result || result.waypoints.length <= 3) return;
 
-            const inner = result.waypoints.slice(1, -1);
-            const bearings = inner.map((wp) => bearingFrom(center, wp));
-            for (let i = 1; i < bearings.length; i++) {
-              expect(bearings[i]).toBeGreaterThan(bearings[i - 1]);
-            }
+            // CLAUDE.md #37: waypoints are reordered to minimize max turn
+            // severity (was bearing-monotonic, which forced U-turns for some
+            // pick configurations).
+            expect(maxTurnSeverity(result.waypoints)).toBeLessThan(170);
           });
         });
       }

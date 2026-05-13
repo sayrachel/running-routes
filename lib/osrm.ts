@@ -1035,6 +1035,88 @@ export function scoreGreenSpace(
  *
  * Returns null if fewer than 3 green space waypoints found (caller should fall back).
  */
+/**
+ * Compute the maximum turn severity at any interior waypoint in a sequence.
+ *
+ * For waypoints `[w0, w1, w2, ..., wn]`, the turn at w[i] is the angular
+ * difference between the bearing-in (w[i-1]→w[i]) and the bearing-out
+ * (w[i]→w[i+1]). 0° means the runner continues straight through w[i];
+ * 180° means a full U-turn. Values ≥160° require OSRM to reverse direction
+ * at that waypoint, which it can only achieve via a block-loop or U-turn —
+ * the visible spurs that originally motivated this check.
+ *
+ * For closed loops the wrap-around at center (w[n] → w[0] equivalence) is
+ * intentionally not checked: a circular loop arrives at start from one
+ * direction and "starts" from the opposite, but the runner experiences
+ * neither — they begin and end at the same time. Adding the wrap-around to
+ * the check would penalize good loops as much as bad ones.
+ */
+export function maxTurnSeverity(waypoints: RoutePoint[]): number {
+  if (waypoints.length < 3) return 0;
+  let maxTurn = 0;
+  for (let i = 1; i < waypoints.length - 1; i++) {
+    const bIn = bearingFrom(waypoints[i - 1], waypoints[i]);
+    const bOut = bearingFrom(waypoints[i], waypoints[i + 1]);
+    const turn = angleDiff(bIn, bOut);
+    if (turn > maxTurn) maxTurn = turn;
+  }
+  return maxTurn;
+}
+
+/**
+ * Try all permutations of intermediate waypoints (excluding fixed endpoints)
+ * and return the order that minimizes max turn severity. Catches the case
+ * where the bearing-sorted order forces a U-turn (e.g. picks at compass
+ * bearings 0°, 90°, 270° in bearing-sorted order has a 180° turn at the
+ * third waypoint, but the alternative order 90°→0°→270° has max turn 135°).
+ *
+ * Brute-force across N! permutations — fine for N≤5 (the practical waypoint
+ * count cap). Returns the input order unchanged if it's already optimal or
+ * if no better permutation exists.
+ *
+ * Closed-loop note: for a closed loop with center duplicated as both
+ * endpoints, the input is `[center, w1, w2, ..., wn, center]`. We permute
+ * w1..wn while keeping center fixed at both ends. The "reverse" permutation
+ * produces an equivalent loop (clockwise vs counter-clockwise) — we don't
+ * dedupe explicitly because the picker is correct either way.
+ */
+export function reorderForLowestUTurn(
+  center: RoutePoint,
+  intermediate: RoutePoint[],
+): RoutePoint[] {
+  if (intermediate.length <= 2) {
+    // For 0, 1, or 2 intermediate waypoints, no reordering helps —
+    // single-element sets have one order, and 2-element sets produce
+    // identical loops in either direction (closed-loop equivalence).
+    return intermediate;
+  }
+  // Cap at 5 to bound the permutation count (5! = 120). Above 5 the
+  // generator runs but the generation pipeline doesn't currently produce
+  // that many waypoints.
+  if (intermediate.length > 5) return intermediate;
+
+  let bestOrder = intermediate;
+  let bestMaxTurn = maxTurnSeverity([center, ...intermediate, center]);
+
+  const permute = (remaining: RoutePoint[], built: RoutePoint[]): void => {
+    if (remaining.length === 0) {
+      const turn = maxTurnSeverity([center, ...built, center]);
+      if (turn < bestMaxTurn) {
+        bestMaxTurn = turn;
+        bestOrder = [...built];
+      }
+      return;
+    }
+    for (let i = 0; i < remaining.length; i++) {
+      const next = [...remaining.slice(0, i), ...remaining.slice(i + 1)];
+      permute(next, [...built, remaining[i]]);
+    }
+  };
+  permute(intermediate, []);
+
+  return bestOrder;
+}
+
 export function selectGreenSpaceWaypoints(
   center: RoutePoint,
   greenSpaces: GreenSpace[],
@@ -1244,12 +1326,25 @@ export function selectGreenSpaceWaypoints(
 
   if (selectedPicks.length < 2) return null;
 
-  let waypoints: RoutePoint[] = [
-    center,
-    ...selectedPicks.map((p) => p.gs.point),
-    center,
-  ];
-  const anchors = selectedPicks.map((p) => p.gs);
+  // Reorder picks to minimize max turn severity at any waypoint. The
+  // bearing-sorted order (above) isn't always U-turn-free — e.g. picks at
+  // compass bearings 0°/90°/270° in bearing order force a 180° turn at the
+  // third waypoint. Reordering catches that without dropping any picks.
+  // Aligned with user request (May 2026, CLAUDE.md #37): when consecutive
+  // waypoints require OSRM to reverse direction, OSRM's only response is
+  // a U-turn or block-loop — fix it upstream by ordering waypoints so
+  // every transition is a forward-progressing turn.
+  const intermediatePoints = selectedPicks.map((p) => p.gs.point);
+  const reorderedPoints = reorderForLowestUTurn(center, intermediatePoints);
+  // Re-pair anchors with the reordered points by lookup. Coordinates are
+  // unique per pick (different green spaces) so this is unambiguous.
+  const anchors: GreenSpace[] = reorderedPoints.map((pt) => {
+    const pick = selectedPicks.find((p) =>
+      p.gs.point.lat === pt.lat && p.gs.point.lng === pt.lng
+    );
+    return pick!.gs;
+  });
+  let waypoints: RoutePoint[] = [center, ...reorderedPoints, center];
 
   // If the loop is way too long, drop the farthest waypoint
   if (waypoints.length > 4) {
@@ -1491,6 +1586,25 @@ function generateMacroSnapLoop(
   }
 
   waypoints.push(center);
+  // Reorder intermediate vertices to minimize max turn severity (CLAUDE.md
+  // #37). Macro-snap's planned bearings are well-spread so the input order
+  // is usually optimal, but jitter retries can move vertices by ±60° from
+  // their planned bearing — the bearing-sorted (visit-in-planned-order)
+  // sequence isn't always U-turn-free after that.
+  const intermediate = waypoints.slice(1, -1);
+  const reordered = reorderForLowestUTurn(center, intermediate);
+  if (reordered !== intermediate) {
+    // Re-pair anchors with the reordered points. An anchor matches a
+    // point iff lat/lng coincide; geometric-only vertices have no anchor.
+    const newAnchors: GreenSpace[] = [];
+    for (const pt of reordered) {
+      const matched = anchors.find((a) =>
+        a.point.lat === pt.lat && a.point.lng === pt.lng
+      );
+      if (matched) newAnchors.push(matched);
+    }
+    return { waypoints: [center, ...reordered, center], anchors: newAnchors };
+  }
   return { waypoints, anchors };
 }
 

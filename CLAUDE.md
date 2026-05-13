@@ -485,6 +485,46 @@ harness gap.
     still win on quality if its distance match is exact. The
     cluster penalty is the next move if macro-snap still loses.
 
+37. **Bearing-sorted waypoint order forced U-turns at the join.**
+    User-reported East Village 16mi after #36: a small spur near
+    start where the route went east, dead-ended, and retraced. User
+    diagnosed correctly: the issue is upstream — when consecutive
+    waypoints require OSRM to reverse direction on the same street,
+    OSRM's only response is a U-turn or block-loop. trimStubs misses
+    the block-loop variant (two ~90° turns instead of one ~180°
+    turn), trimPendantLoops misses the open-loop variant (endpoints
+    at different intersections), so the spur survives all post-
+    processing. Fix can only be upstream.
+    Root cause: `selectGreenSpaceWaypoints` sorted picks by compass
+    bearing from center to "form a loop" — but bearing-sorted order
+    isn't always U-turn-free. Concrete example: picks at compass
+    bearings 0°/90°/270° in bearing order has a 180° turn at the
+    third waypoint (the runner arrives going north and must depart
+    going south to reach the next waypoint), which OSRM resolves
+    via a block-loop. Reordering the same picks to (90°→0°→270°)
+    drops max turn severity to 135° — no U-turn anywhere.
+    Fix: added `maxTurnSeverity(waypoints)` and
+    `reorderForLowestUTurn(center, intermediate)` helpers. Both
+    `selectGreenSpaceWaypoints` and `generateMacroSnapLoop` now run
+    their picks through reorder before constructing the waypoint
+    array. Brute-force across N! permutations (capped at N=5, so
+    max 120 perms — negligible cost). The wrap-around at center
+    (last → center → first) is intentionally NOT checked: a
+    closed-loop's start/end direction inversion is geometric
+    closure, not a U-turn the runner experiences.
+    Test contract change: two existing tests asserted "waypoints
+    bearing-monotonic" — replaced with the actual desired property
+    ("max turn severity < 170°"). The previous contract was a
+    proxy for the desired property that didn't always hold for
+    pathological pick configurations.
+    What's NOT in this fix: anchor SELECTION still picks based on
+    bearing sectoring + scoring, not turn-severity awareness. So
+    if the picker insists on a configuration where NO permutation
+    is U-turn-free (rare but possible — 3 picks all at the same
+    bearing sector), the reorder can't help. Next step if needed:
+    drop picks that, when added, force a U-turn no matter the
+    order.
+
 ### Recurring-fix discipline
 
 User explicitly called out (May 2026) that the same class of bug ("route
