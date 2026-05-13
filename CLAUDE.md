@@ -191,3 +191,116 @@ covering 14 of 28 NYC fixtures, all locations):
     6mi). Not visibly broken, just over the strict 8% harness threshold.
 - Greenpoint fixtures (3, 4, 5mi) all pass cleanly — the user's exact
   scenario is covered.
+
+### May 2026 OTA fixes (post-Build 36)
+
+User-reported bugs surfaced by real-world use after EAS Update wired up.
+None of these were caught by the harness — all required visible-on-the-
+map screenshots from the user. Each entry: symptom → cause → fix →
+harness gap.
+
+25. **Distance slider capped at 30mi/50km but algorithm could still
+    reach NJ via Lincoln/Holland Tunnel from a Manhattan start at long
+    distances.** User reported a 31mi loop with straight diagonal lines
+    crossing the Hudson where OSRM had foot-routed through car tunnels
+    (OSM tag ambiguity). Fix: capped slider to 20mi/32km; that alone
+    reduces the algorithm's pressure to extend far enough to need a
+    tunnel, but the underlying tunnel-routing path is still reachable
+    at 20mi from edge-of-Manhattan starts. See entries 26-28 for the
+    structural fixes.
+
+26. **Step-3.5 bearing-trial fallback was missing the
+    `hasRoutedBarrierCrossing` check that step 3 had.** When every
+    step-3 candidate failed the barrier gate (typical for long
+    Manhattan loops, where most bearings hit a river), step 3.5 would
+    happily ship a westbound trial via Lincoln/Holland Tunnel since
+    none of its other gates (pendant, distance, off-street, aspect,
+    turns) catch water crossing. Fix: added the same barrier check to
+    the step-3.5 gate chain.
+
+27. **`hasRoutedBarrierCrossing` heuristic 1 (straight-line) and 2
+    (geographic drift) both missed the user's Hudson tunnel case.**
+    Heuristic 1's sample stride (`points/60`) didn't reliably hit a
+    sparse 2-point tunnel polyline. Heuristic 2's drift cap was
+    `min(target * 0.45, 8)km` — Hoboken sat at ~5km from Chelsea, well
+    within 8km. Added Heuristic 3: any single polyline edge >1.2km
+    indicates an OSM way with no intermediate nodes (car tunnel or
+    ferry). Threshold history: started at 0.5km, regressed all 12
+    candidates on a real-OSRM 20mi NYC loop (user-reported "Q=12 B=12"
+    error — every candidate had a legitimately long edge from a
+    densely-noded greenway or post-trim discontinuity). Raised to
+    1.2km — still cleanly catches Lincoln (2.4km) and Holland (2.6km)
+    tunnels without rejecting normal routes. Mock harness false-
+    positives at 0.5km were trim-discontinuity artifacts, not real
+    geometry; harness signal was misleading.
+
+28. **Distance slider initial render: persisted distance from a
+    previous build with a higher cap (e.g. 31mi from the old 30mi cap)
+    rendered the thumb past the right edge until first interaction.**
+    Fix: `displayValue` clamps to `[1, maxValue]` in the slider
+    component, with a `useEffect` that propagates the clamp back to
+    parent so the persisted value gets rewritten without user action.
+
+29. **Distance slider scaling: user wanted 10mi at the visual midpoint
+    between 5 and 20.** Was two-segment piecewise (1-5 first half,
+    5-max second half), put 10mi at 67% of slider on the 1-20 scale.
+    Fix: three-segment piecewise — [0,50%]→1-5, [50%,75%]→5-mid,
+    [75%,100%]→mid-max. Imperial mid is 10, metric mid is 16. Labels
+    switched from `justify-content: space-between` to absolute
+    positioning so they align with the new breakpoints.
+
+30. **Highway proximity check was structurally blind to long highways.**
+    User-reported 19mi Williamsburg "Sidestreet Shuffle" included a
+    long stretch alongside I-278 (BQE). Highway dataset stored only
+    the centroid of each OSM way (`out center;`) — for a 10km
+    highway like the BQE, that's a single point at the geometric
+    middle, often km from any specific position on it. Routes
+    running directly alongside the BQE saw their nearest "highway
+    point" 1km+ away and scored ~0% highway proximity, well below
+    the 15% reject threshold. Fix: switched query to `out geom;` and
+    sample every ~150m along each way's geometry. Long highways now
+    have 30+ representative points instead of 1. With accurate data,
+    tightened the hard-reject threshold from 15% → 8% (~2.4km in a
+    30km loop). Step-3.5 fallback was missing the highway gate too
+    (same architectural pattern as #26) — added it.
+
+31. **No "best candidate is still dirty" gate for long loops.** User-
+    reported 19mi Williamsburg loop shipped as a tangled mess with
+    visible backtracking; user couldn't trace it as a single
+    runnable path. The 0.50 retrace+overlap hard reject (line
+    ~3064) is deliberately lenient because dense-Manhattan short
+    loops routinely land at 0.35-0.45 (commit ca8dc56 had tightened
+    to 0.35 and regressed those, then reverted). For LONG loops in
+    geographically constrained areas, every candidate hits 0.30+
+    because the area genuinely can't fit a clean loop at the
+    requested distance — the chooser picked the cleanest of bad
+    options and shipped a tangle. Fix: added a length-conditional
+    best-must-be-clean gate: for distance ≥16km (~10mi), if the
+    sorted-best candidate has dirtiness >0.30, drop the entire pool
+    and let the existing empty-result path (auto-retry once, then
+    surface "no routes" to the user) handle it. Short routes keep
+    the existing 0.50 gate to preserve dense-grid behavior. Also
+    added `dirtiness` (retrace+overlap) to `ResolvedCandidate` so
+    the post-sort gate can check without recomputing.
+
+### Recurring-fix discipline
+
+User explicitly called out (May 2026) that the same class of bug ("route
+ships visibly broken — backtracking, tangle, water/highway/tunnel
+crossing") has been corrected multiple times across builds. The pattern:
+1. User reports a visible-on-the-map failure with a screenshot.
+2. We diagnose, identify a specific gap (missing check, threshold too
+   loose, dataset structurally inaccurate).
+3. We patch with a new heuristic, threshold tightening, or fallback
+   gate addition.
+4. The harness doesn't catch the next instance because the bug class
+   manifests against real OSRM/Overpass data the harness can't
+   reproduce in mock mode.
+
+To prevent regression-by-rediscovery: every algorithm change MUST add a
+numbered entry to this list at the time of the fix, with the symptom,
+cause, fix, and harness gap. Threshold changes MUST cite their
+before/after values and the reasoning (especially when reverting a
+prior tightening). Reverted attempts (e.g. trimDetours #24, retrace+
+overlap 0.35 → 0.50 in entry #31's history) stay documented so we don't
+re-attempt them blind.
