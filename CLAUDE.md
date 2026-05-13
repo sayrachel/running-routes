@@ -350,6 +350,67 @@ harness gap.
     target distance is long enough that parks-only loops can't fit
     without retrace.
 
+34. **Architectural: anchor-first picking produces convoluted loops in
+    dense areal-rich neighborhoods (East Village 16mi case).** User
+    diagnosed the core problem after #32/#33 still produced a
+    "Backstreet Run" that zigzagged through lower Manhattan covering
+    the same 2km square multiple times: the existing
+    `selectGreenSpaceWaypoints` is anchor-availability-driven (pick
+    highest-scoring nearby anchors, then sector them), so in
+    Manhattan with 50+ named parks within 5km, all anchors cluster
+    where the parks are, and the loop collapses around them. The
+    algorithm never planned a coherent loop SHAPE first — shape was
+    whatever fell out of anchor positions.
+    **New strategy: macro-snap.** Added as a 4th `CandidateStrategy`
+    competing alongside `large-parks`/`named-paths`/`balanced` in the
+    12-candidate pool. Loop-only (out-and-back is 1-D, point-to-point
+    is start/end-constrained):
+    1. Compute macro vertices via compass bearings (same perimeter math
+       as step-3.5 fallback) so the planned loop SHAPE matches the
+       target distance.
+    2. Snap each macro vertex to the nearest scenic anchor within
+       0.8km. If no anchor is in range, the geometric vertex is used
+       directly — a partial-anchored candidate is still coherent in
+       shape, which is the whole point.
+    3. OSRM-route between snapped vertices using the existing
+       pipeline (trim, score, hard-rejects all unchanged).
+    Variant seed produces different starting bearings (×137 mod 360,
+    golden-angle-ish) so the 3 macro-snap candidates in a 12-pool
+    don't land on near-duplicate rotations.
+    **New constraints added in same diff** (user explicitly requested,
+    since the scoring pipeline was being touched anyway):
+    - **Short-turn-segment ratio** (`shortTurnSegmentRatio` in
+      `route-scoring.ts`): fraction of route distance in rapid-fire
+      turning (consecutive turns <200m apart). Catches the "zigzag
+      through one neighborhood" pattern. Soft penalty: linear from
+      0.10 ratio (no penalty), 0.5 weight — a 0.30 ratio costs
+      ~0.10 quality points (about a stub's worth). No hard reject —
+      dense Manhattan grids legitimately have rapid turns near
+      intersections, hard reject would over-fire.
+    - **Max single-street share** (`maxStreetShare` in
+      `route-scoring.ts`): max fraction of named-street distance on
+      any one street, computed from OSRM step data. Catches "5th Ave
+      out, 6th Ave back" patterns that pass retrace/overlap (different
+      streets) but read as out-and-backs. Hard reject above 0.50,
+      soft penalty linear from 0.30 (no penalty), 1.0 weight. Loop-
+      only — out-and-back legitimately runs single corridor, point-
+      to-point can follow one avenue.
+    macro-snap is a SEPARATE candidate strategy (option A from the
+    user), not the new primary path. The chooser picks whichever
+    strategy's candidate scores best on quality. If macro-snap
+    consistently wins on long loops, can be promoted; if it
+    consistently loses, can be removed without affecting other
+    strategies. Lower-risk validation than rewriting the existing
+    strategies.
+    **What's NOT in this fix:** sectoring is unchanged in the
+    existing strategies; macro-snap is just one of 4. If the picker
+    still favors anchor-clustered candidates over macro-snap on long
+    loops because of the distance-weighted scoring, the next move is
+    to add a length-conditional weight on shape coherence. Don't
+    add it preemptively — let the data from the user's next few
+    long-loop generations tell us whether macro-snap is competing or
+    losing.
+
 ### Recurring-fix discipline
 
 User explicitly called out (May 2026) that the same class of bug ("route

@@ -1,4 +1,4 @@
-import type { RoutePreferences } from './route-generator';
+import type { RoutePreferences, ManeuverStep } from './route-generator';
 import type { RoutePoint } from './route-generator';
 import type { GreenSpace } from './overpass';
 
@@ -281,6 +281,108 @@ export function turnCount(
     nextSample = cum[i] + SAMPLE_KM;
   }
   return turns;
+}
+
+/**
+ * Fraction of total route distance that's between rapid-fire turns —
+ * segments shorter than `minSegmentKm` between consecutive turn points.
+ *
+ * Catches the visual "zigzag through one neighborhood" pattern where the
+ * route makes 5 turns within a 1km window. Each individual turn is fine,
+ * but the density of turns per linear distance is what makes the route
+ * unrunnable as a single coherent path. Used both as a soft scoring
+ * penalty and a hard reject above an egregious threshold.
+ *
+ * Returns 0 for routes with no rapid-fire turns. Returns up to 1 in the
+ * pathological case where every segment between turns is sub-threshold.
+ */
+export function shortTurnSegmentRatio(
+  points: RoutePoint[],
+  minSegmentKm: number = 0.2,
+  thresholdDeg: number = 45,
+  lookbackKm: number = 0.025
+): number {
+  if (points.length < 4) return 0;
+
+  const cum: number[] = new Array(points.length);
+  cum[0] = 0;
+  for (let i = 1; i < points.length; i++) {
+    cum[i] = cum[i - 1] + haversineDistance(points[i - 1], points[i]);
+  }
+  const total = cum[points.length - 1];
+  if (total < lookbackKm * 2.5) return 0;
+
+  // Find turn indices using the same lookback/threshold/spacing logic
+  // as turnCount so the two metrics agree on what counts as a "turn".
+  const SAMPLE_KM = 0.02;
+  const minSpacingKm = 0.04;
+  const turnCumKm: number[] = [];
+  let nextSample = lookbackKm;
+
+  for (let i = 1; i < points.length - 1; i++) {
+    if (cum[i] < nextSample) continue;
+    if (cum[i] > total - lookbackKm) break;
+
+    let iBack = i;
+    while (iBack > 0 && cum[i] - cum[iBack] < lookbackKm) iBack--;
+    let iFwd = i;
+    while (iFwd < points.length - 1 && cum[iFwd] - cum[i] < lookbackKm) iFwd++;
+
+    if (iBack < i && iFwd > i) {
+      const bBack = bearingFrom(points[iBack], points[i]);
+      const bFwd = bearingFrom(points[i], points[iFwd]);
+      if (angleDiff(bBack, bFwd) >= thresholdDeg) {
+        turnCumKm.push(cum[i]);
+        nextSample = cum[i] + minSpacingKm;
+        continue;
+      }
+    }
+    nextSample = cum[i] + SAMPLE_KM;
+  }
+
+  if (turnCumKm.length < 2) return 0;
+
+  // Sum the distances between consecutive turn pairs that are < minSegmentKm
+  // apart. That's the fraction of the route stuck in rapid-fire turning.
+  let shortKm = 0;
+  for (let i = 1; i < turnCumKm.length; i++) {
+    const gap = turnCumKm[i] - turnCumKm[i - 1];
+    if (gap < minSegmentKm) shortKm += gap;
+  }
+  return total > 0 ? shortKm / total : 0;
+}
+
+/**
+ * Maximum fraction of route distance covered by any single named street,
+ * computed from OSRM step data.
+ *
+ * A clean loop diversifies streets — going up 5th Ave for 3mi then down 6th
+ * Ave for another 3mi looks coherent on a map but covers two streets at 50%
+ * share each, the kind of pattern that reads to a runner as "this is just an
+ * out-and-back along Manhattan avenues, not a real loop". Used both as a
+ * soft scoring penalty and a hard reject above an egregious threshold.
+ *
+ * Skips unnamed steps (parks, alleys, OSM ways without `name` tag) so they
+ * don't dilute the share calculation when a route legitimately passes
+ * through a long unnamed greenway.
+ *
+ * Returns 0 when no step data or all steps unnamed.
+ */
+export function maxStreetShare(steps: ManeuverStep[] | undefined): number {
+  if (!steps || steps.length === 0) return 0;
+  const byName = new Map<string, number>();
+  let namedTotal = 0;
+  for (const step of steps) {
+    if (!step.name) continue;
+    byName.set(step.name, (byName.get(step.name) ?? 0) + step.distanceM);
+    namedTotal += step.distanceM;
+  }
+  if (namedTotal === 0) return 0;
+  let max = 0;
+  for (const v of byName.values()) {
+    if (v > max) max = v;
+  }
+  return max / namedTotal;
 }
 
 /**

@@ -1,7 +1,7 @@
 import type { RoutePoint, GeneratedRoute, RoutePreferences, ManeuverStep } from './route-generator';
 import { fetchGreenSpacesAndHighways } from './overpass';
 import type { GreenSpace } from './overpass';
-import { scoreRoute, computeGreenSpaceProximity, computeRunPathProximity, computeHighwayProximity, computeWaterfrontProximity, countStartPasses, reversalCount, turnCount, bboxAspectRatio, polsbyPopper, maxTurnDensityInWindow } from './route-scoring';
+import { scoreRoute, computeGreenSpaceProximity, computeRunPathProximity, computeHighwayProximity, computeWaterfrontProximity, countStartPasses, reversalCount, turnCount, bboxAspectRatio, polsbyPopper, maxTurnDensityInWindow, shortTurnSegmentRatio, maxStreetShare } from './route-scoring';
 import { emit as traceEmit } from './debug-trace';
 import { isPopularRunningPark } from './popular-running-parks';
 
@@ -961,7 +961,7 @@ export function calculateSearchRadius(
 // Green-space-first waypoint selection
 // ---------------------------------------------------------------------------
 
-export type CandidateStrategy = 'large-parks' | 'named-paths' | 'balanced';
+export type CandidateStrategy = 'large-parks' | 'named-paths' | 'balanced' | 'macro-snap';
 
 /**
  * Score a green space for waypoint selection.
@@ -1367,6 +1367,98 @@ function generateGreenSpaceLoop(
     center, distanceKm, prefs, variant, greenSpaces.map((gs) => gs.point)
   );
   return { waypoints: fallbackWaypoints, anchors: [] };
+}
+
+/**
+ * Macro-snap loop: plan the loop SHAPE first (compass-bearing vertices sized
+ * so the perimeter ≈ target distance), then snap each vertex to the nearest
+ * scenic anchor (park/bridge/corridor) within ~800m. The existing
+ * `selectGreenSpaceWaypoints` strategy is anchor-first — it picks the highest-
+ * scoring nearby greens then sectors them, which in dense areal-rich
+ * neighborhoods packs all anchors into a 2km square (every park is right
+ * there) and the loop shape collapses, forcing the route to make multiple
+ * passes through the same area to fit longer distances. By placing target
+ * vertices on a circle/polygon FIRST and snapping to anchors second, this
+ * strategy enforces loop coherence while preserving scenic anchoring.
+ *
+ * If a macro vertex has no anchor within snap radius, the geometric vertex is
+ * used directly — the resulting candidate then mixes anchored and pure-
+ * geometric vertices, which still produces a coherent loop shape (better
+ * than collapsing all vertices into the anchored area).
+ *
+ * Variant produces different starting bearings so each macro-snap candidate
+ * lands on a different rotation of the same shape, giving sectoring-style
+ * variety without the anchor-clustering pathology.
+ */
+function generateMacroSnapLoop(
+  center: RoutePoint,
+  distanceKm: number,
+  variant: number,
+  greenSpaces: GreenSpace[],
+): { waypoints: RoutePoint[]; anchors: GreenSpace[] } {
+  // Same vertex-count and perimeter math as the step-3.5 geometric fallback,
+  // so the macro-snap distance lands in the same neighborhood and the
+  // distance-adjustment loop has a similar starting point.
+  const targetMi = distanceKm * 0.621371;
+  const numLoopWaypoints = targetMi >= 22 ? 4 : targetMi >= 14 ? 3 : 2;
+  const loopPerimeterFactor =
+    numLoopWaypoints === 4 ? 6.243 :
+    numLoopWaypoints === 3 ? 5.464 :
+    LOOP_TRIANGLE_PERIMETER;
+  const waypointDist = distanceKm / (loopPerimeterFactor * ROUTING_OVERHEAD);
+
+  // Bearing seeded from variant for diversity across the candidate pool.
+  // 137 chosen so consecutive variants land on visibly different bearings
+  // (golden-angle-ish — minimizes near-duplicates in a small variant range).
+  const seedBearing = (variant * 137) % 360;
+  // Spread across 330° (matches step-3.5 fallback) so the last vertex isn't
+  // antipodal to the first — leaves room for the closing leg to take a
+  // different street back.
+  const arc = 330;
+  const step = arc / numLoopWaypoints;
+
+  // Snap radius: small enough to keep the loop shape, big enough to find
+  // anchors in most NYC starts. 0.8km is roughly the spacing between named
+  // parks in dense Manhattan; tighter would frequently leave macro vertices
+  // anchorless, looser would pull anchors so far from the macro shape that
+  // the loop's coherence advantage disappears.
+  const SNAP_RADIUS_KM = 0.8;
+
+  const usedAnchorIdx = new Set<number>();
+  const waypoints: RoutePoint[] = [center];
+  const anchors: GreenSpace[] = [];
+
+  for (let k = 0; k < numLoopWaypoints; k++) {
+    const angle = (seedBearing + k * step) % 360;
+    const macroVertex = destinationPoint(center, angle, waypointDist);
+
+    // Find nearest unused anchor within snap radius.
+    let bestIdx = -1;
+    let bestDist = SNAP_RADIUS_KM;
+    for (let idx = 0; idx < greenSpaces.length; idx++) {
+      if (usedAnchorIdx.has(idx)) continue;
+      const d = haversineDistance(macroVertex, greenSpaces[idx].point);
+      if (d < bestDist) {
+        bestDist = d;
+        bestIdx = idx;
+      }
+    }
+
+    if (bestIdx !== -1) {
+      const gs = greenSpaces[bestIdx];
+      waypoints.push(gs.point);
+      anchors.push(gs);
+      usedAnchorIdx.add(bestIdx);
+    } else {
+      // No nearby anchor — use the geometric vertex. The candidate is still
+      // coherent in shape; it just won't get a named-anchor bonus from
+      // scoring or contribute to the route name.
+      waypoints.push(macroVertex);
+    }
+  }
+
+  waypoints.push(center);
+  return { waypoints, anchors };
 }
 
 /**
@@ -2487,8 +2579,12 @@ export function fabricateElevationGain(distKm: number, variant: number): number 
   return Math.round(5 + distKm * 3 + variant * 2);
 }
 
-/** Candidate strategies for variety: each of the 3 candidates uses a different focus */
-const STRATEGIES: CandidateStrategy[] = ['large-parks', 'named-paths', 'balanced'];
+/** Candidate strategies for variety. With 12-candidate pools each strategy
+ *  gets ~3 attempts. 'macro-snap' is the loop-shape-first strategy (CLAUDE.md
+ *  #34): plans the loop shape via compass bearings then snaps each vertex to
+ *  the nearest scenic anchor. Competes against the existing strategies; if
+ *  it consistently wins on long-loop quality, can be promoted to primary. */
+const STRATEGIES: CandidateStrategy[] = ['large-parks', 'named-paths', 'balanced', 'macro-snap'];
 
 /**
  * Generate real walking routes using the OSRM public API.
@@ -2675,11 +2771,18 @@ export async function generateOSRMRoutes(
         }
       }
     } else if (routeType === 'out-and-back') {
-      const result = generateGreenSpaceOutAndBack(center, distanceKm, prefs, variant, availableGreenSpaces, strategy);
+      // macro-snap is loop-only — out-and-back has 1-D geometry, no shape
+      // to plan macro-first. Fall through to the existing strategies.
+      const obStrategy = strategy === 'macro-snap' ? 'balanced' : strategy;
+      const result = generateGreenSpaceOutAndBack(center, distanceKm, prefs, variant, availableGreenSpaces, obStrategy);
       waypoints = result.waypoints;
       anchors = result.anchors;
     } else {
-      const result = generateGreenSpaceLoop(center, distanceKm, prefs, variant, availableGreenSpaces, strategy);
+      // Loop. macro-snap plans the loop SHAPE first then snaps to anchors —
+      // see CLAUDE.md #34. Other strategies pick anchors first then connect.
+      const result = strategy === 'macro-snap'
+        ? generateMacroSnapLoop(center, distanceKm, variant, availableGreenSpaces)
+        : generateGreenSpaceLoop(center, distanceKm, prefs, variant, availableGreenSpaces, strategy);
       waypoints = result.waypoints;
       anchors = result.anchors;
     }
@@ -3016,6 +3119,28 @@ export async function generateOSRMRoutes(
           continue;
         }
       }
+      // Extract OSRM maneuvers once so the street-share check below and the
+      // candidateRecord construction further down don't both pay the cost.
+      const candidateSteps = extractManeuvers(osrmRoute);
+      // HARD REJECT: more than 50% of named-street distance on a single
+      // street. Catches the "avenue-out, avenue-back" pattern that reads
+      // on the map as a real loop (no retrace, no pendant loops, distance
+      // matches) but to a runner is "I went up 5th Ave for 3mi, came down
+      // 6th Ave for 3mi, that's a glorified out-and-back". Out-and-back
+      // exempt — single-street IS the route. Point-to-point exempt — a
+      // direct shortest path can legitimately follow one avenue end-to-end.
+      // Threshold 0.50 (not 0.30 as originally proposed) because dense
+      // urban grids legitimately route up to ~40% on dominant avenues
+      // even on coherent loops; 0.50 is the egregious floor.
+      if (routeType === 'loop') {
+        const streetShare = maxStreetShare(candidateSteps);
+        if (streetShare > 0.50) {
+          qualityRejectCount++;
+          rejectReasons.backtrack++;
+          traceEmit('candidate-rejected', { i, reason: 'street-share', streetShare });
+          continue;
+        }
+      }
       // SOFT METRICS: feed into a quality score. Lower retrace/overlap/stubs
       // = higher quality. We KEEP all candidates that pass hard rejection
       // and pick the best by quality at the end. This avoids the past bug
@@ -3190,6 +3315,30 @@ export async function generateOSRMRoutes(
       const clusterFloor = 8;
       const clusterExcess = Math.max(0, maxTurnCluster - clusterFloor);
       const clusterPenalty = isOutAndBack ? 0 : clusterExcess * 0.05;
+      // SOFT METRICS for the new constraints (CLAUDE.md #34):
+      //   shortTurnRatio: fraction of route in rapid-fire turning (<200m
+      //     between consecutive turns). Catches the "zigzag through one
+      //     neighborhood" pattern where the loop makes 5 turns in 1km.
+      //   streetShare: max fraction of named-street distance on a single
+      //     street. Catches "avenue out, parallel-avenue back" patterns
+      //     that pass retrace/overlap but read as out-and-backs.
+      // Both loop-only — out-and-back and point-to-point have legitimate
+      // single-corridor patterns.
+      const shortTurnRatio = (isOutAndBack || routeType === 'point-to-point')
+        ? 0
+        : shortTurnSegmentRatio(points, 0.2);
+      const streetShare = (isOutAndBack || routeType === 'point-to-point')
+        ? 0
+        : maxStreetShare(candidateSteps);
+      // Penalty curve for short-turn ratio: linear from 0.10 (no penalty)
+      // up. 0.5 weight, so 0.30 ratio (clearly tangled) costs 0.10 — about
+      // a stub's worth, enough to lose to a cleaner candidate.
+      const shortTurnPenalty = Math.max(0, (shortTurnRatio - 0.10) * 0.5);
+      // Penalty curve for street share: linear from 0.30 (no penalty) up.
+      // 1.0 weight, so 0.45 share costs 0.15. Wider buffer than retrace
+      // because dominant-avenue routes aren't always broken — sometimes
+      // 5th Ave really is the right street to use end-to-end.
+      const streetSharePenalty = Math.max(0, (streetShare - 0.30) * 1.0);
       const qualityPenalty = Math.max(0,
         (isOutAndBack ? 0 : retraced) +
         (isOutAndBack ? 0 : overlap) +
@@ -3216,10 +3365,12 @@ export async function generateOSRMRoutes(
         reversalsPerKm * 0.05 +
         turnPenalty +
         polsbyPenalty +
-        clusterPenalty -
+        clusterPenalty +
+        shortTurnPenalty +
+        streetSharePenalty -
         anchorBonus
       );
-      traceEmit('candidate-evaluated', { i, distKm, distRatio, hwProximity, retraced, overlap, stubs, startPasses, reversalsPerKm, turnsPerKm, turnPenalty, roundingPenalty, aspectRatio, polsbyP, maxTurnCluster, qualityPenalty });
+      traceEmit('candidate-evaluated', { i, distKm, distRatio, hwProximity, retraced, overlap, stubs, startPasses, reversalsPerKm, turnsPerKm, turnPenalty, roundingPenalty, aspectRatio, polsbyP, maxTurnCluster, shortTurnRatio, streetShare, qualityPenalty });
       // Final gate: rounded-display match. The user-facing distance label is
       // an integer mile (or km, in metric). A 5mi request that returns a
       // 5.6mi route shows "6 mi" — the user reads it as the wrong route even
@@ -3229,7 +3380,7 @@ export async function generateOSRMRoutes(
       // wrong-display fallback pool so the algorithm has something to return
       // even when geometry simply can't fit the requested mile (LES 6mi-
       // sized cases).
-      const candidateRecord: ResolvedCandidate = { index: i, variant: candidates[i].variant, points, distKm, estimatedTime, fromOSRM: true, anchors: candidates[i].anchors, qualityPenalty, dirtiness: retraced + overlap, steps: extractManeuvers(osrmRoute) };
+      const candidateRecord: ResolvedCandidate = { index: i, variant: candidates[i].variant, points, distKm, estimatedTime, fromOSRM: true, anchors: candidates[i].anchors, qualityPenalty, dirtiness: retraced + overlap, steps: candidateSteps };
       const adjustUnitsForCheck = useAdjustment ? adjustUnits : null;
       if (adjustUnitsForCheck && !roundedDisplayMatches(distKm, distanceKm, adjustUnitsForCheck)) {
         wrongDisplayFallback.push(candidateRecord);
