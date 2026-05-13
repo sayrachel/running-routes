@@ -287,6 +287,39 @@ harness gap.
     sectored greens. Don't re-add a "best is dirty → no routes"
     gate without solving the underlying generation problem first.
 
+32. **Anchor pool missing bridges and named footways.** Follow-up to
+    #31 after the user pushed back on the gate. The existing
+    `greenSpaceSubQuery` already captures named cycleways (catches
+    Hudson/East River Greenways), pedestrian streets, foot-designated
+    paths, route relations, and waterfront features. But it missed:
+    - **Bridges with foot access.** The Williamsburg / Manhattan /
+      Brooklyn / Pulaski / Queensboro / GW bridges are anchored on by
+      runners doing long Brooklyn or NYC loops — they're how you
+      extend a 15mi+ loop without retrace. They're typically tagged
+      `[highway=footway, bridge=yes, name="Williamsburg Bridge"]`. The
+      named-cycleway line caught the cycleway portion of bridges where
+      that exists, but the foot-only spans were missed.
+    - **Named footways.** Some long pedestrian paths (Brooklyn Bridge
+      Park promenade segments, Roosevelt Island promenade,
+      neighborhood greenways) are tagged `[highway=footway, name=...]`
+      without `foot=designated` (which is implied by `highway=footway`
+      anyway). The previous query required an explicit `foot=designated`
+      tag, so unnamed-but-walkable corridors slipped through.
+    Fix: added two query lines:
+    - `way["highway"="footway"]["name"](${a});`
+    - `way["bridge"~"yes|aqueduct|cantilever|movable|suspension|viaduct"]["foot"!="no"]["name"](${a});`
+    The parser's existing 50m dedup + cap-at-50 + tier-1-then-area
+    sort means parks still rank above linear features (which have
+    areaSize=0), so the addition expands the pool without displacing
+    park anchors. Bridges become tier-1 anchors via the existing
+    `(highway && hasName)` rule. **Did NOT bump candidate variant
+    count from 12** — CLAUDE.md is explicit about OSRM rate-limit
+    risk from increased call volume; 24 simultaneous candidate
+    requests would risk throttling on public OSRM. If the bridge
+    additions don't fix long-loop cleanness on their own, next step
+    is biased sectoring (prefer corridor anchors for ≥10mi loops),
+    not more candidates.
+
 ### Recurring-fix discipline
 
 User explicitly called out (May 2026) that the same class of bug ("route

@@ -399,6 +399,7 @@ function greenSpaceSubQuery(a: string): string {
   return [
     `nwr["leisure"~"^(park|nature_reserve|garden)$"](${a});`,
     `way["highway"="cycleway"]["name"](${a});`,
+    `way["highway"="footway"]["name"](${a});`,
     `way["highway"="pedestrian"](${a});`,
     `relation["route"~"^(foot|bicycle|running)$"](${a});`,
     `way["foot"="designated"]["name"](${a});`,
@@ -406,6 +407,16 @@ function greenSpaceSubQuery(a: string): string {
     `way["waterway"="riverbank"](${a});`,
     `way["natural"~"^(coastline|water)$"]["name"](${a});`,
     `way["name"~"[Bb]oardwalk|[Pp]romenade|[Ee]splanade|[Ww]aterfront|[Rr]iverwalk|[Ss]eawall"](${a});`,
+    // Bridges with foot access. The Williamsburg / Manhattan / Brooklyn /
+    // Pulaski / Queensboro / GW bridges are anchored on with this — the
+    // foot path on a bridge is typically tagged
+    // [highway=footway, bridge=yes, name="Williamsburg Bridge"], which
+    // the named-footway line above catches, but the more permissive
+    // bridge-anywhere query below also picks up bridges where foot
+    // routing is allowed but the OSM way is highway=path or unmapped
+    // separately. ["foot"!="no"] excludes car-only bridges, ["name"]
+    // requires a name to skip generic ramp/overpass segments.
+    `way["bridge"~"yes|aqueduct|cantilever|movable|suspension|viaduct"]["foot"!="no"]["name"](${a});`,
   ].join('');
 }
 
