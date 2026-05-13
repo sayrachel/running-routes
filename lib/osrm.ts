@@ -423,6 +423,132 @@ export function overlapSegmentRatio(
  * Out-and-back routes intentionally retrace every segment; do not call this
  * on them.
  */
+/**
+ * Backstop pendant trim — catches retrace-shaped spurs that survived
+ * trimStubs (which requires a sharp ≥150° apex) and trimPendantLoops
+ * (which requires both bridge endpoints to match within 20m).
+ *
+ * Algorithm: build a coarse-rounded canonical edge key for every segment.
+ * Edges that appear more than once are retraced. Group consecutive
+ * retraced indices into "back-leg runs", and for each run >= minRetraceM
+ * find the matching forward edges (their first-occurrence indices). The
+ * span from the first forward edge through the last back-leg edge IS the
+ * stub. Trim it.
+ *
+ * Shape-agnostic — handles U-turn pendants, L-shaped detours, multi-turn
+ * spurs, anything that visibly retraces the same edges. Out-and-back
+ * routes are exempt (their entire return leg is "retraced" by design).
+ *
+ * Bounded blast radius: refuses to trim more than 25% of the route's
+ * total length in one pass. A larger trim signals the polyline isn't
+ * really a stub-with-mainline but a degenerate near-OAB shape that
+ * upstream gates should have rejected.
+ */
+export function trimRetracedSpurs(
+  points: RoutePoint[],
+  minRetraceM: number = 50,
+): RoutePoint[] {
+  if (points.length < 4) return points;
+
+  // ~5 decimal-place rounding ≈ 1m precision at NYC latitudes — fine
+  // enough that legitimate adjacent points don't collide, coarse enough
+  // that OSRM's sub-meter coordinate jitter on forward vs reverse
+  // traversal of the same OSM way still matches.
+  const keyOf = (p1: RoutePoint, p2: RoutePoint): string => {
+    const a = `${p1.lat.toFixed(5)},${p1.lng.toFixed(5)}`;
+    const b = `${p2.lat.toFixed(5)},${p2.lng.toFixed(5)}`;
+    return a < b ? `${a}|${b}` : `${b}|${a}`;
+  };
+
+  // edgeIndices[key] = sorted list of indices where this edge appears.
+  // Indices ARE traversal order so first-occurrence is forward, later
+  // occurrences are back-traversals.
+  const edgeIndices = new Map<string, number[]>();
+  for (let i = 0; i < points.length - 1; i++) {
+    const key = keyOf(points[i], points[i + 1]);
+    const list = edgeIndices.get(key);
+    if (list) list.push(i);
+    else edgeIndices.set(key, [i]);
+  }
+
+  // Indices of retraced (non-first-occurrence) edges.
+  const retracedAt = new Set<number>();
+  for (const indices of edgeIndices.values()) {
+    if (indices.length > 1) {
+      for (let k = 1; k < indices.length; k++) retracedAt.add(indices[k]);
+    }
+  }
+  if (retracedAt.size === 0) return points;
+
+  // Group into contiguous runs.
+  const sorted = [...retracedAt].sort((a, b) => a - b);
+  type Run = { start: number; end: number; lengthM: number };
+  const runs: Run[] = [];
+  let runStart = sorted[0];
+  let runEnd = sorted[0];
+  for (let k = 1; k < sorted.length; k++) {
+    if (sorted[k] === runEnd + 1) {
+      runEnd = sorted[k];
+    } else {
+      runs.push({ start: runStart, end: runEnd, lengthM: 0 });
+      runStart = sorted[k];
+      runEnd = sorted[k];
+    }
+  }
+  runs.push({ start: runStart, end: runEnd, lengthM: 0 });
+  for (const run of runs) {
+    let m = 0;
+    for (let i = run.start; i <= run.end; i++) {
+      m += haversineDistance(points[i], points[i + 1]) * 1000;
+    }
+    run.lengthM = m;
+  }
+
+  // For each long-enough run, locate the forward leg and mark indices for
+  // removal. The stub spans [fwdStart .. backEnd], inclusive of the
+  // forward edges and back edges.
+  const toRemove = new Set<number>();
+  for (const run of runs) {
+    if (run.lengthM < minRetraceM) continue;
+    const fwdIdx: number[] = [];
+    for (let i = run.start; i <= run.end; i++) {
+      const key = keyOf(points[i], points[i + 1]);
+      const occurrences = edgeIndices.get(key)!;
+      fwdIdx.push(occurrences[0]);
+    }
+    fwdIdx.sort((a, b) => a - b);
+    // Sanity: forward leg must precede back leg. If they overlap the
+    // stub is malformed (figure-8 etc) — skip rather than mistrim.
+    if (fwdIdx[fwdIdx.length - 1] >= run.start) continue;
+
+    // Mark points[fwdStart+1 .. backEnd+1] for removal. Keep
+    // points[fwdStart] (the entry to the stub on the trunk).
+    for (let i = fwdIdx[0] + 1; i <= run.end + 1; i++) {
+      toRemove.add(i);
+    }
+  }
+  if (toRemove.size === 0) return points;
+
+  // Bounded blast radius — refuse to trim >25% of route length.
+  let totalM = 0;
+  for (let i = 0; i < points.length - 1; i++) {
+    totalM += haversineDistance(points[i], points[i + 1]) * 1000;
+  }
+  let removedM = 0;
+  for (let i = 1; i < points.length; i++) {
+    if (toRemove.has(i)) {
+      removedM += haversineDistance(points[i - 1], points[i]) * 1000;
+    }
+  }
+  if (removedM > totalM * 0.25) return points;
+
+  const result: RoutePoint[] = [];
+  for (let i = 0; i < points.length; i++) {
+    if (!toRemove.has(i)) result.push(points[i]);
+  }
+  return result;
+}
+
 export function trimPendantLoops(points: RoutePoint[]): RoutePoint[] {
   if (points.length < 5) return points;
   // 2 passes (down from 8). Even with per-pass body caps, real OSRM closed
@@ -3336,15 +3462,35 @@ export async function generateOSRMRoutes(
       // hard-reject (distRatio band) downstream catches candidates whose
       // pendant accounted for most of their length. OAB exempt — its
       // return leg looks like a pendant of every segment.
-      const points = routeType === 'out-and-back'
+      const afterPendant = routeType === 'out-and-back'
         ? afterStubs
         : trimPendantLoops(afterStubs);
-      if (points !== afterStubs) {
-        let pendantKm = 0;
-        for (let k = 1; k < points.length; k++) {
-          pendantKm += haversineDistance(points[k - 1], points[k]);
+      let afterPendantKm = afterStubsKm;
+      if (afterPendant !== afterStubs) {
+        afterPendantKm = 0;
+        for (let k = 1; k < afterPendant.length; k++) {
+          afterPendantKm += haversineDistance(afterPendant[k - 1], afterPendant[k]);
         }
-        traceEmit('post-process-trim', { i, stage: 'pendant-loops', before: afterStubsKm, after: pendantKm });
+        traceEmit('post-process-trim', { i, stage: 'pendant-loops', before: afterStubsKm, after: afterPendantKm });
+      }
+      // Backstop retrace-spur trim (CLAUDE.md #40). Catches stubs that
+      // survived trimStubs (which requires ≥150° apex) and trimPendantLoops
+      // (which requires endpoint match within 20m). User-reported pendant
+      // near Corlears Hook on a 7mi East Village loop slipped past both
+      // detectors. Threshold 50m matches the user's spec — any contiguous
+      // retrace ≥50m is visible enough to ruin the "single continuous path"
+      // property. Bounded blast radius inside the trimmer caps removal at
+      // 25% of route length so degenerate near-OAB candidates don't get
+      // gutted.
+      const points = routeType === 'out-and-back'
+        ? afterPendant
+        : trimRetracedSpurs(afterPendant, 50);
+      if (points !== afterPendant) {
+        let retraceTrimKm = 0;
+        for (let k = 1; k < points.length; k++) {
+          retraceTrimKm += haversineDistance(points[k - 1], points[k]);
+        }
+        traceEmit('post-process-trim', { i, stage: 'retrace-spurs', before: afterPendantKm, after: retraceTrimKm });
       }
       // Recompute distance from the FINAL points (after both lollipop
       // removal and stub trimming) so the displayed mileage matches the
@@ -3860,7 +4006,11 @@ export async function generateOSRMRoutes(
       // rather than reject — surfacing "no routes" when a trimmed version is
       // available is worse UX. Recompute distance from the trimmed polyline
       // so the displayed mileage matches what's drawn.
-      const points = routeType === 'out-and-back' ? rawFallbackPoints : trimPendantLoops(rawFallbackPoints);
+      const afterPendantFallback = routeType === 'out-and-back'
+        ? rawFallbackPoints : trimPendantLoops(rawFallbackPoints);
+      // Same retrace-spur backstop as step 3 (CLAUDE.md #40).
+      const points = routeType === 'out-and-back'
+        ? afterPendantFallback : trimRetracedSpurs(afterPendantFallback, 50);
       let fallbackDistKm = chosen.route.distance / 1000;
       if (points !== rawFallbackPoints) {
         fallbackDistKm = 0;

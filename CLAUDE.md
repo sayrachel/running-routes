@@ -602,6 +602,41 @@ harness gap.
       Generate, so a user who opened the app, prefetched, and closed
       lost the data on next launch.
 
+40. **Pendant spur survived trimStubs and trimPendantLoops on a 7mi
+    East Village loop near Corlears Hook.** User-reported visible
+    pendant after #39. trimStubs requires a sharp ≥150° apex (misses
+    L-shaped detours and gentle U-turns); trimPendantLoops requires
+    both bridge endpoints to match within 20m AND a body ≤300m
+    (misses pendants where OSRM's coordinate jitter pushes endpoints
+    just over). Either trimmer's spec is the right primary detector
+    for the case it targets, but the union doesn't cover the whole
+    space.
+    Fix: `trimRetracedSpurs(points, minRetraceM=50)` as a backstop
+    that runs AFTER both existing trimmers in the post-processing
+    pipeline (and in the step-3.5 fallback path). Algorithm is
+    shape-agnostic — builds canonical edge keys (5-decimal rounding
+    ≈1m precision), groups consecutive retraced indices into
+    back-leg runs, and for each run ≥50m finds the matching
+    forward-leg edges via first-occurrence lookup. Removes
+    [fwdStart+1 .. backEnd+1], keeping the entry point.
+    Bounded blast radius: refuses to trim >25% of route length in
+    one pass — a larger trim signals a degenerate near-OAB shape
+    that upstream gates should have caught. Out-and-back routes are
+    exempt entirely (their entire return leg is "retraced" by
+    design).
+    What's NOT in this fix: **block-loop trim** (user-requested for
+    Empire State Building area artifact). A block loop traces 3
+    sides of a city block without retrace — different streets each
+    leg, no edge-key matches. Detecting it shape-wise (3 right-angle
+    turns within ~400m total displacement) is doable, but
+    REPLACING it with "a simple turn at the corner intersection"
+    requires knowing which OSM way to short-cut along, which we
+    don't have on-device. Naively stitching points across the
+    detour creates a polyline that visually cuts through buildings.
+    Deferred until we have a safer remedy (likely: detect block
+    loops, reject the candidate, force regeneration with a
+    different waypoint offset that doesn't induce the detour).
+
 ### Recurring-fix discipline
 
 User explicitly called out (May 2026) that the same class of bug ("route
