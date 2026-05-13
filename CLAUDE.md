@@ -320,6 +320,36 @@ harness gap.
     is biased sectoring (prefer corridor anchors for ≥10mi loops),
     not more candidates.
 
+33. **Bridges from #32 squeezed out by parks in dense areas + stale
+    persisted cache served pre-#32 anchor pools.** User-reported East
+    Village 16mi "Backstreet Run" still tangled within lower Manhattan
+    after #32 shipped — never crossed any bridge to extend. Two
+    issues compounding:
+    - **Cache served stale data.** `overpass-persist.ts` keyed at
+      `@running_routes_overpass_cache_v1` with a 30-day TTL and no
+      version bump on schema changes. Users who'd generated routes
+      before #32 had cached anchor pools that never included
+      bridges. New anchor data not queried until cache expired,
+      blocking the #32 fix from reaching most users immediately.
+      Fix: bumped key to `_v2`. Invalidates all existing entries.
+    - **Cap-50 sort by area squeezed out bridges in areal-rich
+      neighborhoods.** `parseGreenSpaceElements` deduped to 50 anchors
+      sorted by `(tier, areaSize)`. In Manhattan with a 5km radius,
+      50+ named parks/waterfront features filled the entire budget,
+      and bridges (areaSize=0) sorted last. Even after #32 added
+      bridges to the *query*, they were truncated out of the *pool*
+      passed to `selectGreenSpaceWaypoints`. Fix: split the cap into
+      35 areal + 15 linear with mutual leftover so each kind is
+      guaranteed slots. The Williamsburg/Manhattan/Brooklyn bridges
+      now reliably appear in East Village's pool.
+    Did NOT change `selectGreenSpaceWaypoints` sectoring logic — even
+    with bridges in the pool, sectoring may still prefer parks (which
+    have bigger area scores in the picker too). If after this users
+    still see lower-Manhattan tangled long loops, that's the next
+    place to look: bias the picker toward bridges/corridors when the
+    target distance is long enough that parks-only loops can't fit
+    without retrace.
+
 ### Recurring-fix discipline
 
 User explicitly called out (May 2026) that the same class of bug ("route

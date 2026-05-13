@@ -497,9 +497,41 @@ function parseGreenSpaceElements(elements: any[]): GreenSpace[] {
     }
   }
 
-  // Sort: tier 1 first, then by area descending. Cap at 50.
-  deduped.sort((a, b) => (a.tier !== b.tier ? a.tier - b.tier : b.areaSize - a.areaSize));
-  return deduped.slice(0, 50);
+  // Split into areal (parks/gardens/nature/waterfront) and linear (bridges/
+  // cycleways/footways/paths/routes) features. Sort each by tier then area
+  // and reserve slots for each in the cap-50 budget.
+  //
+  // Why split: a single sort by area squeezes out linear features in
+  // areal-rich neighborhoods. In Manhattan with a 5km radius, ~50+ named
+  // parks + waterfront features fill the entire budget, and the
+  // Williamsburg/Brooklyn/Manhattan bridges (areaSize=0) get truncated
+  // out. The user-reported East Village 16mi loop tangled in lower
+  // Manhattan because every candidate's anchors were nearby parks; no
+  // bridge was reachable as an anchor, so no candidate could extend
+  // across the East River to use the much larger Brooklyn road network.
+  const linearKinds = new Set<GreenSpace['kind']>(['cycleway', 'footway', 'path', 'route']);
+  const isLinear = (gs: GreenSpace) =>
+    linearKinds.has(gs.kind) || gs.areaSize === 0;
+  const areal = deduped.filter((gs) => !isLinear(gs));
+  const linear = deduped.filter(isLinear);
+  const sortFn = (a: GreenSpace, b: GreenSpace) =>
+    a.tier !== b.tier ? a.tier - b.tier : b.areaSize - a.areaSize;
+  areal.sort(sortFn);
+  linear.sort(sortFn);
+  // 35 areal + 15 linear = 50 total. If one bucket has fewer, the other
+  // takes the slack so total cap is preserved.
+  const ARELAL_CAP = 35;
+  const LINEAR_CAP = 15;
+  const arealTaken = areal.slice(0, ARELAL_CAP);
+  const linearTaken = linear.slice(0, LINEAR_CAP);
+  const arealLeftover = ARELAL_CAP - arealTaken.length;
+  const linearLeftover = LINEAR_CAP - linearTaken.length;
+  return [
+    ...arealTaken,
+    ...areal.slice(ARELAL_CAP, ARELAL_CAP + linearLeftover),
+    ...linearTaken,
+    ...linear.slice(LINEAR_CAP, LINEAR_CAP + arealLeftover),
+  ].slice(0, 50);
 }
 
 /** Build deduplicated highway centers from the highway subset of an Overpass response. */

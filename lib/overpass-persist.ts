@@ -12,7 +12,11 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { dumpOverpassCaches, loadOverpassCaches, type OverpassSnapshot } from './overpass';
 
-const PERSIST_KEY = '@running_routes_overpass_cache_v1';
+// v2: anchor pool now includes bridges and named footways (CLAUDE.md #32).
+// v1 entries don't have those query results cached, so we'd serve stale
+// pools that exclude the corridors needed for clean long loops in
+// constrained areas. Bump invalidates v1 entries on next load.
+const PERSIST_KEY = '@running_routes_overpass_cache_v2';
 const PERSIST_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 interface PersistedSnapshot extends OverpassSnapshot {
