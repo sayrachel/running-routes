@@ -673,6 +673,52 @@ harness gap.
     visible artifacts. Upstream fix would require road-network
     knowledge (OSM way data on-device) to snap waypoints to known
     intersections — significant data dependency we've avoided so far.
+    [Update May 2026: implemented via OSRM /nearest, see #42 — way
+    smaller dependency than bundling OSM data.]
+
+42. **Snap geometric waypoints + start coord to nearest road via OSRM
+    /nearest.** User asked why we'd been avoiding road-network data.
+    Honest answer: bundling OSM data on-device is real complexity
+    (hundreds of MB per city, stale data risk), AND polyline-level
+    fixes had been "good enough" until #41 hit the wall — start-spurs
+    and block-loops are produced by OSRM having to detour from
+    waypoints that aren't on roads (or aren't at intersections), and
+    no polyline transformation can clean them retroactively. But
+    OSRM has a `/nearest` endpoint that returns the snapped road
+    point for any input coord — one tiny call per waypoint, same
+    OSRM server, same rate-limit pool. Way smaller dependency than
+    bundling OSM.
+    New helpers in `lib/osrm.ts`:
+    - `fetchOSRMNearest(point)` — single-coord call to OSRM
+      `/nearest/v1/foot/{lng,lat}?number=1`. Returns snapped coord on
+      success, input coord on any failure. Cached by rounded input
+      coord (~1m precision) so repeats hit cache. Mock no-op.
+    - `snapWaypointsToRoad(points)` — parallel batch via Promise.all.
+    Wired in three places:
+    1. **`generateOSRMRoutes` top.** Snaps the user's input center
+       once per generation (cached for the rest). Result becomes the
+       canonical start for all candidates. When the user's GPS is in
+       a building or on a non-road, the polyline now starts on the
+       actual road — no more closed-loop start-spur from
+       input→snap→loop→snap→input. The user walks the small
+       (typically <30m, indistinguishable from GPS error) input→snap
+       distance separately.
+    2. **`generateMacroSnapLoop`.** When no anchor is found within
+       snap radius for a macro vertex, the geometric fallback vertex
+       is now snapped via /nearest before being pushed. Prevents
+       OSRM from detouring to/from a vertex floating in water or
+       inside a private superblock.
+    3. **`generateCorridorLoop`.** Same — geometric fallback vertices
+       (when no corridor exists in a cardinal direction) get snapped.
+    Anchored vertices are NOT pre-snapped: they come from Overpass
+    way-centroid data which is already road-adjacent, and OSRM's own
+    internal snap during routing handles the small final adjustment.
+    Pre-snapping them would be redundant.
+    Cost: ~1-3 extra /nearest calls per generation in the typical
+    case (1 for start + 0-2 for geometric vertices across all 12
+    candidates, since most are anchored). With caching, repeated
+    coords (same start, same anchor used by multiple candidates)
+    cost only one round trip.
 
 ### Recurring-fix discipline
 

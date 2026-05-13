@@ -1708,12 +1708,12 @@ function generateGreenSpaceLoop(
  * lands on a different rotation of the same shape, giving sectoring-style
  * variety without the anchor-clustering pathology.
  */
-function generateMacroSnapLoop(
+async function generateMacroSnapLoop(
   center: RoutePoint,
   distanceKm: number,
   variant: number,
   greenSpaces: GreenSpace[],
-): { waypoints: RoutePoint[]; anchors: GreenSpace[] } {
+): Promise<{ waypoints: RoutePoint[]; anchors: GreenSpace[] }> {
   // Same vertex-count and perimeter math as the step-3.5 geometric fallback,
   // so the macro-snap distance lands in the same neighborhood and the
   // distance-adjustment loop has a similar starting point.
@@ -1800,11 +1800,16 @@ function generateMacroSnapLoop(
       usedAnchorIdx.add(bestIdx);
     } else {
       // No anchor found across all jittered bearings — use the geometric
-      // vertex at the planned bearing. Rare in practice (jitter sweep is
-      // 5 bearings × ~50 anchors typically) but possible in genuinely
-      // park-poor areas.
+      // vertex at the planned bearing, snapped to the nearest road via
+      // OSRM /nearest (CLAUDE.md #42). Without snap, OSRM has to detour
+      // from the geometric vertex (which may be in water, a building,
+      // or a private interior) back to the road network — that detour
+      // is what produces the user-reported block-loops.
+      // fetchOSRMNearest falls through to the input coord on any
+      // failure, so this never blocks generation.
       const macroVertex = destinationPoint(center, baseAngle, waypointDist);
-      waypoints.push(macroVertex);
+      const snapped = await fetchOSRMNearest(macroVertex);
+      waypoints.push(snapped);
     }
   }
 
@@ -1853,12 +1858,12 @@ function generateMacroSnapLoop(
  * Falls back to geometric vertex when no corridor exists in a given
  * direction (rare in NYC but possible elsewhere).
  */
-function generateCorridorLoop(
+async function generateCorridorLoop(
   center: RoutePoint,
   distanceKm: number,
   variant: number,
   greenSpaces: GreenSpace[],
-): { waypoints: RoutePoint[]; anchors: GreenSpace[] } {
+): Promise<{ waypoints: RoutePoint[]; anchors: GreenSpace[] }> {
   // Same vertex-count math as macro-snap so the two strategies produce
   // candidates at comparable target distances.
   const targetMi = distanceKm * 0.621371;
@@ -1944,9 +1949,12 @@ function generateCorridorLoop(
       usedAnchorIdx.add(bestIdx);
     } else {
       // No corridor in this direction — fall back to a geometric vertex at
-      // the target bearing. Allows corridor-loop to succeed even when
-      // corridor coverage is sparse in one cardinal direction.
-      waypoints.push(destinationPoint(center, targetBearing, waypointDist));
+      // the target bearing, snapped to nearest road via OSRM /nearest
+      // (CLAUDE.md #42). Same rationale as macro-snap: prevents OSRM from
+      // detouring through a private interior or in-water position.
+      const fallback = destinationPoint(center, targetBearing, waypointDist);
+      const snapped = await fetchOSRMNearest(fallback);
+      waypoints.push(snapped);
     }
   }
 
@@ -2814,6 +2822,86 @@ async function fetchOSRMRoute(waypoints: RoutePoint[]): Promise<OSRMRoute | null
 }
 
 /**
+ * In-memory cache for OSRM /nearest results. Keyed by rounded input coord
+ * (~1m precision so sub-meter GPS jitter still hits cache). Value is the
+ * snapped road point that OSRM would route from/to for that input coord.
+ */
+const osrmNearestCache = new Map<string, RoutePoint>();
+const NEAREST_CACHE_MAX = 500;
+function nearestCacheKey(p: RoutePoint): string {
+  return `${p.lat.toFixed(5)},${p.lng.toFixed(5)}`;
+}
+export function clearOSRMNearestCache(): void { osrmNearestCache.clear(); }
+
+/**
+ * Snap an arbitrary coordinate to the nearest foot-routable road point via
+ * OSRM /nearest. Used by macro-snap and corridor-loop to ensure waypoints
+ * land on actual intersections — without this, OSRM has to detour from a
+ * waypoint that's 50m off-road back to the road network, which surfaces as
+ * block-loops and start-spurs (CLAUDE.md #41).
+ *
+ * Returns the snapped coord on success, or the input coord on any failure
+ * (network, timeout, parse error, missing data). Falling back to the input
+ * preserves the current behavior for that waypoint while degrading
+ * gracefully — no /nearest failure ever blocks generation.
+ *
+ * Single-coordinate API; for batch snap use Promise.all on multiple calls.
+ */
+export async function fetchOSRMNearest(point: RoutePoint): Promise<RoutePoint> {
+  // Mock: pass through. The synthetic harness expects deterministic
+  // waypoint coordinates so tests don't depend on a network round trip.
+  if (osrmMockEnabled) return point;
+
+  const key = nearestCacheKey(point);
+  const cached = osrmNearestCache.get(key);
+  if (cached !== undefined) {
+    osrmNearestCache.delete(key);
+    osrmNearestCache.set(key, cached);
+    return cached;
+  }
+
+  // Derive the /nearest endpoint from the configured /route base. Same
+  // OSRM server, just a different service path. number=1 returns just the
+  // single closest road point.
+  const nearestBase = osrmBase.replace('/route/', '/nearest/');
+  const url = `${nearestBase}/${point.lng},${point.lat}?number=1`;
+
+  try {
+    const res = await fetchWithRetry(url);
+    if (!res.ok) return point;
+    const data: any = await res.json();
+    if (data.code !== 'Ok' || !Array.isArray(data.waypoints) || data.waypoints.length === 0) {
+      return point;
+    }
+    const loc = data.waypoints[0]?.location;
+    if (!Array.isArray(loc) || loc.length < 2) return point;
+    const snapped: RoutePoint = { lng: loc[0], lat: loc[1] };
+    if (osrmNearestCache.size >= NEAREST_CACHE_MAX) {
+      const oldest = osrmNearestCache.keys().next().value;
+      if (oldest !== undefined) osrmNearestCache.delete(oldest);
+    }
+    osrmNearestCache.set(key, snapped);
+    return snapped;
+  } catch {
+    // Same fall-through as fetchOSRMRoute: any error → null-equivalent
+    // behavior (here, return input). Intentionally silent — /nearest is
+    // an optimization, not load-bearing.
+    return point;
+  }
+}
+
+/**
+ * Snap multiple coordinates in parallel. Used by waypoint generators to
+ * snap an entire candidate's waypoint set in one round-trip-equivalent
+ * window. Skips snap for the start/end (caller decides whether to snap
+ * those).
+ */
+export async function snapWaypointsToRoad(points: RoutePoint[]): Promise<RoutePoint[]> {
+  if (osrmMockEnabled || points.length === 0) return points;
+  return Promise.all(points.map((p) => fetchOSRMNearest(p)));
+}
+
+/**
  * In-memory cache for `?alternatives=true` responses. Keyed by URL (which
  * encodes both the waypoints and the alternatives flag), so it never
  * collides with `osrmRouteCache`. Stores the FULL alternatives array per URL
@@ -3136,6 +3224,23 @@ export async function generateOSRMRoutes(
   // spinner past the existing degraded ceiling.
   const generateStartMs = Date.now();
 
+  // Snap the user's input start to the nearest road via OSRM /nearest
+  // (CLAUDE.md #42). When the GPS coord is in a building or 50m off-road,
+  // OSRM internally snaps to a road, but the polyline returned includes
+  // a straight segment from input → snap and snap → input (closed loops
+  // duplicate this). The user sees a "spur" at start. Pre-snapping makes
+  // the canonical start = the road point: the polyline starts ON the
+  // loop and the user walks the small input→snap distance separately
+  // (typically <30m and visually indistinguishable from GPS error).
+  // Falls through to the original center on /nearest failure so this
+  // never blocks generation.
+  const snappedCenter = await fetchOSRMNearest(center);
+  const centerSnapKm = haversineDistance(center, snappedCenter);
+  if (centerSnapKm > 0) {
+    traceEmit('start-snap', { input: center, snapped: snappedCenter, distanceM: centerSnapKm * 1000 });
+  }
+  center = snappedCenter;
+
   // Step 1: Fetch enriched green spaces and highway segments in a single
   // Overpass round trip (shared across all candidates).
   const radiusKm = calculateSearchRadius(routeType, distanceKm, center, end);
@@ -3292,11 +3397,13 @@ export async function generateOSRMRoutes(
       // Loop. macro-snap plans the loop SHAPE first then snaps to anchors
       // (#34); corridor-loop picks corridor anchors directly in cardinal
       // directions (#38); other strategies pick anchors first then connect.
+      // macro-snap and corridor-loop are async because they snap their
+      // geometric (non-anchored) vertices to road via OSRM /nearest (#42).
       let result;
       if (strategy === 'macro-snap') {
-        result = generateMacroSnapLoop(center, distanceKm, variant, availableGreenSpaces);
+        result = await generateMacroSnapLoop(center, distanceKm, variant, availableGreenSpaces);
       } else if (strategy === 'corridor-loop') {
-        result = generateCorridorLoop(center, distanceKm, variant, availableGreenSpaces);
+        result = await generateCorridorLoop(center, distanceKm, variant, availableGreenSpaces);
       } else {
         result = generateGreenSpaceLoop(center, distanceKm, prefs, variant, availableGreenSpaces, strategy);
       }
