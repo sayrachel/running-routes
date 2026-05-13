@@ -424,6 +424,103 @@ export function overlapSegmentRatio(
  * on them.
  */
 /**
+ * Detect a "start spur" — a retrace at the boundary of a closed loop where
+ * the runner goes from start out to where the loop actually begins, runs the
+ * loop, then retraces the same path back. The blue dot ends up on a
+ * dead-end branch off the loop, not on the loop itself.
+ *
+ * trimRetracedSpurs (below) detects this same pattern but its blast radius
+ * cap refuses to trim — removing the spur would leave start disconnected
+ * from the loop body. So instead we DETECT and surface the length so the
+ * scorer can penalize the candidate, and so a hard-reject can fire when
+ * the spur is egregious enough (>250m).
+ *
+ * Algorithm: walk forward from index 0 and backward from index N-1
+ * simultaneously. While the edge keys match (forward edge i→i+1 ==
+ * back edge j-1→j), accumulate their length. Stops at the first
+ * mismatch — that's where the spur joins the loop body.
+ *
+ * Returns 0 for routes <4 points or for routes where the first and last
+ * edges don't share a canonical key (no start-spur).
+ */
+export function detectStartSpurM(points: RoutePoint[]): number {
+  if (points.length < 4) return 0;
+  const keyOf = (p1: RoutePoint, p2: RoutePoint): string => {
+    const a = `${p1.lat.toFixed(5)},${p1.lng.toFixed(5)}`;
+    const b = `${p2.lat.toFixed(5)},${p2.lng.toFixed(5)}`;
+    return a < b ? `${a}|${b}` : `${b}|${a}`;
+  };
+  let i = 0;
+  let j = points.length - 1;
+  let spurM = 0;
+  while (i < j - 1) {
+    const fwdEdge = keyOf(points[i], points[i + 1]);
+    const backEdge = keyOf(points[j - 1], points[j]);
+    if (fwdEdge !== backEdge) break;
+    spurM += haversineDistance(points[i], points[i + 1]) * 1000;
+    i++;
+    j--;
+  }
+  return spurM;
+}
+
+/**
+ * Count "block loops" — 3-edge sequences where the route makes 3 ~90° turns
+ * traversing 3 sides of a city block, returning to within ~150m of where
+ * the detour started. NYC blocks are ~80m × 250m so each leg is in that
+ * range. No retrace (different streets each leg) means trimRetracedSpurs
+ * doesn't catch it; the pattern's specific shape (3 right-angle turns,
+ * small displacement) needs its own detector.
+ *
+ * Used as a soft scoring penalty — NOT a hard reject and NOT a trimmer.
+ * Replacing the detour with a "diagonal" shortcut would visually cut
+ * through buildings (we don't have road network data on-device to know
+ * which short-cut street to use). The penalty makes block-loop candidates
+ * lose to clean alternatives in the chooser; if no clean alternative
+ * exists, the algorithm still ships a route rather than dead-ending the
+ * user.
+ */
+export function countBlockLoops(points: RoutePoint[]): number {
+  if (points.length < 4) return 0;
+  let count = 0;
+  let i = 0;
+  while (i < points.length - 3) {
+    const e0Bearing = bearingFrom(points[i], points[i + 1]);
+    const e1Bearing = bearingFrom(points[i + 1], points[i + 2]);
+    const e2Bearing = bearingFrom(points[i + 2], points[i + 3]);
+    const turn1 = angleDiff(e0Bearing, e1Bearing);
+    const turn2 = angleDiff(e1Bearing, e2Bearing);
+    // Both turns must be near right-angle. 60-120° is generous enough for
+    // diagonal NYC blocks (Broadway etc) but still rejects gentle curves.
+    if (turn1 < 60 || turn1 > 120 || turn2 < 60 || turn2 > 120) {
+      i++;
+      continue;
+    }
+    // Each leg should be a single block (30-300m). Below 30m is GPS jitter,
+    // above 300m is a real route segment not a detour.
+    const len0 = haversineDistance(points[i], points[i + 1]) * 1000;
+    const len1 = haversineDistance(points[i + 1], points[i + 2]) * 1000;
+    const len2 = haversineDistance(points[i + 2], points[i + 3]) * 1000;
+    if (len0 < 30 || len0 > 300 || len1 < 30 || len1 > 300 || len2 < 30 || len2 > 300) {
+      i++;
+      continue;
+    }
+    // Net displacement small — the 3-edge sequence returns close to where
+    // it started (within one block). 150m threshold catches short blocks
+    // and avenue-block detours; 200m would also catch some legitimate
+    // S-curves on long blocks.
+    const displacement = haversineDistance(points[i], points[i + 3]) * 1000;
+    if (displacement > 150) {
+      i++;
+      continue;
+    }
+    count++;
+    i += 3; // skip past this loop to avoid double-counting overlapping windows
+  }
+  return count;
+}
+
+/**
  * Backstop pendant trim — catches retrace-shaped spurs that survived
  * trimStubs (which requires a sharp ≥150° apex) and trimPendantLoops
  * (which requires both bridge endpoints to match within 20m).
@@ -3619,6 +3716,24 @@ export async function generateOSRMRoutes(
         traceEmit('candidate-rejected', { i, reason: 'pendant-loop', pendantLoops, source: 'post-trim-residual' });
         continue;
       }
+      // HARD REJECT: egregious start-spur (CLAUDE.md #41). Start spur means
+      // the start point is a dead-end branch off the loop — runner walks
+      // out from start to where the loop begins, runs the loop, walks back
+      // the same way. trimRetracedSpurs detects this but its bounded blast
+      // radius refuses to trim (would gut the route). Soft penalty below
+      // makes 50–250m spurs lose to clean alternatives. This hard reject
+      // catches >250m spurs where the soft penalty alone might not be
+      // enough to flip the chooser. OAB exempt; point-to-point exempt
+      // (closed-loop spur math doesn't apply).
+      const startSpurMHardCheck = (routeType === 'loop')
+        ? detectStartSpurM(points)
+        : 0;
+      if (startSpurMHardCheck > 250) {
+        qualityRejectCount++;
+        rejectReasons.pendantLoop++;
+        traceEmit('candidate-rejected', { i, reason: 'start-spur', startSpurM: startSpurMHardCheck });
+        continue;
+      }
       // HARD REJECT: visibly bad backtracking. The user-reported Build 23
       // spur in N. Williamsburg slipped through because the chooser picked
       // a candidate with retrace 22%, overlap 13% over rounding-wrong
@@ -3783,6 +3898,20 @@ export async function generateOSRMRoutes(
       const streetShare = (isOutAndBack || routeType === 'point-to-point')
         ? 0
         : maxStreetShare(candidateSteps);
+      // Start-spur and block-loop detection (CLAUDE.md #41). Both produce
+      // routes that are visibly broken even when distance/retrace/etc. are
+      // fine: start-spur means the start point is a dead-end branch off
+      // the loop (runner has to walk out, run loop, walk back); block-loop
+      // means a 3-side detour around a single city block where one turn
+      // would have sufficed. Detection-only here — neither is trimmable
+      // without road network data, so we penalize and let the chooser
+      // prefer clean alternatives.
+      const startSpurM = (isOutAndBack || routeType === 'point-to-point')
+        ? 0
+        : detectStartSpurM(points);
+      const blockLoopCount = (isOutAndBack || routeType === 'point-to-point')
+        ? 0
+        : countBlockLoops(points);
       // Penalty curve for short-turn ratio: linear from 0.10 (no penalty)
       // up. 0.5 weight, so 0.30 ratio (clearly tangled) costs 0.10 — about
       // a stub's worth, enough to lose to a cleaner candidate.
@@ -3792,6 +3921,16 @@ export async function generateOSRMRoutes(
       // because dominant-avenue routes aren't always broken — sometimes
       // 5th Ave really is the right street to use end-to-end.
       const streetSharePenalty = Math.max(0, (streetShare - 0.30) * 1.0);
+      // Start-spur penalty: linear from 50m (no penalty) up. 0.002 per m
+      // capped at 0.40 — for 200m spur (visibly egregious) penalty is
+      // 0.30, dwarfing the typical anchor bonus (0.10) and rivaling the
+      // distance penalty for a 15% miss. Hard reject also fires above
+      // 250m below.
+      const startSpurPenalty = Math.min(0.40, Math.max(0, (startSpurM - 50) * 0.002));
+      // Block-loop penalty: 0.15 per detected loop. One loop costs as much
+      // as a 0.075 distance miss (≈4% off target) — significant but not
+      // overwhelming. For multi-loop candidates the penalty stacks.
+      const blockLoopPenalty = blockLoopCount * 0.15;
       const qualityPenalty = Math.max(0,
         (isOutAndBack ? 0 : retraced) +
         (isOutAndBack ? 0 : overlap) +
@@ -3820,10 +3959,12 @@ export async function generateOSRMRoutes(
         polsbyPenalty +
         clusterPenalty +
         shortTurnPenalty +
-        streetSharePenalty -
+        streetSharePenalty +
+        startSpurPenalty +
+        blockLoopPenalty -
         anchorBonus
       );
-      traceEmit('candidate-evaluated', { i, distKm, distRatio, hwProximity, retraced, overlap, stubs, startPasses, reversalsPerKm, turnsPerKm, turnPenalty, roundingPenalty, aspectRatio, polsbyP, maxTurnCluster, shortTurnRatio, streetShare, qualityPenalty });
+      traceEmit('candidate-evaluated', { i, distKm, distRatio, hwProximity, retraced, overlap, stubs, startPasses, reversalsPerKm, turnsPerKm, turnPenalty, roundingPenalty, aspectRatio, polsbyP, maxTurnCluster, shortTurnRatio, streetShare, startSpurM, blockLoopCount, qualityPenalty });
       // Final gate: rounded-display match. The user-facing distance label is
       // an integer mile (or km, in metric). A 5mi request that returns a
       // 5.6mi route shows "6 mi" — the user reads it as the wrong route even

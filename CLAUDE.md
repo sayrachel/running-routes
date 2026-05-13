@@ -637,6 +637,43 @@ harness gap.
     loops, reject the candidate, force regeneration with a
     different waypoint offset that doesn't induce the detour).
 
+41. **Start-spur (start point is dead-end branch off the loop) and
+    block-loop survived #40 trim.** User-reported 7mi East Village
+    "Backstreet Run": the blue dot was on a spur off the main loop
+    at 12th & 3rd, not ON the loop — runner had to walk out from
+    start, run the loop, walk back the same way. The trimRetracedSpurs
+    backstop from #40 detected the retrace correctly but its bounded
+    blast radius (25%) refused to trim — for a closed-loop start-spur,
+    trimming would remove everything except the start point (the
+    "spur" is on both ends of the polyline). User also reported
+    block-loop near Washington Square — route circles a single block
+    instead of just turning at the corner.
+    Both cases are detection-then-penalize, not trim:
+    - **`detectStartSpurM(points)`** walks forward from index 0 and
+      backward from N-1 simultaneously, accumulating the length of
+      matching mirror-image edges. For a 200m start-spur, returns
+      ~200. Used as a soft penalty (linear from 50m, 0.002/m, capped
+      at 0.40) so 50–250m spurs lose to clean alternatives in the
+      chooser. **Hard reject for >250m** because the soft penalty
+      alone may not be enough to flip the chooser when the alternative
+      is a wrong-distance candidate.
+    - **`countBlockLoops(points)`** detects 3-edge sequences with two
+      ~90° turns (both 60–120°), each leg 30–300m, and net
+      displacement ≤150m — i.e., 3 sides of a city block. Soft
+      penalty only (0.15 per loop). Cannot trim because replacing
+      the detour with "a diagonal" would visually cut through
+      buildings without road-network data.
+    What's NOT in this fix: **upstream waypoint placement** to
+    prevent start-spurs and block-loops from being generated in the
+    first place. Both happen because OSRM has to detour to satisfy
+    a waypoint that isn't on a road that passes through start (or
+    isn't at a clean intersection). The detection-and-penalize
+    approach lets the algorithm SHIP a route in the worst case
+    (no clean alternative), at the cost of occasionally still
+    visible artifacts. Upstream fix would require road-network
+    knowledge (OSM way data on-device) to snap waypoints to known
+    intersections — significant data dependency we've avoided so far.
+
 ### Recurring-fix discipline
 
 User explicitly called out (May 2026) that the same class of bug ("route
