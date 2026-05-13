@@ -3108,14 +3108,27 @@ export async function generateOSRMRoutes(
       // hospital/college campuses) — the user reported PCV/Stuy Town as
       // a recurring case where the rendered polyline visibly cuts across
       // blocks where no public street exists. See `computeOffStreetRatio`
-      // for the rationale. Threshold of 10% lets brief unnamed alleys or
-      // sidewalk transitions through; systematic interior routing fails.
+      // for the rationale.
+      // Threshold scales with distance: short routes (≤5km) keep the
+      // original 10% (PCV diagonals on a 3mi route are ~50%, well above
+      // the floor). Long routes (≥20km) get up to 15% headroom because
+      // the macro-snap strategy + extension into adjacent neighborhoods
+      // means more legitimate exposure to brief unnamed-path transitions
+      // (housing-project edges, unmapped bridge approaches, college
+      // campus crossings). User-reported East Village 16mi case (May 2026,
+      // CLAUDE.md #35): 6 of 12 candidates rejected for off-street with
+      // the 10% flat threshold — most were extending into Brooklyn or
+      // Murray Hill where 1-2km of unnamed pass-through pushed long-route
+      // ratios over 10% even though the route was otherwise clean. With
+      // 15% at this distance, the same routes would pass while a true
+      // PCV-diagonal candidate (>40% off-street) would still be rejected.
       if (routeType !== 'point-to-point') {
         const offStreetRatio = computeOffStreetRatio(osrmRoute, greenSpaces);
-        if (offStreetRatio > 0.10) {
+        const offStreetThreshold = Math.min(0.15, 0.10 + Math.max(0, distanceKm - 5) * 0.0033);
+        if (offStreetRatio > offStreetThreshold) {
           qualityRejectCount++;
           rejectReasons.offStreet++;
-          traceEmit('candidate-rejected', { i, reason: 'off-street', offStreetRatio });
+          traceEmit('candidate-rejected', { i, reason: 'off-street', offStreetRatio, threshold: offStreetThreshold });
           continue;
         }
       }
@@ -3575,7 +3588,9 @@ export async function generateOSRMRoutes(
       const fallbackOffStreetRatio = routeType === 'point-to-point'
         ? 0
         : computeOffStreetRatio(chosen.route, greenSpaces);
-      const fallbackOffStreet = fallbackOffStreetRatio > 0.10;
+      // Same length-scaled threshold as step 3 (CLAUDE.md #35).
+      const fallbackOffStreetThreshold = Math.min(0.15, 0.10 + Math.max(0, distanceKm - 5) * 0.0033);
+      const fallbackOffStreet = fallbackOffStreetRatio > fallbackOffStreetThreshold;
       // Same shape gates as step 3. Without these, step 3.5 would happily
       // ship the exact "Quiet Lanes through-line" pattern that motivated
       // the gates in the first place — the bearing-trial chooser only

@@ -411,6 +411,37 @@ harness gap.
     long-loop generations tell us whether macro-snap is competing or
     losing.
 
+35. **Off-street threshold over-fired on long loops, blocking
+    East Village 16mi entirely.** User-reported error after #34 with
+    diagnostic `Q=9 (b=2 o=6 p=1) W=3` — 6 of 12 candidates rejected
+    for off-street ratio >10%. The 10% flat threshold from #34 (and
+    earlier) was tuned on PCV/Stuy Town diagonal cases (3mi route
+    cutting straight through a private superblock at ~50% off-street).
+    For long loops, the math works against us: a 26km route extending
+    into Brooklyn or Murray Hill legitimately crosses 1-2km of
+    unmapped pass-through (housing-project edges, unmapped bridge
+    approaches, college campus crossings) — that's already 4-8% before
+    counting the Stuy-Town/PCV pathology the gate was actually meant
+    to catch. Combined with the macro-snap strategy aiming bearings
+    in arbitrary directions (some of which inevitably point at
+    unmappable interior zones), the algorithm rejected most candidates
+    and surfaced "no routes found" with auto-retry also failing.
+    Fix: scale the threshold linearly with target distance, from
+    10% at ≤5km up to 15% at ≥20km (cap), formula
+    `min(0.15, 0.10 + max(0, distanceKm - 5) * 0.0033)`. For a 26km
+    route, threshold becomes 0.15 — true PCV-diagonal candidates
+    (40%+) still rejected, but borderline long-route candidates with
+    1-2km of pass-through pass. Applied to both step-3 hard reject
+    AND step-3.5 fallback gate.
+    **What's NOT being addressed here:** macro-snap might be
+    over-firing the off-street gate by aiming bearings into
+    known-bad zones (Stuy Town, college campuses). A more targeted
+    fix would identify these zones and skip bearings that aim into
+    them, but we don't have a list of "bad zones" and building one
+    is hand-curation work. Pragmatic order: ship the threshold
+    loosening first, see if it unblocks the user, then decide
+    whether the macro-snap bearing selection needs zone-awareness.
+
 ### Recurring-fix discipline
 
 User explicitly called out (May 2026) that the same class of bug ("route
