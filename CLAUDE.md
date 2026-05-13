@@ -571,6 +571,37 @@ harness gap.
     count preemptively — let real generations show whether
     dilution is a real problem.
 
+39. **Generation latency: step-3.5 sequential bearing trials, no
+    map-pan prewarm, prefetch not persisted.** User-reported "routing
+    service slow or unavailable" — the cache-invalidation side effect
+    of #33 made cold-start generations slower because every
+    neighborhood needed a fresh Overpass + OSRM round trip. Two
+    targeted optimizations:
+    - **Step-3.5 batched parallelism.** The 8 bearing trials in
+      step-3.5 fallback were sequential (CLAUDE.md: a previous "all 8
+      in parallel" hedge regressed because it was 21+ in flight when
+      combined with concurrent step-3 candidates). Step 3.5 only
+      fires AFTER step 3 completes, so its concurrent count IS the
+      in-flight count. Batched the 4 first-pass bearings in parallel,
+      then the 4 second-pass bearings if the first pass found nothing
+      with right-display match. Peak in-flight = 4 (well under the 12
+      step-3 tolerates). Cuts step-3.5 wall-clock from 30-60s
+      sequential to 8-15s in degraded conditions. Removed the
+      per-bearing EARLY_EXIT_RATIO check — early exit now happens
+      between passes (skip pass 2 if pass 1 succeeded) which preserves
+      the "stop when good enough" behavior at coarser granularity.
+    - **Map-pan Overpass prewarm.** Added `onRegionChanged` callback
+      to `RouteMap` and a debounced handler in `app/index.tsx` that
+      fires `prefetchGreenSpacesAndHighways` for the new region. 800ms
+      debounce + 500m distance threshold prevents firing during pan
+      animations or for sub-block movements. The bucketed cache key
+      (~111m) means same-area pans hit cache anyway. Persists the
+      cache 5s after each prefetch so the data survives app close.
+    - **Prefetch persistence on `ctx.center` change.** Same 5s
+      timeout pattern — used to only persist after a successful
+      Generate, so a user who opened the app, prefetched, and closed
+      lost the data on next launch.
+
 ### Recurring-fix discipline
 
 User explicitly called out (May 2026) that the same class of bug ("route

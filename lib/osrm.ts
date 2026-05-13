@@ -3758,32 +3758,28 @@ export async function generateOSRMRoutes(
         LOOP_TRIANGLE_PERIMETER;
       const waypointDist = distanceKm / (loopPerimeterFactor * ROUTING_OVERHEAD);
 
-      // Sequential, not parallel. Firing all trials in parallel (each with
-      // its own internal retry loop) means many in-flight OSRM calls
-      // against a free public endpoint, which rate-limits or times out — the
-      // surviving trial is often the bad-bearing one. Sequential lets each
-      // trial get OSRM's full attention; early-exit avoids wasted calls.
+      // Batched parallel: fire each pass (4 bearings) concurrently, await
+      // both, then check early-exit. Was sequential — at 1-3 OSRM calls
+      // per bearing × 8 bearings serially that ran 30-60s in degraded
+      // network conditions. Batching by pass gives ~4 in-flight requests
+      // (well under the 12-candidate burst pressure step 3 tolerates) and
+      // halves typical step-3.5 wall-clock. The original "all 8 in
+      // parallel" hedge that regressed (CLAUDE.md notes) was 21+ in flight
+      // when combined with concurrent step-3 candidates — different
+      // failure mode. Step 3.5 only fires AFTER step 3 completes, so its
+      // concurrent count IS the in-flight count.
+      // Skip the second pass entirely if the first found a right-display
+      // route — the extra trials are insurance, not always needed.
       chosen = { route: null, waypoints: [] };
       let bestErr = Infinity;
       let bestIdx = 0;
       let foundRightDisplay = false;
-      const EARLY_EXIT_RATIO = 0.10; // stop once we're within 10% of target
-      const totalBearings = FIRST_PASS_BEARINGS + SECOND_PASS_BEARINGS;
 
-      for (let i = 0; i < totalBearings; i++) {
-        // First 4 bearings: evenly spaced 90° starting at seedBearing.
-        // Next 4 bearings: rotated 45° (interleaved between the first set).
-        // Skip the second pass entirely if we already found a right-display
-        // route — the extra trials are insurance, not always needed.
-        if (i >= FIRST_PASS_BEARINGS && foundRightDisplay) break;
-        const phase = i < FIRST_PASS_BEARINGS ? 0 : 360 / (FIRST_PASS_BEARINGS * 2);
-        const indexInPass = i % FIRST_PASS_BEARINGS;
-        const bearing = (seedBearing + phase + (indexInPass * 360) / FIRST_PASS_BEARINGS) % 360;
-        let wps: RoutePoint[];
+      const buildWaypoints = (bearing: number): RoutePoint[] => {
         if (routeType === 'out-and-back') {
-          wps = [center, destinationPoint(center, bearing, halfDist), center];
+          return [center, destinationPoint(center, bearing, halfDist), center];
         } else if (numLoopWaypoints === 2) {
-          wps = [
+          return [
             center,
             destinationPoint(center, bearing, waypointDist),
             // Offset wp2 30° from antipodal so the route forms a triangle,
@@ -3803,38 +3799,52 @@ export async function generateOSRMRoutes(
             generated.push(destinationPoint(center, angle, waypointDist));
           }
           generated.push(center);
-          wps = generated;
+          return generated;
         }
+      };
 
-        const t = await fetchOSRMRouteAdjusted(wps, center, distanceKm, 3, adjustUnits);
-        const trialDisplayMatches = !!t.route && !!adjustUnits &&
-          roundedDisplayMatches(t.route.distance / 1000, distanceKm, adjustUnits);
-        traceEmit('fallback-trial', {
-          i,
-          bearing,
-          routedKm: t.route ? t.route.distance / 1000 : null,
-          ratio: t.route ? (t.route.distance / 1000) / distanceKm : null,
-          displayMatches: trialDisplayMatches,
-          waypoints: t.waypoints,
-        });
-
-        if (!t.route) continue;
-        const err = Math.abs(t.route.distance / 1000 - distanceKm);
-        // Prefer a right-display route over a closer-by-distance wrong-
-        // display one. e.g. a 4.6mi route beats a 5.4mi route on raw error
-        // but the second one displays correctly as "5 mi" for a 5mi request.
-        // Within the same display-match status, prefer smaller error.
-        const beatsBest =
-          (trialDisplayMatches && !foundRightDisplay) ||
-          (trialDisplayMatches === foundRightDisplay && err < bestErr);
-        if (beatsBest) {
-          chosen = t;
-          bestErr = err;
-          bestIdx = i;
-          if (trialDisplayMatches) foundRightDisplay = true;
+      const runPass = async (passIdx: 0 | 1): Promise<void> => {
+        const phase = passIdx === 0 ? 0 : 360 / (FIRST_PASS_BEARINGS * 2);
+        const trials = await Promise.all(
+          Array.from({ length: FIRST_PASS_BEARINGS }, (_, k) => {
+            const bearing = (seedBearing + phase + (k * 360) / FIRST_PASS_BEARINGS) % 360;
+            const i = passIdx * FIRST_PASS_BEARINGS + k;
+            const wps = buildWaypoints(bearing);
+            return fetchOSRMRouteAdjusted(wps, center, distanceKm, 3, adjustUnits)
+              .then((t) => ({ i, bearing, t }));
+          })
+        );
+        for (const { i, bearing, t } of trials) {
+          const trialDisplayMatches = !!t.route && !!adjustUnits &&
+            roundedDisplayMatches(t.route.distance / 1000, distanceKm, adjustUnits);
+          traceEmit('fallback-trial', {
+            i,
+            bearing,
+            routedKm: t.route ? t.route.distance / 1000 : null,
+            ratio: t.route ? (t.route.distance / 1000) / distanceKm : null,
+            displayMatches: trialDisplayMatches,
+            waypoints: t.waypoints,
+          });
+          if (!t.route) continue;
+          const err = Math.abs(t.route.distance / 1000 - distanceKm);
+          // Prefer a right-display route over a closer-by-distance wrong-
+          // display one. Within the same display-match status, prefer
+          // smaller error.
+          const beatsBest =
+            (trialDisplayMatches && !foundRightDisplay) ||
+            (trialDisplayMatches === foundRightDisplay && err < bestErr);
+          if (beatsBest) {
+            chosen = t;
+            bestErr = err;
+            bestIdx = i;
+            if (trialDisplayMatches) foundRightDisplay = true;
+          }
         }
-        if (foundRightDisplay && err / distanceKm <= EARLY_EXIT_RATIO) break;
-      }
+      };
+
+      await runPass(0);
+      if (!foundRightDisplay) await runPass(1);
+
       traceEmit('fallback-chosen', {
         bestIdx,
         foundRightDisplay,

@@ -294,11 +294,48 @@ export default function SetupScreen() {
   // the perceived loading time. Overpass is cached at max radius so any
   // subsequent Generate at this location reuses it regardless of distance;
   // the OSRM warmup just keeps the socket open for the first real call.
+  // Persist the cache after the prefetch resolves so a user who opens the
+  // app and closes it without generating still gets the data on next launch.
   useEffect(() => {
     if (ctx.center) {
       prefetchGreenSpacesAndHighways(ctx.center);
       prewarmOSRMConnection(ctx.center);
+      // Wait briefly for the prefetch to settle before persisting.
+      // 5s comfortably covers a typical Overpass round trip even on
+      // public mirrors with tail latency, and persistOverpassCache is
+      // a no-op if the cache is empty.
+      const persistTimer = setTimeout(() => {
+        persistOverpassCache();
+      }, 5000);
+      return () => clearTimeout(persistTimer);
     }
+  }, [ctx.center]);
+
+  // Map-pan prewarm. When the user pans the map to a new neighborhood,
+  // fire Overpass prefetch for the new region so the cache is populated
+  // before they tap Generate. Debounced so a rapid pan doesn't fire
+  // dozens of Overpass requests; the bucketed cache key (~111m) means
+  // sub-block pans hit cache anyway. Distance threshold (>500m from the
+  // current ctx.center) avoids re-firing for any settle-back animation.
+  const lastPrewarmRef = useRef<RoutePoint | null>(null);
+  const prewarmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const handleMapRegionChanged = useCallback((newCenter: RoutePoint) => {
+    if (prewarmTimerRef.current) clearTimeout(prewarmTimerRef.current);
+    prewarmTimerRef.current = setTimeout(() => {
+      const last = lastPrewarmRef.current;
+      const distFromLast = last
+        ? Math.hypot(newCenter.lat - last.lat, newCenter.lng - last.lng) * 111
+        : Infinity;
+      const distFromCenter = Math.hypot(newCenter.lat - ctx.center.lat, newCenter.lng - ctx.center.lng) * 111;
+      // Only prefetch if the new region is meaningfully different from
+      // both the user's center AND the last prewarmed point. Avoids
+      // double-firing when animateToRegion settles back.
+      if (distFromLast < 0.5 || distFromCenter < 0.5) return;
+      lastPrewarmRef.current = newCenter;
+      prefetchGreenSpacesAndHighways(newCenter);
+      // Persist after prefetch settles (same 5s window as ctx.center prewarm).
+      setTimeout(() => persistOverpassCache(), 5000);
+    }, 800);
   }, [ctx.center]);
 
 
@@ -715,6 +752,7 @@ export default function SetupScreen() {
           center={ctx.center}
           routes={[]}
           selectedRouteId={null}
+          onRegionChanged={handleMapRegionChanged}
         />
       </View>
 

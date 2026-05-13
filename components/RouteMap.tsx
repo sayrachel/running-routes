@@ -17,9 +17,14 @@ interface RouteMapProps {
    *  point — the visual half of turn-by-turn navigation. Pass null when no
    *  step is active (idle / finished / between routes / off-route). */
   nextManeuver?: ManeuverStep | null;
+  /** Fires when the user pans/zooms to a new region. Receives the lat/lng
+   *  of the new region center. The Setup screen wires this to Overpass
+   *  prefetch so panning to a new neighborhood pre-populates the cache
+   *  before Generate is tapped. */
+  onRegionChanged?: (center: RoutePoint) => void;
 }
 
-function RouteMapImpl({ center, routes, selectedRouteId, gpsTrack, currentPosition, nextManeuver }: RouteMapProps) {
+function RouteMapImpl({ center, routes, selectedRouteId, gpsTrack, currentPosition, nextManeuver, onRegionChanged }: RouteMapProps) {
   const selectedRoute = routes.find((r) => r.id === selectedRouteId) ?? null;
 
   // Convert {lat, lng} → {latitude, longitude} once per route/track change.
@@ -85,6 +90,13 @@ function RouteMapImpl({ center, routes, selectedRouteId, gpsTrack, currentPositi
         showsMyLocationButton={false}
         showsCompass={false}
         initialRegion={region}
+        onRegionChangeComplete={onRegionChanged ? (r) => {
+          // Fires after the user finishes a pan/zoom gesture (or after
+          // animateToRegion settles). Our own animateToRegion call (above)
+          // would trigger this too, which is fine — the Setup-screen
+          // listener debounces and the prefetch is idempotent (cache hit).
+          onRegionChanged({ lat: r.latitude, lng: r.longitude });
+        } : undefined}
       >
         {selectedRouteCoords && (
           <Polyline
