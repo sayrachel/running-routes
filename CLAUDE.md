@@ -442,6 +442,49 @@ harness gap.
     loosening first, see if it unblocks the user, then decide
     whether the macro-snap bearing selection needs zone-awareness.
 
+36. **Macro-snap worked for far vertex but failed locally — Manhattan
+    side block-weaved while Brooklyn lobe was clean.** User-reported
+    East Village 16mi after #35 unblocked generation: Brooklyn lobe
+    (across Williamsburg Bridge → Greenpoint → back) was clean and
+    runnable; Manhattan side was tight zigzag through SoHo/West
+    Village. The user diagnosed exactly: macro-snap planned the far
+    vertex well but the close vertex either snapped to a clustered
+    park (causing OSRM to weave between nearby anchors) or fell in
+    water (Hudson) with no anchor in snap radius, leaving it
+    geometric and OSRM routed to an unreachable point.
+    Three fixes to `generateMacroSnapLoop`:
+    - **Snap radius scales with waypoint distance**:
+      `max(0.5, min(2.0, waypointDist * 0.4))`. Long loops put
+      vertices 4-6km out where the nearest viable corridor is often
+      1.5-2km away (Hudson River Greenway from a Hudson-floating
+      vertex); the previous flat 0.8km radius left those vertices
+      anchorless. Short loops keep tight radius so vertices don't
+      all snap to the same big park.
+    - **Linear-corridor preference**: anchors with kind in
+      {cycleway, footway, path, route, waterfront} get a 0.5×
+      distance discount in the snap chooser. Catches the
+      user-reported case where the Manhattan-side vertex snapped to
+      Washington Sq (park, dense weaving back to start) instead of
+      the Hudson River Greenway (clean linear extension up the
+      river). Park anchors still picked when nothing else is in
+      range — discount only flips ties.
+    - **Bearing-jitter retry**: if the planned bearing puts the
+      vertex in water/no-anchor zone, try ±30° then ±60° before
+      falling back to geometric. Small bearing nudge often reaches
+      a viable anchor without breaking the macro shape much. Stops
+      at the first success so the planned bearing is preserved
+      whenever possible.
+    What this should fix: the user's Manhattan side should now
+    extend along the Hudson River Greenway (linear corridor) instead
+    of weaving through SoHo. The Brooklyn lobe pattern (clean
+    bridge-out + corridor + bridge-back) is what we want for both
+    sides.
+    What's NOT in this fix: scoring still doesn't penalize
+    waypoint clustering — if the legacy strategies produce a
+    candidate where 2 anchors are 1km apart, that candidate can
+    still win on quality if its distance match is exact. The
+    cluster penalty is the next move if macro-snap still loses.
+
 ### Recurring-fix discipline
 
 User explicitly called out (May 2026) that the same class of bug ("route

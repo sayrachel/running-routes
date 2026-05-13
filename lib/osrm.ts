@@ -1417,31 +1417,62 @@ function generateMacroSnapLoop(
   const arc = 330;
   const step = arc / numLoopWaypoints;
 
-  // Snap radius: small enough to keep the loop shape, big enough to find
-  // anchors in most NYC starts. 0.8km is roughly the spacing between named
-  // parks in dense Manhattan; tighter would frequently leave macro vertices
-  // anchorless, looser would pull anchors so far from the macro shape that
-  // the loop's coherence advantage disappears.
-  const SNAP_RADIUS_KM = 0.8;
+  // Scale snap radius with waypoint distance. Long loops put vertices ~4-6km
+  // out — many of those land in water or unreachable zones, and the nearest
+  // viable corridor (e.g. Hudson River Greenway from an East Village macro
+  // vertex floating in the Hudson) can be 1.5-2km away. A flat 0.8km radius
+  // left those vertices anchorless, OSRM routed to the geometric vertex in
+  // water, and the route either failed or produced a degenerate shape.
+  // Short loops (1-3mi, waypointDist < 1.5km) keep the tight 0.6km radius
+  // so vertices don't snap across half of Manhattan to the same big park.
+  const SNAP_RADIUS_KM = Math.max(0.5, Math.min(2.0, waypointDist * 0.4));
+
+  // Anchors that route as linear extensions (greenways, bridges, named
+  // pedestrian/cycle paths, waterfronts) get a 0.5× distance discount when
+  // the snap chooser compares candidates within range. Catches the user-
+  // reported East Village 16mi case where the Manhattan-side macro vertex
+  // snapped to the nearest park (Washington Sq, dense weaving back to
+  // start) instead of the Hudson River Greenway (clean linear extension
+  // up/down the river). Park anchors are still picked when nothing else
+  // is in range — the discount only flips ties.
+  const LINEAR_KINDS = new Set<GreenSpace['kind']>([
+    'cycleway', 'footway', 'path', 'route', 'waterfront',
+  ]);
 
   const usedAnchorIdx = new Set<number>();
   const waypoints: RoutePoint[] = [center];
   const anchors: GreenSpace[] = [];
 
-  for (let k = 0; k < numLoopWaypoints; k++) {
-    const angle = (seedBearing + k * step) % 360;
-    const macroVertex = destinationPoint(center, angle, waypointDist);
+  // Bearing-jitter sequence: try the planned bearing first, then ±30°, ±60°
+  // before giving up. When the planned bearing puts the vertex in water or
+  // a no-anchor zone, a small bearing nudge often reaches a viable anchor
+  // without breaking the macro shape much. The user-reported 16mi case had
+  // a NW vertex floating in the Hudson — with no jitter, the vertex stayed
+  // geometric and OSRM routed to a point in the river. With ±30° jitter,
+  // the vertex moves to Chelsea Piers / Hudson River Park.
+  const JITTER_DEGREES = [0, 30, -30, 60, -60];
 
-    // Find nearest unused anchor within snap radius.
+  for (let k = 0; k < numLoopWaypoints; k++) {
+    const baseAngle = (seedBearing + k * step) % 360;
     let bestIdx = -1;
-    let bestDist = SNAP_RADIUS_KM;
-    for (let idx = 0; idx < greenSpaces.length; idx++) {
-      if (usedAnchorIdx.has(idx)) continue;
-      const d = haversineDistance(macroVertex, greenSpaces[idx].point);
-      if (d < bestDist) {
-        bestDist = d;
-        bestIdx = idx;
+    let bestEffectiveDist = SNAP_RADIUS_KM;
+
+    for (const jitter of JITTER_DEGREES) {
+      const angle = (baseAngle + jitter + 360) % 360;
+      const macroVertex = destinationPoint(center, angle, waypointDist);
+      for (let idx = 0; idx < greenSpaces.length; idx++) {
+        if (usedAnchorIdx.has(idx)) continue;
+        const d = haversineDistance(macroVertex, greenSpaces[idx].point);
+        if (d > SNAP_RADIUS_KM) continue;
+        const effectiveDist = LINEAR_KINDS.has(greenSpaces[idx].kind) ? d * 0.5 : d;
+        if (effectiveDist < bestEffectiveDist) {
+          bestEffectiveDist = effectiveDist;
+          bestIdx = idx;
+        }
       }
+      // Stop searching jitters as soon as we found something — preserves
+      // the planned bearing as much as possible. Only jitter when needed.
+      if (bestIdx !== -1) break;
     }
 
     if (bestIdx !== -1) {
@@ -1450,9 +1481,11 @@ function generateMacroSnapLoop(
       anchors.push(gs);
       usedAnchorIdx.add(bestIdx);
     } else {
-      // No nearby anchor — use the geometric vertex. The candidate is still
-      // coherent in shape; it just won't get a named-anchor bonus from
-      // scoring or contribute to the route name.
+      // No anchor found across all jittered bearings — use the geometric
+      // vertex at the planned bearing. Rare in practice (jitter sweep is
+      // 5 bearings × ~50 anchors typically) but possible in genuinely
+      // park-poor areas.
+      const macroVertex = destinationPoint(center, baseAngle, waypointDist);
       waypoints.push(macroVertex);
     }
   }
