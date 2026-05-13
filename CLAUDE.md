@@ -264,24 +264,28 @@ harness gap.
     30km loop). Step-3.5 fallback was missing the highway gate too
     (same architectural pattern as #26) — added it.
 
-31. **No "best candidate is still dirty" gate for long loops.** User-
-    reported 19mi Williamsburg loop shipped as a tangled mess with
-    visible backtracking; user couldn't trace it as a single
-    runnable path. The 0.50 retrace+overlap hard reject (line
-    ~3064) is deliberately lenient because dense-Manhattan short
-    loops routinely land at 0.35-0.45 (commit ca8dc56 had tightened
-    to 0.35 and regressed those, then reverted). For LONG loops in
-    geographically constrained areas, every candidate hits 0.30+
-    because the area genuinely can't fit a clean loop at the
-    requested distance — the chooser picked the cleanest of bad
-    options and shipped a tangle. Fix: added a length-conditional
-    best-must-be-clean gate: for distance ≥16km (~10mi), if the
-    sorted-best candidate has dirtiness >0.30, drop the entire pool
-    and let the existing empty-result path (auto-retry once, then
-    surface "no routes" to the user) handle it. Short routes keep
-    the existing 0.50 gate to preserve dense-grid behavior. Also
-    added `dirtiness` (retrace+overlap) to `ResolvedCandidate` so
-    the post-sort gate can check without recomputing.
+31. **No "best candidate is still dirty" gate for long loops —
+    ATTEMPTED AND REVERTED.** Initially added a length-conditional
+    gate: for distance ≥16km, if the sorted-best candidate had
+    dirtiness >0.30, drop the entire pool so the user got "no
+    routes". User pushed back immediately: "I should just get the
+    right route generated" — gating to "try a shorter distance" is
+    the wrong response, the algorithm should actually find a clean
+    route at the requested distance. Reverted. The `dirtiness`
+    field on `ResolvedCandidate` is kept (cheap to populate, useful
+    for diagnostics).
+    **Real fix needed (not yet shipped):** candidate generation for
+    long loops in geographically constrained areas (Williamsburg,
+    LES, Brooklyn Heights, etc.) needs work — the green-space-only
+    anchor pool doesn't include bridges, greenways, or pedestrian
+    corridors that runners actually use to extend long routes
+    cleanly. Possible directions: (a) add bridges/greenways/
+    promenades to the anchor pool via a separate Overpass query,
+    (b) increase candidate variant count for long loops to find
+    luckier configurations, (c) for long loops in narrow areas,
+    bias anchors toward known pedestrian corridors instead of
+    sectored greens. Don't re-add a "best is dirty → no routes"
+    gate without solving the underlying generation problem first.
 
 ### Recurring-fix discipline
 

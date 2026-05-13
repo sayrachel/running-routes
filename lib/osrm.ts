@@ -3635,38 +3635,7 @@ export async function generateOSRMRoutes(
   const sortedByQuality = [...scoredForSort].sort(
     (a, b) => a.candidate.qualityPenalty - b.candidate.qualityPenalty
   );
-  let topCandidates = sortedByQuality.slice(0, count);
-
-  // Best-must-be-clean gate for long loops. The 0.50 retrace+overlap hard
-  // reject (line ~3064) is deliberately lenient because dense-Manhattan
-  // short-distance loops routinely land at 0.35-0.45 — tightening it
-  // regressed those cases historically (commit ca8dc56 reverted). But for
-  // LONG loops in geographically constrained areas (e.g. user-reported
-  // 19mi Williamsburg "Sidestreet Shuffle"), every candidate hits 0.30+
-  // because the area genuinely can't fit a clean 19mi loop. The chooser
-  // picks the cleanest of bad options and ships a tangle the user can't
-  // physically follow as a single path. For long loops, treat "best
-  // candidate is still dirty" as a signal that the requested distance
-  // doesn't fit the area — surface "no clean routes" via the existing
-  // empty-result path (which auto-retries once with a fresh seed, then
-  // shows the user a "try a shorter distance" prompt). Threshold 0.30
-  // and only for distance >= 16km (~10mi) — short routes keep the
-  // existing 0.50 gate to preserve dense-grid behavior.
-  const isLongLoop = routeType !== 'point-to-point' && distanceKm >= 16;
-  if (isLongLoop && topCandidates.length > 0) {
-    const bestDirtiness = topCandidates[0].candidate.dirtiness ?? 0;
-    if (bestDirtiness > 0.30) {
-      traceEmit('candidate-rejected', {
-        i: -1,
-        reason: 'no-clean-long-loop',
-        bestDirtiness,
-        target: distanceKm,
-      });
-      qualityRejectCount += topCandidates.length;
-      rejectReasons.backtrack += topCandidates.length;
-      topCandidates = [];
-    }
-  }
+  const topCandidates = sortedByQuality.slice(0, count);
 
   // Snapshot the diagnostic counters when we're about to return an empty
   // route list. Caller (UI) reads this via getLastFailureDiagnostics() to
