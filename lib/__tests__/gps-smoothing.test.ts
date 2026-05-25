@@ -1,4 +1,4 @@
-import { smoothGpsSample } from '../useLocationTracking';
+import { smoothGpsSample, shouldSnapToRoad } from '../useLocationTracking';
 import type { RoutePoint } from '../route-generator';
 
 describe('smoothGpsSample', () => {
@@ -38,5 +38,32 @@ describe('smoothGpsSample', () => {
     }
     expect(smoothed.lat).toBeCloseTo(target.lat, 4);
     expect(smoothed.lng).toBeCloseTo(target.lng, 4);
+  });
+});
+
+describe('shouldSnapToRoad', () => {
+  test('first sample (no prior attempt) always snaps', () => {
+    expect(shouldSnapToRoad(null, { lat: 40.7, lng: -74.0 })).toBe(true);
+  });
+
+  test('sample within throttle distance does NOT snap', () => {
+    const prev: RoutePoint = { lat: 40.7000, lng: -74.0000 };
+    // ~5m north — well under the 20m default
+    const current: RoutePoint = { lat: 40.7000 + 0.000045, lng: -74.0000 };
+    expect(shouldSnapToRoad(prev, current)).toBe(false);
+  });
+
+  test('sample beyond throttle distance snaps', () => {
+    const prev: RoutePoint = { lat: 40.7000, lng: -74.0000 };
+    // ~25m north — above the 20m default
+    const current: RoutePoint = { lat: 40.7000 + 0.000225, lng: -74.0000 };
+    expect(shouldSnapToRoad(prev, current)).toBe(true);
+  });
+
+  test('custom threshold can tighten/loosen the throttle', () => {
+    const prev: RoutePoint = { lat: 40.7000, lng: -74.0000 };
+    const current: RoutePoint = { lat: 40.7000 + 0.000135, lng: -74.0000 }; // ~15m
+    expect(shouldSnapToRoad(prev, current, 0.010)).toBe(true); // 10m
+    expect(shouldSnapToRoad(prev, current, 0.020)).toBe(false); // 20m
   });
 });

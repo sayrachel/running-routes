@@ -851,6 +851,52 @@ surface because they live in the tracking/UX path, not the algorithm.
     run at one sample per 3s = 500 samples = no map-match. Easy to
     add chunked /match later when needed.
 
+50. **Smoothing-only blue track still wandered off-road.** Follow-up to
+    #44 after user reported the live blue GPS track was still visibly
+    off-road after the EMA filter shipped. Correct diagnosis: EMA
+    dampens jitter but doesn't snap — if the underlying GPS sample
+    reports a position 30m off the road, the smoothed point ends up
+    ~15m off (closer to the previous smoothed point), still not on
+    the road. The post-run /match (#49) cleans the saved track but
+    doesn't help while the user is looking at the live view.
+    Fix: throttled per-sample /nearest snap in `handleLocationUpdate`.
+    After pushing a smoothed sample to the polyline, fire
+    `fetchOSRMNearest(smoothed)` asynchronously if the sample has
+    moved ≥`SNAP_THROTTLE_DISTANCE_KM` (20m) from the last snap
+    attempt. When the call resolves, replace the same index in
+    `coordinatesRef` with the snapped point and set
+    `snapPendingEmitRef` so the timer's next array-rebuild check
+    forces a re-emit (without the flag, the length-only equality
+    check would skip the rebuild and the snapped point wouldn't
+    reach the map until the next GPS sample).
+    Cost model: at running pace (~3 m/s) a smoothed sample moves
+    ~10m per 3s tick, so the 20m throttle means ~1 snap call per
+    7s, or ~8/min. Same OSRM server, same rate-limit pool as /route,
+    but unlike route generation (12 candidates × ~1 call burst) the
+    snap load is a steady drip — significantly less likely to trip
+    public OSRM's burst throttle. `osrmNearestCache` (keyed at ~1m
+    precision) absorbs repeat snap requests for the same patch of
+    road (user stops at a light → same coord repeatedly).
+    Race-condition guards:
+    - Reference identity check: the snap callback only writes if
+      `coordinatesRef.current[snapIndex] === snapTarget` (the exact
+      object pushed). When the background-task sync wholesale-replaces
+      `coordinatesRef`, fresh point objects break reference equality
+      and the stale snap is dropped rather than corrupting the new
+      array.
+    - Distance accounting stays on the smoothed series. `lastPointRef`
+      is NOT updated to the snapped value when the snap resolves —
+      doing so would race with subsequent samples that already
+      computed distance using the smoothed baseline. The polyline
+      visually snaps, the recorded distance stays computed from the
+      smoothed deltas; the discrepancy is sub-meter per snap.
+    What's NOT in this fix: snapping in the background task. Async
+    network calls from a `TaskManager`-defined task on iOS are
+    fragile (the task may be suspended mid-await), and the user is
+    by definition not looking at the map when backgrounded. Bg
+    samples land in the polyline unsnapped; when the app foregrounds
+    again the next round of foreground samples will snap normally.
+
 Harness gaps this batch surfaced (preserved here so the next round of
 in-run UX bugs doesn't get the same blind-eye treatment):
 - The quality harness exercises ROUTE GENERATION only. It has no

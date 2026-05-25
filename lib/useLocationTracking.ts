@@ -2,6 +2,7 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import { Platform } from 'react-native';
 import * as Location from 'expo-location';
 import type { RoutePoint } from './route-generator';
+import { fetchOSRMNearest } from './osrm';
 
 const BACKGROUND_LOCATION_TASK = 'background-location-tracking';
 
@@ -57,6 +58,27 @@ export function smoothGpsSample(prev: RoutePoint | null, raw: RoutePoint): Route
  *  outdoor reception is 5-15m and we still want the run to start recording
  *  while GPS is warming up at the start of a session. */
 const MAX_ACCEPTED_ACCURACY_M = 50;
+
+/** Minimum distance (km) the smoothed sample must move from the previous
+ *  snap-attempt point before we fire another /nearest call. At running pace
+ *  (~3 m/s) a smoothed sample lands ~10m from the previous; 20m throttle
+ *  means we snap roughly every 2nd sample, ~7s apart — high enough that
+ *  the live blue track snaps onto the road within a few seconds of going
+ *  off, low enough that we don't burn the public-OSRM /nearest budget. */
+const SNAP_THROTTLE_DISTANCE_KM = 0.020;
+
+/** Should we kick off a /nearest snap for this smoothed sample? True iff
+ *  no snap has been attempted yet this run, or the sample has moved far
+ *  enough from the last attempt to justify another call. Pure function so
+ *  the throttle policy is unit-testable in isolation. */
+export function shouldSnapToRoad(
+  lastAttempt: RoutePoint | null,
+  current: RoutePoint,
+  thresholdKm: number = SNAP_THROTTLE_DISTANCE_KM,
+): boolean {
+  if (!lastAttempt) return true;
+  return haversineDistance(lastAttempt, current) >= thresholdKm;
+}
 
 /** Format pace from min/km number to mm:ss string */
 function formatPace(paceMinPerKm: number): string {
@@ -177,6 +199,15 @@ export function useLocationTracking() {
   // came in, so the reference stays stable and React.memo'd map consumers
   // can skip re-rendering once per second for nothing.
   const lastEmittedCoordsRef = useRef<RoutePoint[]>([]);
+  // Tracks the smoothed point we last submitted to /nearest, so we don't
+  // re-snap the same patch of road on every 3s GPS sample (the throttle
+  // window is SNAP_THROTTLE_DISTANCE_KM).
+  const lastSnappedAttemptRef = useRef<RoutePoint | null>(null);
+  // Set to true by the snap callback when it mutates coordinatesRef in
+  // place. The timer's array-rebuild check uses length only — without this
+  // flag, an in-place index swap would skip emission and the snapped point
+  // wouldn't reach the map until the NEXT GPS sample arrived (1-3s delay).
+  const snapPendingEmitRef = useRef(false);
 
   // Elapsed time ticker
   useEffect(() => {
@@ -242,13 +273,18 @@ export function useLocationTracking() {
           });
         }
 
-        // Only allocate a fresh coordinates array when length actually grew.
-        // Otherwise reuse the previously-emitted ref so downstream React.memo
-        // checks (RouteMap compares gpsTrack length) skip cleanly.
-        const coordsForState = coords.length === lastEmittedCoordsRef.current.length
-          ? lastEmittedCoordsRef.current
-          : [...coords];
+        // Only allocate a fresh coordinates array when length actually grew
+        // OR when a snap callback mutated coordinatesRef in-place since the
+        // last emit. Either condition means downstream consumers need to
+        // re-render; otherwise reuse the previously-emitted ref so
+        // React.memo'd map components skip cleanly.
+        const snapDirty = snapPendingEmitRef.current;
+        const coordsForState =
+          coords.length === lastEmittedCoordsRef.current.length && !snapDirty
+            ? lastEmittedCoordsRef.current
+            : [...coords];
         lastEmittedCoordsRef.current = coordsForState;
+        snapPendingEmitRef.current = false;
 
         setStats({
           coordinates: coordsForState,
@@ -273,10 +309,12 @@ export function useLocationTracking() {
 
   /** Shared handler for both foreground-watch and resume-watch callbacks.
    *  Filters low-precision samples, applies EMA smoothing, dedupes
-   *  sub-3m moves, then appends the smoothed point to the polyline and
-   *  syncs to background-task shared state. Kept as a closure (not a
-   *  useCallback) so the ref accesses are always current — the watch
-   *  subscription captures whatever was the latest closure at start. */
+   *  sub-3m moves, appends the smoothed point to the polyline, syncs to
+   *  background-task shared state, then kicks off a throttled /nearest
+   *  snap to nudge the just-pushed point onto a real road. Kept as a
+   *  closure (not a useCallback) so the ref accesses are always current —
+   *  the watch subscription captures whatever was the latest closure at
+   *  start. */
   const handleLocationUpdate = (location: Location.LocationObject) => {
     accuracyRef.current = location.coords.accuracy;
     if (
@@ -306,6 +344,38 @@ export function useLocationTracking() {
     sharedTotalDistance = totalDistanceRef.current;
     lastBackgroundPoint = raw;
     lastBackgroundSmoothed = smoothed;
+
+    // Throttled live road-snap. Fires asynchronously; the smoothed point
+    // is already in the polyline so the run is never blocked on the snap
+    // resolving. When the snap returns we replace the same index in
+    // coordinatesRef and mark snapPendingEmitRef so the next timer tick
+    // rebuilds the React-visible array.
+    if (shouldSnapToRoad(lastSnappedAttemptRef.current, smoothed)) {
+      lastSnappedAttemptRef.current = smoothed;
+      const snapIndex = coordinatesRef.current.length - 1;
+      const snapTarget = smoothed; // captured by reference for the verify step
+      fetchOSRMNearest(smoothed)
+        .then((snapped) => {
+          // No-op if /nearest returned the input unchanged.
+          if (snapped.lat === snapTarget.lat && snapped.lng === snapTarget.lng) return;
+          // Reference-guard against the background-sync path having
+          // wholesale-replaced coordinatesRef while we were awaiting
+          // (`coordinatesRef.current = [...sharedCoordinates]` in the timer).
+          // If the index no longer holds the exact object we pushed, the
+          // snap is stale — drop it rather than risk writing to a foreign
+          // point.
+          if (coordinatesRef.current[snapIndex] !== snapTarget) return;
+          coordinatesRef.current[snapIndex] = snapped;
+          // Mirror to shared state so a future background sync doesn't
+          // clobber the snapped point with the pre-snap one.
+          sharedCoordinates = [...coordinatesRef.current];
+          snapPendingEmitRef.current = true;
+        })
+        .catch(() => {
+          // fetchOSRMNearest already swallows internal errors; defensive
+          // catch so any unexpected rejection doesn't take down the run.
+        });
+    }
   };
 
   const startTracking = useCallback(async () => {
@@ -316,6 +386,8 @@ export function useLocationTracking() {
     lastPointRef.current = null;
     splitTimestampsRef.current = [];
     lastEmittedCoordsRef.current = [];
+    lastSnappedAttemptRef.current = null;
+    snapPendingEmitRef.current = false;
     resetSmoothingState();
 
     setStats({
