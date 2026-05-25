@@ -720,6 +720,151 @@ harness gap.
     coords (same start, same anchor used by multiple candidates)
     cost only one round trip.
 
+### In-run experience fixes (May 2026, post-launch QA)
+
+These cover the in-run tracking/navigation layer, NOT route generation.
+First batch of fixes after the user did a real-world test of the
+shipping app. Caught issues that the route-quality harness can't
+surface because they live in the tracking/UX path, not the algorithm.
+
+43. **Map auto-pan yanked user's manual zoom every GPS tick.** During
+    a run, `RouteMap`'s region useEffect called `animateToRegion` on
+    every input change. `region` recomputes when `currentPosition`
+    changes (every 3s during a run), so any manual pinch-zoom was
+    overridden within seconds. Fix: `userControlledUntilRef` bumped by
+    `USER_CONTROL_HOLD_MS` (10s) every time `onRegionChangeComplete`
+    fires with `details.isGesture === true`. The auto-animate effect
+    skips while `Date.now() < userControlledUntilRef.current`. Route
+    changes (new `selectedRouteId`) bypass the gate — when the user
+    taps Refresh they expect the new bbox even if they were exploring.
+    What's NOT in this fix: a "recenter" button to manually jump back
+    to follow-mode. Currently the user has to wait 10s after their
+    last gesture. Cheap to add later if anyone asks.
+
+44. **GPS polyline rendered as jagged squiggles.** The recorded GPS
+    track was visibly jittery on the map: each raw sample landed
+    ±3-10m around the true path, and the polyline drew a line through
+    every point. Fix: EMA smoothing in `useLocationTracking.ts` with
+    `SMOOTH_ALPHA = 0.5` (each new smoothed point = midpoint of raw
+    sample and previous smoothed point). Both the displayed polyline
+    AND the distance integration use the smoothed series — moving
+    average doesn't lose path distance because the jitter it removes
+    was inflating distance to begin with (a zigzag line is longer than
+    the underlying straight road). Also added a
+    `MAX_ACCEPTED_ACCURACY_M = 50` gate — samples worse than 50m of
+    accuracy (typical under buildings / urban canyon refraction) are
+    dropped entirely; the EMA can't recover from samples that wrong.
+    Live map-matching is OUT — public OSRM /match has the same
+    rate-limit envelope as /route (CLAUDE.md is explicit about volume
+    risk), and per-sample matching would burn the budget. Instead see
+    fix #48 for the post-run /match.
+
+45. **Audio kept reading original-route instructions when off route.**
+    Once the user crossed the 150m off-route threshold, the in-run
+    audio kept announcing turns from the planned route — confusing
+    when those turns were now 500m away on streets the user can't
+    reach without backtracking. Fix is structural and tiered (see
+    entries #45-47 together; they share the new
+    `lib/off-route.ts` state machine and the new
+    `fetchInRunRoute` OSRM helper). Specifically for #45: after 60s
+    continuously off route, the app silently calls OSRM with
+    `[currentPos, nextOnRouteTarget(planned route, lookahead 150m)]`
+    and uses the resulting `extractManeuvers` step list as a `recalcSteps`
+    OVERRIDE for ManeuverBanner. The override stays in effect until
+    the user gets back on route (auto-cleared) or the reroute tier
+    fires (cleared by the route-change reset useEffect). What's NOT in
+    this fix: continuing the planned-route turn-by-turn from "after
+    the return point" — once the user is back on route the banner
+    resets to step 0 of the planned list, not step N where they left
+    off. Picking the right resume index is a future improvement.
+
+46. **Off-route runs never auto-rerouted.** Even after the recalc
+    tier (#45) gave back-to-route directions, if the user kept going
+    farther off, nothing replanned the rest of the run. Fix: at 90s
+    continuously off-route, the app calls
+    `fetchInRunRoute([currentPos, destination])` (destination =
+    `ctx.center` for loop/OAB, `ctx.endLocation` for p2p) and
+    REPLACES `ctx.selectedRoute` with the result. The route-change
+    useEffect already in run.tsx (predates this) catches the
+    swap and resets turn-by-turn state + off-route state + recalc
+    override — the new route is now the plan and "off" is recomputed
+    against it. What's deliberately NOT in v1: preserving remaining
+    planned anchors. The route is a straight pos→destination path;
+    we don't know which of the original anchors are "behind" the
+    user vs ahead without spatial analysis of the GPS track against
+    each, and an out-of-order anchor would produce its own block-loops
+    / pendant artifacts (CLAUDE.md #34, #41). A user who wants to
+    continue the full distance can plan a new route post-arrival.
+
+47. **"Off course" audio nagged every time isOffRoute flipped.** The
+    previous implementation fired `speakOffCourse` on the false→true
+    edge of `isOffRoute`, but GPS jitter near the 150m boundary
+    caused multiple true/false flips per minute, each one queuing a
+    new "Off course" announcement. Fix is now built into the
+    `updateOffRoute` state machine in `lib/off-route.ts`:
+    - 30s grace period before the first speech (existing behavior,
+      kept)
+    - 30s minimum cooldown between subsequent speeches
+    - Hard cap at 2 speeches per off-route episode — after the
+      second cue the app falls silent and lets the rerouting
+      (#45/#46) do the talking
+    - Counter resets to 0 when the user returns on-route, so a fresh
+      episode plays the full sequence from the beginning
+    Pure state machine, exported separately, fully unit-tested in
+    `lib/__tests__/off-route.test.ts` (8 update-state cases + 5
+    helper-function cases). The chip visibility and the speech edge
+    are now both derived from the same state machine — they can't
+    desync.
+
+48. **Run never auto-completed at the destination.** Users had to
+    manually tap Finish even after arriving at the planned start/end
+    point — easy to miss when phone is in a pocket. Fix: geofence
+    check in run.tsx on each GPS tick. Destination =
+    `ctx.center` for loop / out-and-back, `ctx.endLocation` for p2p.
+    Triggers when `haversineDistance(currentPosition, destination) <
+    AUTO_FINISH_RADIUS_KM` (40m). For loops/OAB, gated on
+    `totalDistanceKm >= 0.7 × plannedKm` so standing at start in
+    the first minute doesn't fire (no planned distance → fall back
+    to a 500m minimum). On trigger, a 5-second cancel countdown
+    toast appears at the top of the screen ("Finishing in 5…" with
+    a "Keep Running" button). The toast is dismissable: cancel sets
+    `autoFinishCancelledRef.current = true` so the geofence trip
+    doesn't immediately re-arm on the next GPS tick (otherwise a
+    user loitering at start during cooldown would loop into
+    cancel → arm → cancel forever). Re-arm requires the route to
+    change (new selectedRoute id). At 0 the countdown calls
+    `handleFinish` which is the same path as the manual finish
+    button — same StopTracking, same StatsView, same Save flow.
+
+49. **Post-run map-match for saved track quality.** Live GPS, even
+    smoothed (#44), still has small wobble where individual samples
+    land off-road and the smoothed polyline kinks. Saved runs were
+    visibly squiggly on the history detail view. Fix: one OSRM
+    `/match` call at save time in `handleSave`, snapping the recorded
+    GPS track to the actual road network. Fires AFTER the user taps
+    Save (not in the hot generation path) so the steady-state public-
+    OSRM load is negligible. Falls back to raw track on: <5 samples
+    (too short for /match to disambiguate), >100 samples (OSRM /match
+    has a request-size cap), any HTTP / JSON / parse error. Implemented
+    in `lib/osrm.ts:fetchOSRMMapMatch` as a public export. Long-run
+    chunking (>100 samples) is a known follow-up — currently a 25-min
+    run at one sample per 3s = 500 samples = no map-match. Easy to
+    add chunked /match later when needed.
+
+Harness gaps this batch surfaced (preserved here so the next round of
+in-run UX bugs doesn't get the same blind-eye treatment):
+- The quality harness exercises ROUTE GENERATION only. It has no
+  simulator for "user runs along the route, gets off, comes back" —
+  off-route handling can't be QA'd by running the harness. Manual
+  testing is currently the only signal for entries #45-#47.
+- The harness has no model of UI state — map zoom respect, chip
+  visibility, countdown toast behavior all require manual or
+  on-device test.
+- A future "tracking simulator" that replays a known-good GPS trace
+  (real run recording) against the in-run hooks would catch
+  regressions in the smoothing, off-route detection, and auto-complete
+  paths without requiring a phone. Not built yet.
+
 ### Recurring-fix discipline
 
 User explicitly called out (May 2026) that the same class of bug ("route

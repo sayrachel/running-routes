@@ -30,6 +30,34 @@ function haversineDistance(p1: RoutePoint, p2: RoutePoint): number {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+/** Exponential moving average smoothing weight applied to incoming GPS
+ *  samples. New point contributes 0.5, previous smoothed point contributes
+ *  0.5 — enough to visibly straighten the polyline without introducing
+ *  noticeable lag at the 3s sample rate. Higher (e.g., 0.7) tracks raw GPS
+ *  more closely; lower (e.g., 0.3) smooths harder but the live cursor lags
+ *  behind the runner's actual position. The recorded polyline IS the smoothed
+ *  one — moving average doesn't lose path distance for runs, since the
+ *  jitter the filter removes was inflating distance to begin with. */
+const SMOOTH_ALPHA = 0.5;
+
+/** Apply EMA smoothing to a new raw GPS sample. Returns the smoothed point
+ *  to use as the next polyline vertex. Exported for unit testing.  */
+export function smoothGpsSample(prev: RoutePoint | null, raw: RoutePoint): RoutePoint {
+  if (!prev) return raw;
+  return {
+    lat: SMOOTH_ALPHA * raw.lat + (1 - SMOOTH_ALPHA) * prev.lat,
+    lng: SMOOTH_ALPHA * raw.lng + (1 - SMOOTH_ALPHA) * prev.lng,
+  };
+}
+
+/** Reject samples whose reported accuracy is worse than this many meters.
+ *  Position quality below this is dominated by multipath errors (urban
+ *  canyons, indoor refraction); smoothing can't recover them and they drag
+ *  the EMA toward fictitious positions. 50m was picked because typical
+ *  outdoor reception is 5-15m and we still want the run to start recording
+ *  while GPS is warming up at the start of a session. */
+const MAX_ACCEPTED_ACCURACY_M = 50;
+
 /** Format pace from min/km number to mm:ss string */
 function formatPace(paceMinPerKm: number): string {
   if (!isFinite(paceMinPerKm) || paceMinPerKm <= 0) return '--:--';
@@ -59,6 +87,17 @@ export interface TrackingStats {
 let sharedCoordinates: RoutePoint[] = [];
 let sharedTotalDistance = 0;
 let lastBackgroundPoint: RoutePoint | null = null;
+let lastBackgroundSmoothed: RoutePoint | null = null;
+
+/** Reset all module-level smoothing/distance state. Called from
+ *  `startTracking` so a fresh run never inherits the previous run's
+ *  smoothed-tail position or its accumulated distance. */
+function resetSmoothingState(): void {
+  sharedCoordinates = [];
+  sharedTotalDistance = 0;
+  lastBackgroundPoint = null;
+  lastBackgroundSmoothed = null;
+}
 
 // Register background location task (native only)
 if (Platform.OS !== 'web') {
@@ -72,21 +111,31 @@ if (Platform.OS !== 'web') {
       if (data) {
         const { locations } = data as { locations: Location.LocationObject[] };
         for (const loc of locations) {
-          const point: RoutePoint = {
+          // Drop low-precision samples entirely — they're more likely to
+          // distort the smoothed track than to contribute useful position.
+          if (
+            typeof loc.coords.accuracy === 'number' &&
+            loc.coords.accuracy > MAX_ACCEPTED_ACCURACY_M
+          ) {
+            continue;
+          }
+          const raw: RoutePoint = {
             lat: loc.coords.latitude,
             lng: loc.coords.longitude,
           };
+          const smoothed = smoothGpsSample(lastBackgroundSmoothed, raw);
 
-          if (lastBackgroundPoint) {
-            const dist = haversineDistance(lastBackgroundPoint, point);
+          if (lastBackgroundSmoothed) {
+            const dist = haversineDistance(lastBackgroundSmoothed, smoothed);
             if (dist < 0.003) continue;
           }
 
-          sharedCoordinates.push(point);
-          if (lastBackgroundPoint) {
-            sharedTotalDistance += haversineDistance(lastBackgroundPoint, point);
+          sharedCoordinates.push(smoothed);
+          if (lastBackgroundSmoothed) {
+            sharedTotalDistance += haversineDistance(lastBackgroundSmoothed, smoothed);
           }
-          lastBackgroundPoint = point;
+          lastBackgroundPoint = raw;
+          lastBackgroundSmoothed = smoothed;
         }
       }
     });
@@ -115,6 +164,11 @@ export function useLocationTracking() {
   const coordinatesRef = useRef<RoutePoint[]>([]);
   const totalDistanceRef = useRef(0);
   const elapsedRef = useRef(0);
+  // Last SMOOTHED point we appended to the polyline. Used as the EMA
+  // baseline for the next incoming raw sample and as the distance-delta
+  // anchor — both display + distance flow through the same smoothed series
+  // so a single jittery sample can't inflate distance or visibly squiggle
+  // the line.
   const lastPointRef = useRef<RoutePoint | null>(null);
   const splitTimestampsRef = useRef<number[]>([]);
   const accuracyRef = useRef<number | null>(null);
@@ -217,6 +271,43 @@ export function useLocationTracking() {
     };
   }, [isTracking, isPaused]);
 
+  /** Shared handler for both foreground-watch and resume-watch callbacks.
+   *  Filters low-precision samples, applies EMA smoothing, dedupes
+   *  sub-3m moves, then appends the smoothed point to the polyline and
+   *  syncs to background-task shared state. Kept as a closure (not a
+   *  useCallback) so the ref accesses are always current — the watch
+   *  subscription captures whatever was the latest closure at start. */
+  const handleLocationUpdate = (location: Location.LocationObject) => {
+    accuracyRef.current = location.coords.accuracy;
+    if (
+      typeof location.coords.accuracy === 'number' &&
+      location.coords.accuracy > MAX_ACCEPTED_ACCURACY_M
+    ) {
+      return;
+    }
+    const raw: RoutePoint = {
+      lat: location.coords.latitude,
+      lng: location.coords.longitude,
+    };
+    const smoothed = smoothGpsSample(lastPointRef.current, raw);
+
+    if (lastPointRef.current) {
+      const dist = haversineDistance(lastPointRef.current, smoothed);
+      if (dist < 0.003) return;
+    }
+
+    coordinatesRef.current.push(smoothed);
+    if (lastPointRef.current) {
+      totalDistanceRef.current += haversineDistance(lastPointRef.current, smoothed);
+    }
+    lastPointRef.current = smoothed;
+
+    sharedCoordinates = [...coordinatesRef.current];
+    sharedTotalDistance = totalDistanceRef.current;
+    lastBackgroundPoint = raw;
+    lastBackgroundSmoothed = smoothed;
+  };
+
   const startTracking = useCallback(async () => {
     // Reset all state
     coordinatesRef.current = [];
@@ -225,9 +316,7 @@ export function useLocationTracking() {
     lastPointRef.current = null;
     splitTimestampsRef.current = [];
     lastEmittedCoordsRef.current = [];
-    sharedCoordinates = [];
-    sharedTotalDistance = 0;
-    lastBackgroundPoint = null;
+    resetSmoothingState();
 
     setStats({
       coordinates: [],
@@ -253,31 +342,7 @@ export function useLocationTracking() {
         timeInterval: 3000,
         distanceInterval: 3,
       },
-      (location) => {
-        const point: RoutePoint = {
-          lat: location.coords.latitude,
-          lng: location.coords.longitude,
-        };
-
-        accuracyRef.current = location.coords.accuracy;
-
-        // Filter GPS jitter
-        if (lastPointRef.current) {
-          const dist = haversineDistance(lastPointRef.current, point);
-          if (dist < 0.003) return; // less than 3m
-        }
-
-        coordinatesRef.current.push(point);
-        if (lastPointRef.current) {
-          totalDistanceRef.current += haversineDistance(lastPointRef.current, point);
-        }
-        lastPointRef.current = point;
-
-        // Sync to shared state for background task
-        sharedCoordinates = [...coordinatesRef.current];
-        sharedTotalDistance = totalDistanceRef.current;
-        lastBackgroundPoint = point;
-      }
+      handleLocationUpdate,
     );
 
     // Try to start background tracking (native only)
@@ -328,29 +393,7 @@ export function useLocationTracking() {
         timeInterval: 3000,
         distanceInterval: 3,
       },
-      (location) => {
-        const point: RoutePoint = {
-          lat: location.coords.latitude,
-          lng: location.coords.longitude,
-        };
-
-        accuracyRef.current = location.coords.accuracy;
-
-        if (lastPointRef.current) {
-          const dist = haversineDistance(lastPointRef.current, point);
-          if (dist < 0.003) return;
-        }
-
-        coordinatesRef.current.push(point);
-        if (lastPointRef.current) {
-          totalDistanceRef.current += haversineDistance(lastPointRef.current, point);
-        }
-        lastPointRef.current = point;
-
-        sharedCoordinates = [...coordinatesRef.current];
-        sharedTotalDistance = totalDistanceRef.current;
-        lastBackgroundPoint = point;
-      }
+      handleLocationUpdate,
     );
   }, []);
 

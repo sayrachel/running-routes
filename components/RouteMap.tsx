@@ -1,6 +1,13 @@
-import React, { useRef, useEffect, useMemo } from 'react';
+import React, { useRef, useEffect, useMemo, useCallback } from 'react';
 import { View, StyleSheet } from 'react-native';
 import MapView, { Polyline, Marker } from 'react-native-maps';
+
+/** How long (ms) to honor the user's manual pan/zoom before resuming
+ *  auto-follow. Refreshed on every fresh gesture so a user who keeps panning
+ *  doesn't have the map snap on them. Route-change events (new selectedRoute
+ *  id) bypass this — when the user taps Refresh, they want to see the new
+ *  route's bounds even if they were exploring. */
+const USER_CONTROL_HOLD_MS = 10000;
 import { Ionicons } from '@expo/vector-icons';
 import type { GeneratedRoute, RoutePoint, ManeuverStep } from '@/lib/route-generator';
 import { Colors } from '@/lib/theme';
@@ -71,13 +78,37 @@ function RouteMapImpl({ center, routes, selectedRouteId, gpsTrack, currentPositi
   // subsequent changes gives a smooth ~400ms transition.
   const mapRef = useRef<MapView>(null);
   const isFirstMountRef = useRef(true);
+  // Timestamp until which we should NOT auto-animate the camera — bumped
+  // every time the user pans or pinches. Without this, every GPS sample
+  // during a run re-fits the camera to the route bbox and yanks the user
+  // out of their manually-chosen zoom level within a couple of seconds.
+  const userControlledUntilRef = useRef(0);
+  const lastRouteIdRef = useRef<string | null>(null);
   useEffect(() => {
+    const routeChanged = lastRouteIdRef.current !== (selectedRouteId ?? null);
+    lastRouteIdRef.current = selectedRouteId ?? null;
     if (isFirstMountRef.current) {
       isFirstMountRef.current = false;
       return;
     }
+    // Route change (refresh / new pick) overrides the user-control hold —
+    // the user implicitly asked for a new bbox when they tapped Refresh.
+    if (!routeChanged && Date.now() < userControlledUntilRef.current) return;
     mapRef.current?.animateToRegion(region, 400);
-  }, [region]);
+  }, [region, selectedRouteId]);
+
+  // Region change handler — fires both for user gestures and our own
+  // animateToRegion calls. `details.isGesture` (RN Maps ≥1.4) distinguishes
+  // them; only user gestures bump the hold timer.
+  const handleRegionChangeComplete = useCallback(
+    (r: { latitude: number; longitude: number }, details?: { isGesture?: boolean }) => {
+      if (details?.isGesture) {
+        userControlledUntilRef.current = Date.now() + USER_CONTROL_HOLD_MS;
+      }
+      onRegionChanged?.({ lat: r.latitude, lng: r.longitude });
+    },
+    [onRegionChanged],
+  );
 
   return (
     <View style={styles.container}>
@@ -90,13 +121,7 @@ function RouteMapImpl({ center, routes, selectedRouteId, gpsTrack, currentPositi
         showsMyLocationButton={false}
         showsCompass={false}
         initialRegion={region}
-        onRegionChangeComplete={onRegionChanged ? (r) => {
-          // Fires after the user finishes a pan/zoom gesture (or after
-          // animateToRegion settles). Our own animateToRegion call (above)
-          // would trigger this too, which is fine — the Setup-screen
-          // listener debounces and the prefetch is idempotent (cache hit).
-          onRegionChanged({ lat: r.latitude, lng: r.longitude });
-        } : undefined}
+        onRegionChangeComplete={handleRegionChangeComplete}
       >
         {selectedRouteCoords && (
           <Polyline

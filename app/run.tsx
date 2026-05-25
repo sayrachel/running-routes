@@ -25,13 +25,19 @@ import { saveRunRecord, addPendingRun, getCachedRunHistory } from '@/lib/firesto
 import { buildGoogleMapsUrl } from '@/lib/route-export';
 import { BottomTabBar } from '@/components/BottomTabBar';
 import { Colors, Fonts } from '@/lib/theme';
-import { generateOSRMRoutes, OSRMUnavailableError, getLastFailureDiagnostics, haversineDistance } from '@/lib/osrm';
+import { generateOSRMRoutes, OSRMUnavailableError, getLastFailureDiagnostics, haversineDistance, fetchInRunRoute, fetchOSRMMapMatch } from '@/lib/osrm';
 import { findMatchingHistoricalRoute } from '@/lib/route-history';
 import { isDevUser } from '@/lib/dev-mode';
 import { INITIAL_TURN_STATE, updateTurnByTurn, type TurnByTurnState } from '@/lib/turn-by-turn';
 import { prepareAudioSession, resetSpokenPrompts, maybeFireCues, speakOffCourse } from '@/lib/audio-cues';
+import {
+  INITIAL_OFF_ROUTE_STATE,
+  updateOffRoute,
+  nextOnRouteTarget,
+  type OffRouteState,
+} from '@/lib/off-route';
 import { ManeuverBanner } from '@/components/ManeuverBanner';
-import type { ManeuverStep } from '@/lib/route-generator';
+import type { ManeuverStep, GeneratedRoute } from '@/lib/route-generator';
 import type { RoutePoint } from '@/lib/route-generator';
 import { persistOverpassCache } from '@/lib/overpass-persist';
 import { persistOSRMCache } from '@/lib/osrm-persist';
@@ -99,14 +105,27 @@ export default function RunScreen() {
     };
   }, []);
 
-  // Off-route indicator. Passive: shows a chip when the user has been more
-  // than 150m from the planned polyline for at least 30 continuous seconds.
-  // Doesn't change the route or stats — just tells the user. Threshold is
-  // generous enough to ignore typical detours (water fountain, traffic light)
-  // and the 30s grace prevents the chip from flickering on momentary GPS
-  // jumps or single-block deviations.
+  // Off-route handling. Tiered (lib/off-route.ts):
+  //   30s off → chip + one voice cue
+  //   60s off → silent recalc: OSRM directions from current pos back to the
+  //             planned route; ManeuverBanner switches to those steps
+  //   90s off → full reroute: OSRM from current pos to the destination
+  //             (loop/OAB = start, p2p = end). Replaces the planned route.
+  // State machine is a pure function; this component just owns the ref and
+  // dispatches the side effects (speech, OSRM calls, banner override) on
+  // the edges returned by updateOffRoute.
   const [isOffRoute, setIsOffRoute] = useState(false);
-  const offRouteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const offRouteStateRef = useRef<OffRouteState>(INITIAL_OFF_ROUTE_STATE);
+  // Override applied to ManeuverBanner when the recalc tier has fired. Stays
+  // set until either: the user gets back on route (cleared by the GPS tick
+  // when isOffRoute returns false), or a full reroute fires and replaces the
+  // selected route (cleared in handleReroute).
+  const [recalcSteps, setRecalcSteps] = useState<ManeuverStep[] | null>(null);
+  // Guards against firing recalc/reroute twice if the GPS tick double-fires
+  // before the await completes (the state machine's recalcFired flag only
+  // flips after the function returns).
+  const recalcInFlightRef = useRef(false);
+  const rerouteInFlightRef = useRef(false);
 
   // Turn-by-turn state. The internal debounce/commit state lives in a ref so
   // GPS samples don't trigger re-renders just to update it; the UI-facing
@@ -116,6 +135,16 @@ export default function RunScreen() {
   const [navStep, setNavStep] = useState<ManeuverStep | null>(null);
   const [navDistanceM, setNavDistanceM] = useState<number | null>(null);
 
+  // Auto-complete countdown. When the user arrives within AUTO_FINISH_RADIUS_KM
+  // of the destination AND has covered ≥AUTO_FINISH_PROGRESS_FRACTION of the
+  // planned distance, a 5s countdown arms before handleFinish fires. Cancel
+  // button on the toast sets `autoFinishCancelledRef` so the geofence trip
+  // doesn't immediately re-arm on the next GPS tick (would loop forever if
+  // the user is loitering near the finish).
+  const [autoFinishCountdown, setAutoFinishCountdown] = useState<number | null>(null);
+  const autoFinishTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const autoFinishCancelledRef = useRef(false);
+
   // Audio session setup happens once per mount. Idempotent — safe even if
   // the user never starts a run.
   useEffect(() => {
@@ -123,18 +152,24 @@ export default function RunScreen() {
   }, []);
 
   // Reset turn-by-turn state and the spoken-prompt cache whenever the route
-  // changes (initial gen, refresh, history fallback). Otherwise prompts
-  // already fired on the previous route would be marked "spoken" and the
-  // new route's identical-coord steps (rare but possible) would skip them.
+  // changes (initial gen, refresh, history fallback, or auto-reroute).
+  // Otherwise prompts already fired on the previous route would be marked
+  // "spoken" and the new route's identical-coord steps (rare but possible)
+  // would skip them. Also drops off-route state and the recalc override —
+  // the new route IS now the plan, so "off" is recomputed against it.
   useEffect(() => {
     turnStateRef.current = INITIAL_TURN_STATE;
     setNavStep(null);
     setNavDistanceM(null);
     resetSpokenPrompts();
+    offRouteStateRef.current = INITIAL_OFF_ROUTE_STATE;
+    setIsOffRoute(false);
+    setRecalcSteps(null);
+    autoFinishCancelledRef.current = false;
   }, [ctx.selectedRoute?.id]);
   useEffect(() => {
     return () => {
-      if (offRouteTimerRef.current) clearTimeout(offRouteTimerRef.current);
+      if (autoFinishTimerRef.current) clearInterval(autoFinishTimerRef.current);
     };
   }, []);
   const runSessionId = useRef(`run-${Date.now()}`);
@@ -181,53 +216,106 @@ export default function RunScreen() {
     transform: [{ scale: 1 + (1 - recordingPing.value) * 0.6 }],
   }));
 
-  // Off-route detection: re-evaluates only when a new GPS point arrives,
-  // because tracking.stats.currentPosition is reference-stable between ticks
-  // when no new point came in (see useLocationTracking.ts perf fix).
+  // Off-route detection — re-evaluates whenever a new GPS sample arrives.
+  // The state machine in lib/off-route.ts owns the timing (grace / recalc /
+  // reroute tiers and voice cooldown); this effect just feeds it the
+  // "is currently off route" signal and dispatches the actions it returns.
   const OFF_ROUTE_THRESHOLD_KM = 0.15;
-  const OFF_ROUTE_GRACE_MS = 30000;
+  const handleRecalc = useCallback(async (pos: RoutePoint) => {
+    if (recalcInFlightRef.current) return;
+    const route = ctx.selectedRoute?.points;
+    if (!route) return;
+    const target = nextOnRouteTarget(pos, route);
+    if (!target) return;
+    recalcInFlightRef.current = true;
+    try {
+      const result = await fetchInRunRoute([pos, target]);
+      if (result?.steps && result.steps.length > 0) {
+        setRecalcSteps(result.steps);
+        // Reset turn-by-turn so the banner doesn't try to advance off the
+        // OLD step list using the NEW step indices.
+        turnStateRef.current = INITIAL_TURN_STATE;
+        resetSpokenPrompts();
+      }
+    } finally {
+      recalcInFlightRef.current = false;
+    }
+  }, [ctx.selectedRoute]);
+
+  const handleReroute = useCallback(async (pos: RoutePoint) => {
+    if (rerouteInFlightRef.current) return;
+    const current = ctx.selectedRoute;
+    if (!current) return;
+    // v1 reroute target: the run's original destination.
+    //   loop / out-and-back → start (= ctx.center)
+    //   point-to-point     → ctx.endLocation
+    // Past-anchor preservation is left for a follow-up; the simple
+    // pos→destination reroute reads as "get me home from here" which is
+    // the user-stated behavior in fix #4. We don't try to inject the
+    // remaining anchor list because we don't yet know which anchors are
+    // "behind" the user vs ahead of them, and an out-of-order anchor would
+    // produce its own block-loops / pendants.
+    const destination = ctx.routeStyle === 'point-to-point' && ctx.endLocation
+      ? ctx.endLocation
+      : ctx.center;
+    rerouteInFlightRef.current = true;
+    try {
+      const result = await fetchInRunRoute([pos, destination]);
+      if (!result) return;
+      // Update planned distance to reflect the NEW remaining distance —
+      // ManeuverBanner and any consumer reading selectedRoute.distance
+      // should reflect what's still ahead, not the original plan.
+      const newDistanceMiles =
+        Math.round((result.distanceMeters / 1000) * 0.621371 * 10) / 10;
+      const reroutedRoute: GeneratedRoute = {
+        ...current,
+        id: `${current.id}-reroute-${Date.now()}`,
+        points: result.points,
+        steps: result.steps,
+        distance: newDistanceMiles,
+        anchorPoints: undefined,
+      };
+      // Reroute path: replace selectedRoute. The route-change useEffect
+      // above will clear turnStateRef / recalcSteps / offRouteStateRef.
+      ctx.setSelectedRoute(reroutedRoute);
+    } finally {
+      rerouteInFlightRef.current = false;
+    }
+  }, [ctx]);
+
   useEffect(() => {
     const pos = tracking.stats.currentPosition;
     const route = ctx.selectedRoute?.points;
     if (!isRunning || !pos || !route || route.length < 2) {
-      if (offRouteTimerRef.current) {
-        clearTimeout(offRouteTimerRef.current);
-        offRouteTimerRef.current = null;
+      if (offRouteStateRef.current.offSinceTs !== null) {
+        offRouteStateRef.current = INITIAL_OFF_ROUTE_STATE;
+        if (isOffRoute) setIsOffRoute(false);
       }
-      if (isOffRoute) setIsOffRoute(false);
       return;
     }
     const distance = pointToPolylineKm(pos, route);
-    if (distance > OFF_ROUTE_THRESHOLD_KM) {
-      // Off route — start the grace timer if not already running and not
-      // already showing the chip. This is what enforces the 30s of continuous
-      // deviation before we surface the indicator.
-      if (!offRouteTimerRef.current && !isOffRoute) {
-        offRouteTimerRef.current = setTimeout(() => {
-          setIsOffRoute(true);
-          offRouteTimerRef.current = null;
-        }, OFF_ROUTE_GRACE_MS);
-      }
-    } else {
-      // Back on route — drop the indicator and cancel any pending arming.
-      if (offRouteTimerRef.current) {
-        clearTimeout(offRouteTimerRef.current);
-        offRouteTimerRef.current = null;
-      }
-      if (isOffRoute) setIsOffRoute(false);
-    }
-  }, [tracking.stats.currentPosition, ctx.selectedRoute, isRunning, isOffRoute]);
+    const isOff = distance > OFF_ROUTE_THRESHOLD_KM;
+    const update = updateOffRoute(offRouteStateRef.current, isOff, Date.now());
+    offRouteStateRef.current = update.newState;
+    if (update.shouldShowChip !== isOffRoute) setIsOffRoute(update.shouldShowChip);
+    if (update.shouldSpeak) speakOffCourse(ctx.prefs.voicePrompts);
+    if (update.shouldRecalc) handleRecalc(pos);
+    if (update.shouldReroute) handleReroute(pos);
+    // Returning on-route drops the recalc override too — the planned route
+    // is what the user is on, so its steps are the correct source again.
+    if (!isOff && recalcSteps) setRecalcSteps(null);
+  }, [tracking.stats.currentPosition, ctx.selectedRoute, ctx.prefs.voicePrompts, isRunning, isOffRoute, recalcSteps, handleRecalc, handleReroute]);
 
-  // Turn-by-turn update on each new GPS sample. Skips when not running, when
-  // the route has no steps (mock OSRM / firestore-loaded routes), or when
-  // currently flagged off-route (banner instructions would be misleading
-  // until the user is back on track). Fires haptic + voice prompts via
-  // maybeFireCues — that helper deduplicates per step+threshold so this
-  // effect is safe to run on every GPS tick.
+  // Turn-by-turn update on each new GPS sample. Step source: `recalcSteps`
+  // (the OSRM recalc tier's directions back to the planned route) when set,
+  // otherwise the planned route's own step list. The banner keeps playing
+  // either way — silence-while-off-route was the original behavior but it
+  // left the runner with no audible guidance during the most confusing
+  // moment of the run (CLAUDE.md off-route block — bug #3 from May 2026 QA).
   useEffect(() => {
     const pos = tracking.stats.currentPosition;
-    const steps = ctx.selectedRoute?.steps;
-    if (!isRunning || !pos || !steps || steps.length === 0 || isOffRoute) return;
+    const steps = recalcSteps ?? ctx.selectedRoute?.steps;
+    if (!isRunning || !pos || !steps || steps.length === 0) return;
     const result = updateTurnByTurn(turnStateRef.current, pos, tracking.stats.accuracy, steps);
     turnStateRef.current = result.newState;
     setNavStep(result.currentStep);
@@ -241,18 +329,7 @@ export default function RunScreen() {
         hapticEnabled: ctx.prefs.hapticPrompts,
       });
     }
-  }, [tracking.stats.currentPosition, tracking.stats.accuracy, ctx.selectedRoute, isRunning, isOffRoute, ctx.prefs.voicePrompts, ctx.prefs.hapticPrompts]);
-
-  // Off-course voice cue — fires once on the false→true edge of isOffRoute.
-  // The visual chip (rendered separately) stays up the whole time the user
-  // is off-route; this is the audible nudge.
-  const wasOffRouteRef = useRef(false);
-  useEffect(() => {
-    if (isOffRoute && !wasOffRouteRef.current) {
-      speakOffCourse(ctx.prefs.voicePrompts);
-    }
-    wasOffRouteRef.current = isOffRoute;
-  }, [isOffRoute, ctx.prefs.voicePrompts]);
+  }, [tracking.stats.currentPosition, tracking.stats.accuracy, ctx.selectedRoute, recalcSteps, isRunning, ctx.prefs.voicePrompts, ctx.prefs.hapticPrompts]);
 
   const handleStart = useCallback(async () => {
     // Optimistically flip to 'running' so the StartButton morphs immediately —
@@ -299,6 +376,12 @@ export default function RunScreen() {
   }, [tracking]);
 
   const handleFinish = useCallback(async () => {
+    // Cancel any pending auto-finish countdown — manual finish wins.
+    if (autoFinishTimerRef.current) {
+      clearInterval(autoFinishTimerRef.current);
+      autoFinishTimerRef.current = null;
+    }
+    setAutoFinishCountdown(null);
     try {
       await tracking.stopTracking();
     } catch {
@@ -313,6 +396,80 @@ export default function RunScreen() {
     setShowStats(true);
   }, [tracking]);
 
+  // Auto-complete: arm a 5s cancel countdown when the user enters the
+  // destination geofence AND has covered enough of the planned distance
+  // that they're plausibly finishing (not starting). The user can cancel
+  // by tapping the toast — that sets `autoFinishCancelledRef` so we don't
+  // immediately re-arm on the next GPS tick (avoids a "cancel → arm →
+  // cancel → arm" loop while loitering near the finish).
+  const AUTO_FINISH_RADIUS_KM = 0.04; // 40m
+  const AUTO_FINISH_PROGRESS_FRACTION = 0.7;
+  const AUTO_FINISH_COUNTDOWN_S = 5;
+
+  const armAutoFinish = useCallback(() => {
+    if (autoFinishTimerRef.current) return;
+    setAutoFinishCountdown(AUTO_FINISH_COUNTDOWN_S);
+    autoFinishTimerRef.current = setInterval(() => {
+      setAutoFinishCountdown((prev) => {
+        if (prev === null) return null;
+        if (prev <= 1) {
+          if (autoFinishTimerRef.current) {
+            clearInterval(autoFinishTimerRef.current);
+            autoFinishTimerRef.current = null;
+          }
+          handleFinish();
+          return null;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  }, [handleFinish]);
+
+  const cancelAutoFinish = useCallback(() => {
+    if (autoFinishTimerRef.current) {
+      clearInterval(autoFinishTimerRef.current);
+      autoFinishTimerRef.current = null;
+    }
+    setAutoFinishCountdown(null);
+    autoFinishCancelledRef.current = true;
+  }, []);
+
+  useEffect(() => {
+    const pos = tracking.stats.currentPosition;
+    if (!isRunning || !pos || autoFinishCancelledRef.current) return;
+    // Destination: loop/OAB return to start, p2p go to the chosen end.
+    const destination = ctx.routeStyle === 'point-to-point' && ctx.endLocation
+      ? ctx.endLocation
+      : ctx.center;
+    const distKm = haversineDistance(pos, destination);
+    if (distKm > AUTO_FINISH_RADIUS_KM) return;
+    // Progress gate (loop / OAB only): standing at start during the first
+    // 30 seconds of a 5mi loop shouldn't auto-finish.
+    if (ctx.routeStyle !== 'point-to-point') {
+      const plannedKm = ctx.selectedRoute?.distance
+        ? ctx.selectedRoute.distance * 1.60934
+        : null;
+      if (plannedKm !== null) {
+        const fraction = tracking.stats.totalDistanceKm / plannedKm;
+        if (fraction < AUTO_FINISH_PROGRESS_FRACTION) return;
+      } else if (tracking.stats.totalDistanceKm < 0.5) {
+        // No planned distance — fall back to a 500m minimum so a paused
+        // run at start doesn't auto-finish in the first minute.
+        return;
+      }
+    }
+    armAutoFinish();
+  }, [
+    tracking.stats.currentPosition,
+    tracking.stats.totalDistanceKm,
+    ctx.center,
+    ctx.endLocation,
+    ctx.routeStyle,
+    ctx.selectedRoute?.distance,
+    isRunning,
+    armAutoFinish,
+  ]);
+
   const handleDiscard = useCallback(() => {
     setIsFinished(false);
     setShowStats(false);
@@ -324,6 +481,19 @@ export default function RunScreen() {
   const handleSave = useCallback(async () => {
     const { totalDistanceKm, elapsedSeconds, avgPace, currentPace, splits, coordinates } = tracking.stats;
 
+    // Post-run map-match: snap the recorded GPS track to the road network
+    // for the saved record. Single OSRM /match call, fires AFTER the user
+    // taps Save (not in the hot generation path), so the public-OSRM rate
+    // budget isn't affected. Failure falls back to the raw track silently —
+    // map-matching is a polish improvement, not a correctness requirement.
+    let savedTrack = coordinates;
+    try {
+      savedTrack = await fetchOSRMMapMatch(coordinates);
+    } catch {
+      // fetchOSRMMapMatch already swallows internal errors; this catch is
+      // belt-and-suspenders so a /match outage never blocks the save.
+    }
+
     const runData = {
       date: Date.now(),
       routeName: ctx.selectedRoute?.name || 'Run',
@@ -334,7 +504,7 @@ export default function RunScreen() {
       calories: Math.round(elapsedSeconds * 0.18),
       elevation: ctx.selectedRoute?.elevationGain || 0,
       splits,
-      gpsTrack: coordinates,
+      gpsTrack: savedTrack,
       terrain: ctx.selectedRoute?.terrain || 'Loop',
     };
 
@@ -563,7 +733,12 @@ export default function RunScreen() {
               selectedRouteId={ctx.selectedRoute?.id || null}
               gpsTrack={hasStarted ? coordinates : undefined}
               currentPosition={hasStarted ? currentPosition : undefined}
-              nextManeuver={hasStarted && !isOffRoute ? navStep : null}
+              // Hide the next-maneuver marker when off-route without recalc
+              // directions — the planned-route arrow would point at a turn
+              // the user can no longer make. Show it again once recalc gives
+              // us back-to-route directions (those steps are anchored at
+              // the user's actual position).
+              nextManeuver={hasStarted && (!isOffRoute || !!recalcSteps) ? navStep : null}
             />
             {/* Dark overlay to dim the map behind the bottom sheet */}
             {!hasStarted && (
@@ -623,11 +798,28 @@ export default function RunScreen() {
           </View>
         </View>
 
-        {/* Turn-by-turn banner — only when actively running, route has step
-          * data, and we're not currently flagged off-route (instructions
-          * would be misleading until the user is back on the polyline). */}
-        {hasStarted && !isFinished && !isOffRoute && navStep && navDistanceM !== null && (
+        {/* Turn-by-turn banner — visible when actively running with step
+          * data. Hidden if off-route AND we don't yet have recalc directions
+          * (planned-route instructions would be misleading there); shown
+          * again once recalc gives us back-to-route steps. */}
+        {hasStarted && !isFinished && navStep && navDistanceM !== null && (!isOffRoute || !!recalcSteps) && (
           <ManeuverBanner step={navStep} distanceM={navDistanceM} units={ctx.prefs.units} />
+        )}
+
+        {/* Auto-finish countdown toast. Renders only while the countdown is
+          * active; tapping Keep Running cancels and locks out auto-finish
+          * for the remainder of this run. */}
+        {autoFinishCountdown !== null && (
+          <View style={[styles.autoFinishToastContainer, { top: insets.top + 56 }]} pointerEvents="box-none">
+            <View style={styles.autoFinishToast}>
+              <Text style={styles.autoFinishLabel}>
+                Finishing in {autoFinishCountdown}s
+              </Text>
+              <Pressable onPress={cancelAutoFinish} style={styles.autoFinishCancelBtn} hitSlop={8}>
+                <Text style={styles.autoFinishCancelLabel}>Keep Running</Text>
+              </Pressable>
+            </View>
+          </View>
         )}
 
         {/* Return-to-summary pill — shown when finished but viewing the map */}
@@ -977,5 +1169,41 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: Colors.primaryForeground,
     letterSpacing: 0.5,
+  },
+  autoFinishToastContainer: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+    zIndex: 40,
+  },
+  autoFinishToast: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    backgroundColor: Colors.primary,
+    borderRadius: 9999,
+    paddingHorizontal: 20,
+    paddingVertical: 12,
+    shadowColor: '#000',
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 4 },
+  },
+  autoFinishLabel: {
+    fontFamily: Fonts.sansBold,
+    fontSize: 14,
+    color: Colors.primaryForeground,
+  },
+  autoFinishCancelBtn: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 9999,
+    backgroundColor: Colors.primaryForeground + '33',
+  },
+  autoFinishCancelLabel: {
+    fontFamily: Fonts.sansSemiBold,
+    fontSize: 13,
+    color: Colors.primaryForeground,
   },
 });

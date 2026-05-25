@@ -2902,6 +2902,89 @@ export async function snapWaypointsToRoad(points: RoutePoint[]): Promise<RoutePo
 }
 
 /**
+ * Public wrapper for in-run rerouting: fetch an OSRM foot route through
+ * the given waypoint sequence, return the polyline + extracted maneuver
+ * steps for the in-run banner. Returns null on any OSRM failure so the
+ * caller can fall back to the existing planned route (don't draw a
+ * straight-line fallback through buildings — CLAUDE.md #15).
+ *
+ * Distinct from generateOSRMRoutes (which runs the full candidate-pool
+ * pipeline): in-run reroutes need a single deterministic best-effort
+ * path right now, not a quality contest. The OSRM call is the same
+ * primitive, just unwrapped from the generator.
+ */
+export async function fetchInRunRoute(
+  waypoints: RoutePoint[],
+): Promise<{ points: RoutePoint[]; distanceMeters: number; steps: ManeuverStep[] | undefined } | null> {
+  if (waypoints.length < 2) return null;
+  const route = await fetchOSRMRoute(waypoints);
+  if (!route) return null;
+  const points: RoutePoint[] = route.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }));
+  if (points.length < 2) return null;
+  return {
+    points,
+    distanceMeters: route.distance,
+    steps: extractManeuvers(route),
+  };
+}
+
+/**
+ * Post-run /match call: snap a recorded GPS track to the road network so
+ * the saved polyline reads as a clean route on history/share screens
+ * instead of a wobbling raw GPS trace. One call per saved run; failure
+ * falls through to the raw track (no user-visible error — map-matching is
+ * a polish improvement, not a correctness requirement).
+ *
+ * OSRM /match is rate-limited like /route on the public endpoint, but
+ * this fires at most once per saved run (post-Finish, not in the hot
+ * generation path), so the steady-state load is negligible compared to
+ * generation. Falls back to the raw track for: short runs (<5 samples),
+ * very long runs (>100 samples — OSRM /match has a coord limit), and
+ * any network/parse failure.
+ *
+ * Returns the matched polyline, or the input on any fall-through case.
+ */
+export async function fetchOSRMMapMatch(
+  coordinates: RoutePoint[],
+): Promise<RoutePoint[]> {
+  // Mock no-op: harness deterministic seeding shouldn't depend on /match.
+  if (osrmMockEnabled) return coordinates;
+  if (coordinates.length < 5) return coordinates;
+  // Public OSRM caps /match at 100 coordinates per request. Long runs
+  // would need chunking; for now we just skip matching and save the raw
+  // track rather than risk a partial match that drops the second half.
+  if (coordinates.length > 100) return coordinates;
+
+  const coordsStr = coordinates
+    .map((p) => `${p.lng.toFixed(6)},${p.lat.toFixed(6)}`)
+    .join(';');
+  const matchBase = osrmBase.replace('/route/', '/match/');
+  const url = `${matchBase}/${coordsStr}?overview=full&geometries=geojson&tidy=true`;
+
+  try {
+    const res = await fetchWithRetry(url);
+    if (!res.ok) return coordinates;
+    const data: any = await res.json();
+    if (data.code !== 'Ok' || !Array.isArray(data.matchings) || data.matchings.length === 0) {
+      return coordinates;
+    }
+    // Concatenate every matching segment. The /match API can return
+    // multiple matchings when the trace has gaps; we want the full
+    // reconstructed path, not just the longest.
+    const matched: RoutePoint[] = [];
+    for (const m of data.matchings) {
+      const coords: [number, number][] = m?.geometry?.coordinates ?? [];
+      for (const [lng, lat] of coords) {
+        matched.push({ lat, lng });
+      }
+    }
+    return matched.length >= 2 ? matched : coordinates;
+  } catch {
+    return coordinates;
+  }
+}
+
+/**
  * In-memory cache for `?alternatives=true` responses. Keyed by URL (which
  * encodes both the waypoints and the alternatives flag), so it never
  * collides with `osrmRouteCache`. Stores the FULL alternatives array per URL
