@@ -135,15 +135,20 @@ export default function RunScreen() {
   const [navStep, setNavStep] = useState<ManeuverStep | null>(null);
   const [navDistanceM, setNavDistanceM] = useState<number | null>(null);
 
-  // Auto-complete countdown. When the user arrives within AUTO_FINISH_RADIUS_KM
-  // of the destination AND has covered ≥AUTO_FINISH_PROGRESS_FRACTION of the
-  // planned distance, a 5s countdown arms before handleFinish fires. Cancel
-  // button on the toast sets `autoFinishCancelledRef` so the geofence trip
-  // doesn't immediately re-arm on the next GPS tick (would loop forever if
-  // the user is loitering near the finish).
-  const [autoFinishCountdown, setAutoFinishCountdown] = useState<number | null>(null);
-  const autoFinishTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const autoFinishCancelledRef = useRef(false);
+  // Auto-complete: silent. Fires only when ALL of the following hold:
+  //   1. User is within AUTO_FINISH_RADIUS_KM of the destination.
+  //   2. User has been ≥AUTO_FINISH_AWAY_RADIUS_KM from the destination
+  //      at some point during the run (hasBeenAwayFromDestRef). This is
+  //      what prevents "stand at start, run never started" and "P2P with
+  //      A within 40m of B" from auto-finishing immediately.
+  //   3. User has covered ≥AUTO_FINISH_PROGRESS_FRACTION of the planned
+  //      distance (or AUTO_FINISH_MIN_DISTANCE_KM if no plan exists). This
+  //      is what prevents figure-8 loops from auto-finishing mid-run when
+  //      the runner crosses the start area on the way to the second lobe.
+  // hasAutoFinishedRef guards against double-firing across the ~1s window
+  // before setRunState('idle') propagates and gates out the effect.
+  const hasAutoFinishedRef = useRef(false);
+  const hasBeenAwayFromDestRef = useRef(false);
 
   // Audio session setup happens once per mount. Idempotent — safe even if
   // the user never starts a run.
@@ -165,13 +170,9 @@ export default function RunScreen() {
     offRouteStateRef.current = INITIAL_OFF_ROUTE_STATE;
     setIsOffRoute(false);
     setRecalcSteps(null);
-    autoFinishCancelledRef.current = false;
+    hasAutoFinishedRef.current = false;
+    hasBeenAwayFromDestRef.current = false;
   }, [ctx.selectedRoute?.id]);
-  useEffect(() => {
-    return () => {
-      if (autoFinishTimerRef.current) clearInterval(autoFinishTimerRef.current);
-    };
-  }, []);
   const runSessionId = useRef(`run-${Date.now()}`);
 
   const isRunning = runState === 'running';
@@ -337,6 +338,11 @@ export default function RunScreen() {
     // on failure so the user isn't left with a recording chip pulsing over a
     // run that was never actually tracking.
     setRunState('running');
+    // Reset auto-finish gates so a second run on the same selectedRoute id
+    // (e.g. user finishes, discards, restarts without regenerating) starts
+    // from a clean slate. The route-change useEffect only fires on id flips.
+    hasAutoFinishedRef.current = false;
+    hasBeenAwayFromDestRef.current = false;
     try {
       await tracking.startTracking();
     } catch (err) {
@@ -376,12 +382,6 @@ export default function RunScreen() {
   }, [tracking]);
 
   const handleFinish = useCallback(async () => {
-    // Cancel any pending auto-finish countdown — manual finish wins.
-    if (autoFinishTimerRef.current) {
-      clearInterval(autoFinishTimerRef.current);
-      autoFinishTimerRef.current = null;
-    }
-    setAutoFinishCountdown(null);
     try {
       await tracking.stopTracking();
     } catch {
@@ -396,69 +396,56 @@ export default function RunScreen() {
     setShowStats(true);
   }, [tracking]);
 
-  // Auto-complete: arm a 5s cancel countdown when the user enters the
-  // destination geofence AND has covered enough of the planned distance
-  // that they're plausibly finishing (not starting). The user can cancel
-  // by tapping the toast — that sets `autoFinishCancelledRef` so we don't
-  // immediately re-arm on the next GPS tick (avoids a "cancel → arm →
-  // cancel → arm" loop while loitering near the finish).
-  const AUTO_FINISH_RADIUS_KM = 0.04; // 40m
-  const AUTO_FINISH_PROGRESS_FRACTION = 0.7;
-  const AUTO_FINISH_COUNTDOWN_S = 5;
-
-  const armAutoFinish = useCallback(() => {
-    if (autoFinishTimerRef.current) return;
-    setAutoFinishCountdown(AUTO_FINISH_COUNTDOWN_S);
-    autoFinishTimerRef.current = setInterval(() => {
-      setAutoFinishCountdown((prev) => {
-        if (prev === null) return null;
-        if (prev <= 1) {
-          if (autoFinishTimerRef.current) {
-            clearInterval(autoFinishTimerRef.current);
-            autoFinishTimerRef.current = null;
-          }
-          handleFinish();
-          return null;
-        }
-        return prev - 1;
-      });
-    }, 1000);
-  }, [handleFinish]);
-
-  const cancelAutoFinish = useCallback(() => {
-    if (autoFinishTimerRef.current) {
-      clearInterval(autoFinishTimerRef.current);
-      autoFinishTimerRef.current = null;
-    }
-    setAutoFinishCountdown(null);
-    autoFinishCancelledRef.current = true;
-  }, []);
+  // Auto-complete: silent. See `hasAutoFinishedRef` declaration above for
+  // the three-condition gate (radius + been-away + progress). Thresholds
+  // are intentionally conservative — false-negatives (user manually taps
+  // Finish on arrival) are recoverable; false-positives (run ends mid-route)
+  // are not.
+  const AUTO_FINISH_RADIUS_KM = 0.04; // 40m — "at destination"
+  const AUTO_FINISH_AWAY_RADIUS_KM = 0.25; // 250m — must clear this once for "been away" to latch
+  const AUTO_FINISH_PROGRESS_FRACTION = 0.9; // 90% of planned distance
+  const AUTO_FINISH_MIN_DISTANCE_KM = 0.5; // fallback floor when no planned distance
 
   useEffect(() => {
     const pos = tracking.stats.currentPosition;
-    if (!isRunning || !pos || autoFinishCancelledRef.current) return;
+    if (!isRunning || !pos || hasAutoFinishedRef.current) return;
     // Destination: loop/OAB return to start, p2p go to the chosen end.
     const destination = ctx.routeStyle === 'point-to-point' && ctx.endLocation
       ? ctx.endLocation
       : ctx.center;
     const distKm = haversineDistance(pos, destination);
-    if (distKm > AUTO_FINISH_RADIUS_KM) return;
-    // Progress gate (loop / OAB only): standing at start during the first
-    // 30 seconds of a 5mi loop shouldn't auto-finish.
-    if (ctx.routeStyle !== 'point-to-point') {
-      const plannedKm = ctx.selectedRoute?.distance
-        ? ctx.selectedRoute.distance * 1.60934
-        : null;
-      if (plannedKm !== null) {
-        const fraction = tracking.stats.totalDistanceKm / plannedKm;
-        if (fraction < AUTO_FINISH_PROGRESS_FRACTION) return;
-      } else if (tracking.stats.totalDistanceKm < 0.5) {
-        // No planned distance — fall back to a 500m minimum so a paused
-        // run at start doesn't auto-finish in the first minute.
-        return;
-      }
+
+    // Latch hasBeenAway as soon as the runner clears the away-radius. The
+    // ref stays true for the rest of the run — even if they cross back
+    // into the geofence later, the "been away" condition remains satisfied.
+    // We do this BEFORE the radius gate so a runner moving away from start
+    // updates the flag every tick (including ticks where they're outside
+    // the auto-finish radius, which is the common case mid-run).
+    if (distKm > AUTO_FINISH_AWAY_RADIUS_KM) {
+      hasBeenAwayFromDestRef.current = true;
     }
-    armAutoFinish();
+
+    if (distKm > AUTO_FINISH_RADIUS_KM) return;
+    // Standing-at-start case: never been away → not finishing, just hasn't
+    // left yet. Catches both "loop runner standing at start" and "P2P
+    // where A and B are within the away radius."
+    if (!hasBeenAwayFromDestRef.current) return;
+    // Progress gate: applies to ALL route styles. Without this, a figure-8
+    // loop crossing back through the start area mid-run (e.g., at the 4km
+    // mark of an 8km loop) would auto-finish despite the runner not being
+    // done. 90% is high enough to filter mid-loop crossings, low enough
+    // that a runner who cuts a small corner off the planned route still
+    // triggers on actual arrival.
+    const plannedKm = ctx.selectedRoute?.distance
+      ? ctx.selectedRoute.distance * 1.60934
+      : null;
+    if (plannedKm !== null) {
+      if (tracking.stats.totalDistanceKm < plannedKm * AUTO_FINISH_PROGRESS_FRACTION) return;
+    } else if (tracking.stats.totalDistanceKm < AUTO_FINISH_MIN_DISTANCE_KM) {
+      return;
+    }
+    hasAutoFinishedRef.current = true;
+    handleFinish();
   }, [
     tracking.stats.currentPosition,
     tracking.stats.totalDistanceKm,
@@ -467,7 +454,7 @@ export default function RunScreen() {
     ctx.routeStyle,
     ctx.selectedRoute?.distance,
     isRunning,
-    armAutoFinish,
+    handleFinish,
   ]);
 
   const handleDiscard = useCallback(() => {
@@ -804,22 +791,6 @@ export default function RunScreen() {
           * again once recalc gives us back-to-route steps. */}
         {hasStarted && !isFinished && navStep && navDistanceM !== null && (!isOffRoute || !!recalcSteps) && (
           <ManeuverBanner step={navStep} distanceM={navDistanceM} units={ctx.prefs.units} />
-        )}
-
-        {/* Auto-finish countdown toast. Renders only while the countdown is
-          * active; tapping Keep Running cancels and locks out auto-finish
-          * for the remainder of this run. */}
-        {autoFinishCountdown !== null && (
-          <View style={[styles.autoFinishToastContainer, { top: insets.top + 56 }]} pointerEvents="box-none">
-            <View style={styles.autoFinishToast}>
-              <Text style={styles.autoFinishLabel}>
-                Finishing in {autoFinishCountdown}s
-              </Text>
-              <Pressable onPress={cancelAutoFinish} style={styles.autoFinishCancelBtn} hitSlop={8}>
-                <Text style={styles.autoFinishCancelLabel}>Keep Running</Text>
-              </Pressable>
-            </View>
-          </View>
         )}
 
         {/* Return-to-summary pill — shown when finished but viewing the map */}
@@ -1169,41 +1140,5 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: Colors.primaryForeground,
     letterSpacing: 0.5,
-  },
-  autoFinishToastContainer: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    alignItems: 'center',
-    zIndex: 40,
-  },
-  autoFinishToast: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
-    backgroundColor: Colors.primary,
-    borderRadius: 9999,
-    paddingHorizontal: 20,
-    paddingVertical: 12,
-    shadowColor: '#000',
-    shadowOpacity: 0.3,
-    shadowRadius: 8,
-    shadowOffset: { width: 0, height: 4 },
-  },
-  autoFinishLabel: {
-    fontFamily: Fonts.sansBold,
-    fontSize: 14,
-    color: Colors.primaryForeground,
-  },
-  autoFinishCancelBtn: {
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 9999,
-    backgroundColor: Colors.primaryForeground + '33',
-  },
-  autoFinishCancelLabel: {
-    fontFamily: Fonts.sansSemiBold,
-    fontSize: 13,
-    color: Colors.primaryForeground,
   },
 });

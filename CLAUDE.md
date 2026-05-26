@@ -911,6 +911,91 @@ in-run UX bugs doesn't get the same blind-eye treatment):
   regressions in the smoothing, off-route detection, and auto-complete
   paths without requiring a phone. Not built yet.
 
+### In-run polish + setup UX fixes (May 2026 round 2)
+
+51. **Auto-finish countdown toast was actually a confirmation popup.**
+    Entry #48 shipped a 5-second cancel countdown ("Finishing in 5…"
+    with a "Keep Running" button) the first time the geofence + progress
+    gate fired. User feedback: the prompt is friction — when they reach
+    the destination they want the run to end silently, not be asked.
+    Fix: removed the countdown UI (`autoFinishCountdown` state,
+    `autoFinishTimerRef`, `armAutoFinish`/`cancelAutoFinish` callbacks,
+    `autoFinishToast`/`autoFinishCancelBtn` styles). The geofence effect
+    now calls `handleFinish()` directly on trip, guarded by a single
+    `hasAutoFinishedRef` to prevent double-fire across the ~1s window
+    before `setRunState('idle')` propagates and gates the effect itself.
+    The progress gate (≥70% of planned km, or ≥500m if no plan) is
+    unchanged so starting at the destination doesn't fire instantly.
+    What's NOT in this fix: a manual "Finish" override during the run
+    (already exists via StartButton's finish action) or a per-user
+    setting to re-enable the countdown — entry #48's premise (some users
+    will want the cancel) didn't survive contact with the real-world
+    test. If feedback flips later, the previous behavior can be
+    restored cleanly from git history.
+
+52. **GPS polyline still rendered as seismograph after entry #44's EMA
+    smoothing and #50's /nearest throttled snap.** EMA dampens jitter
+    but doesn't eliminate it (a 30m off-road raw sample produces a
+    ~15m off-road smoothed sample); /nearest snap fires every ~7s on
+    a 20m throttle and only snaps the point that triggered the call,
+    leaving intermediate samples unsnapped. The two filters together
+    were not enough to make the live polyline read as a clean path.
+    Fix: added `simplifyRDP` (Ramer-Douglas-Peucker) at the RENDER
+    layer in `RouteMap.tsx`. Tolerance 4m — below typical GPS jitter
+    (5-10m) so wobble below that threshold collapses, while real
+    intersection turns (corners well above the tolerance from any
+    smoothed chord) survive. Applied to the displayed polyline only;
+    distance integration in `useLocationTracking` continues to use the
+    un-simplified smoothed series, so total distance is unaffected.
+    Helper lives in `lib/gps-simplify.ts` with 6 unit tests covering
+    endpoint preservation, jitter-vs-corner discrimination, and short
+    array passthrough. Memo key on `gpsTrack` reference is fine — we
+    only ever append to the array (entry #50 reference-identity guard
+    notwithstanding, the snap callback mutates the same array, then
+    a fresh ref gets emitted by the timer's `[...coords]` clone).
+    What's NOT in this fix: snapping the entire polyline to roads via
+    a chunked OSRM /match on every render — too expensive (per-render
+    network round-trip), and the post-run /match (#49) already handles
+    the saved-track case. RDP at render time is a CPU-only, predictable-
+    cost transform.
+
+53. **Address autocomplete dropdown invisible to users.** User reported
+    "no address suggestions appear" when typing an endpoint for a
+    point-to-point run. The Photon (Komoot) API itself is fine
+    (confirmed via curl) and the wiring in `app/index.tsx` correctly
+    debounces and populates `endSuggestions`. Root cause: the
+    conditional render gated on `endSuggestions.length > 0`, which
+    means during the 200ms debounce + ~500ms fetch window the dropdown
+    is empty — and if the fetch silently returns 0 results (no API
+    match, rate limit, network blip), the dropdown stays empty
+    indefinitely with no indication of WHY. Indistinguishable from
+    "autocomplete broken" from the user's perspective.
+    Fix: render the suggestions container any time the search input is
+    open and the user has typed ≥2 chars. Inside the container, branch
+    on three states:
+    - `isLoading*Suggestions` (flipped synchronously on the keystroke
+      that triggers debounce) → "Searching…" spinner row.
+    - `*Suggestions.length > 0` → the existing scrollable list.
+    - `*SearchAttempted` (flipped after a debounce-driven fetch
+      resolves) → "No matching addresses. Check spelling or try again."
+    Loading and attempted flags reset on every code path that clears
+    the search input (selectSuggestion, handleLocationCardPress,
+    handleEndLocationCardPress, the route-style toggle, blur+resolve,
+    handleGenerate's pre-resolve). The dropdown now always has visible
+    content while the user is typing, so the "no suggestions appeared"
+    case becomes "I see Searching… and then either results or No
+    matching addresses, never a void."
+    What's NOT in this fix: switching to Google Places / Mapbox. Photon
+    is free, unauthenticated, and works for Manhattan addresses today;
+    swap is justified only if Photon's NYC coverage starts failing.
+    Also NOT in: error surface for actual fetch failure (HTTP 500,
+    network timeout). `searchAddresses` swallows errors into an empty
+    array, which the new "No matching addresses" branch covers
+    sufficiently from the user's perspective. A dedicated "Couldn't
+    reach search service" message would require differentiating empty
+    results from errors at the fetch layer — defer until we see real
+    user reports of network-related failures.
+
 ### Recurring-fix discipline
 
 User explicitly called out (May 2026) that the same class of bug ("route

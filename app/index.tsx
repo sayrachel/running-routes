@@ -265,6 +265,15 @@ export default function SetupScreen() {
   const [startAddressText, setStartAddressText] = useState('');
   const [isStartGeocoding, setIsStartGeocoding] = useState(false);
   const [startSuggestions, setStartSuggestions] = useState<GeocodeSuggestion[]>([]);
+  // True while a debounced /search is in-flight for the start input. Drives
+  // the spinner-vs-results render below — without it, the dropdown looks
+  // empty during the 200ms debounce + ~500ms fetch window and the user
+  // can't tell the difference between "searching" and "no results."
+  const [isLoadingStartSuggestions, setIsLoadingStartSuggestions] = useState(false);
+  // True once a /search for the current input text has completed. Lets us
+  // render "No matching addresses" only after we actually tried, not before
+  // the user has finished typing.
+  const [startSearchAttempted, setStartSearchAttempted] = useState(false);
   const startInputRef = useRef<TextInput>(null);
   const startDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const startRequestIdRef = useRef(0);
@@ -275,6 +284,8 @@ export default function SetupScreen() {
   const [endAddressText, setEndAddressText] = useState('');
   const [isEndGeocoding, setIsEndGeocoding] = useState(false);
   const [endSuggestions, setEndSuggestions] = useState<GeocodeSuggestion[]>([]);
+  const [isLoadingEndSuggestions, setIsLoadingEndSuggestions] = useState(false);
+  const [endSearchAttempted, setEndSearchAttempted] = useState(false);
   const endInputRef = useRef<TextInput>(null);
   const sheetScrollRef = useRef<ScrollView>(null);
   const endDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -383,14 +394,23 @@ export default function SetupScreen() {
     if (startDebounceRef.current) clearTimeout(startDebounceRef.current);
     if (text.trim().length < 2) {
       setStartSuggestions([]);
+      setIsLoadingStartSuggestions(false);
+      setStartSearchAttempted(false);
       return;
     }
+    // Flip the loading flag synchronously so the dropdown shows a
+    // "Searching…" indicator from the very first keystroke — without it
+    // the dropdown stays empty for the debounce + fetch window (700ms+)
+    // and the user thinks autocomplete is broken.
+    setIsLoadingStartSuggestions(true);
     const requestId = ++startRequestIdRef.current;
     startDebounceRef.current = setTimeout(async () => {
       const results = await searchAddresses(text, ctx.center);
       // Only update if this is still the latest request
       if (requestId === startRequestIdRef.current) {
         setStartSuggestions(results);
+        setIsLoadingStartSuggestions(false);
+        setStartSearchAttempted(true);
       }
     }, 200);
   }, [ctx.center]);
@@ -401,14 +421,18 @@ export default function SetupScreen() {
     if (endDebounceRef.current) clearTimeout(endDebounceRef.current);
     if (text.trim().length < 2) {
       setEndSuggestions([]);
+      setIsLoadingEndSuggestions(false);
+      setEndSearchAttempted(false);
       return;
     }
+    setIsLoadingEndSuggestions(true);
     const requestId = ++endRequestIdRef.current;
     endDebounceRef.current = setTimeout(async () => {
       const results = await searchAddresses(text, ctx.center);
-      // Only update if this is still the latest request
       if (requestId === endRequestIdRef.current) {
         setEndSuggestions(results);
+        setIsLoadingEndSuggestions(false);
+        setEndSearchAttempted(true);
       }
     }, 200);
   }, [ctx.center]);
@@ -421,6 +445,8 @@ export default function SetupScreen() {
     setShowStartSearch(false);
     setStartAddressText('');
     setStartSuggestions([]);
+    setIsLoadingStartSuggestions(false);
+    setStartSearchAttempted(false);
   }, [ctx]);
 
   const selectEndSuggestion = useCallback((suggestion: GeocodeSuggestion) => {
@@ -434,6 +460,8 @@ export default function SetupScreen() {
     setShowEndSearch(false);
     setEndAddressText('');
     setEndSuggestions([]);
+    setIsLoadingEndSuggestions(false);
+    setEndSearchAttempted(false);
   }, [ctx, localRouteStyle]);
 
   const handleUseCurrentLocation = useCallback(async () => {
@@ -474,6 +502,8 @@ export default function SetupScreen() {
     if (ctx.hasLocation) {
       setStartAddressText('');
       setStartSuggestions([]);
+      setIsLoadingStartSuggestions(false);
+      setStartSearchAttempted(false);
       setShowStartSearch(true);
       setTimeout(() => startInputRef.current?.focus(), 100);
     } else {
@@ -526,6 +556,8 @@ export default function SetupScreen() {
   const handleEndLocationCardPress = useCallback(() => {
     setEndAddressText('');
     setEndSuggestions([]);
+    setIsLoadingEndSuggestions(false);
+    setEndSearchAttempted(false);
     setShowEndSearch(true);
     if (localRouteStyle !== 'point-to-point') {
       setLocalRouteStyle('point-to-point');
@@ -927,20 +959,37 @@ export default function SetupScreen() {
                 </Pressable>
               )}
 
-              {/* Start address suggestions dropdown */}
-              {showStartSearch && startSuggestions.length > 0 && (
-                <ScrollView style={styles.suggestionsContainerInGroup} nestedScrollEnabled keyboardShouldPersistTaps="handled">
-                  {startSuggestions.map((s) => (
-                    <Pressable
-                      key={s.placeId}
-                      style={styles.suggestionItem}
-                      onPress={() => selectStartSuggestion(s)}
-                    >
-                      <Ionicons name="location-outline" size={14} color={Colors.mutedForeground} />
-                      <Text style={styles.suggestionText} numberOfLines={2}>{s.displayName}</Text>
-                    </Pressable>
-                  ))}
-                </ScrollView>
+              {/* Start address suggestions dropdown. Renders any time the
+                * search input is open and the user has typed ≥2 chars, so
+                * the user always gets visible feedback (Searching / results
+                * / No matching addresses) instead of a silent empty state
+                * that reads as "autocomplete broken." */}
+              {showStartSearch && startAddressText.trim().length >= 2 && (
+                <View style={styles.suggestionsContainerInGroup}>
+                  {isLoadingStartSuggestions ? (
+                    <View style={styles.suggestionStatusRow}>
+                      <ActivityIndicator size="small" color={Colors.primary} />
+                      <Text style={styles.suggestionStatusText}>Searching…</Text>
+                    </View>
+                  ) : startSuggestions.length > 0 ? (
+                    <ScrollView nestedScrollEnabled keyboardShouldPersistTaps="handled">
+                      {startSuggestions.map((s) => (
+                        <Pressable
+                          key={s.placeId}
+                          style={styles.suggestionItem}
+                          onPress={() => selectStartSuggestion(s)}
+                        >
+                          <Ionicons name="location-outline" size={14} color={Colors.mutedForeground} />
+                          <Text style={styles.suggestionText} numberOfLines={2}>{s.displayName}</Text>
+                        </Pressable>
+                      ))}
+                    </ScrollView>
+                  ) : startSearchAttempted ? (
+                    <View style={styles.suggestionStatusRow}>
+                      <Text style={styles.suggestionStatusText}>No matching addresses. Check spelling or try again.</Text>
+                    </View>
+                  ) : null}
+                </View>
               )}
 
               {/* Divider */}
@@ -1015,20 +1064,34 @@ export default function SetupScreen() {
                 ) : null}
               </Pressable>
 
-              {/* End address suggestions dropdown */}
-              {showEndSearch && endSuggestions.length > 0 && (
-                <ScrollView style={styles.suggestionsContainerInGroup} nestedScrollEnabled keyboardShouldPersistTaps="handled">
-                  {endSuggestions.map((s) => (
-                    <Pressable
-                      key={s.placeId}
-                      style={styles.suggestionItem}
-                      onPress={() => selectEndSuggestion(s)}
-                    >
-                      <Ionicons name="location-outline" size={14} color={Colors.mutedForeground} />
-                      <Text style={styles.suggestionText} numberOfLines={2}>{s.displayName}</Text>
-                    </Pressable>
-                  ))}
-                </ScrollView>
+              {/* End address suggestions dropdown — same loading / results
+                * / empty-state pattern as the start input above. */}
+              {showEndSearch && endAddressText.trim().length >= 2 && (
+                <View style={styles.suggestionsContainerInGroup}>
+                  {isLoadingEndSuggestions ? (
+                    <View style={styles.suggestionStatusRow}>
+                      <ActivityIndicator size="small" color={Colors.primary} />
+                      <Text style={styles.suggestionStatusText}>Searching…</Text>
+                    </View>
+                  ) : endSuggestions.length > 0 ? (
+                    <ScrollView nestedScrollEnabled keyboardShouldPersistTaps="handled">
+                      {endSuggestions.map((s) => (
+                        <Pressable
+                          key={s.placeId}
+                          style={styles.suggestionItem}
+                          onPress={() => selectEndSuggestion(s)}
+                        >
+                          <Ionicons name="location-outline" size={14} color={Colors.mutedForeground} />
+                          <Text style={styles.suggestionText} numberOfLines={2}>{s.displayName}</Text>
+                        </Pressable>
+                      ))}
+                    </ScrollView>
+                  ) : endSearchAttempted ? (
+                    <View style={styles.suggestionStatusRow}>
+                      <Text style={styles.suggestionStatusText}>No matching addresses. Check spelling or try again.</Text>
+                    </View>
+                  ) : null}
+                </View>
               )}
             </View>
           </View>
@@ -1224,6 +1287,19 @@ const styles = StyleSheet.create({
     maxHeight: 160,
     borderTopWidth: 1,
     borderTopColor: Colors.border,
+  },
+  suggestionStatusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+  },
+  suggestionStatusText: {
+    flex: 1,
+    fontFamily: Fonts.sans,
+    fontSize: 12,
+    color: Colors.mutedForeground,
   },
   locationCard: {
     flexDirection: 'row',

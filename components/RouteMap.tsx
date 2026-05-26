@@ -11,6 +11,15 @@ const USER_CONTROL_HOLD_MS = 10000;
 import { Ionicons } from '@expo/vector-icons';
 import type { GeneratedRoute, RoutePoint, ManeuverStep } from '@/lib/route-generator';
 import { Colors } from '@/lib/theme';
+import { simplifyRDP } from '@/lib/gps-simplify';
+
+/** Perpendicular-distance tolerance for the live GPS polyline simplifier.
+ *  Vertices whose offset from the line through their neighbors is below
+ *  this drop out of the rendered shape. ~4m is below typical GPS jitter
+ *  (5-10m) so the seismograph wobble flattens, while real turns at
+ *  intersections retain their corners. Display only — distance integration
+ *  in useLocationTracking continues to use the un-simplified series. */
+const GPS_SIMPLIFY_TOLERANCE_M = 4;
 
 interface RouteMapProps {
   center: RoutePoint;
@@ -41,10 +50,17 @@ function RouteMapImpl({ center, routes, selectedRouteId, gpsTrack, currentPositi
     () => selectedRoute?.points.map((p: RoutePoint) => ({ latitude: p.lat, longitude: p.lng })) ?? null,
     [selectedRoute],
   );
-  const gpsTrackCoords = useMemo(
-    () => gpsTrack?.map((p) => ({ latitude: p.lat, longitude: p.lng })) ?? null,
-    [gpsTrack],
-  );
+  // Simplify the live GPS polyline before mapping to {latitude, longitude}.
+  // simplifyRDP keeps endpoints and any vertex whose perpendicular offset
+  // from its neighbors exceeds GPS_SIMPLIFY_TOLERANCE_M, so jitter wobble
+  // (sub-tolerance) collapses while turn corners survive. Length-only memo
+  // key is enough because we only ever append to gpsTrack — same length
+  // means same array; new length means we need to re-simplify.
+  const gpsTrackCoords = useMemo(() => {
+    if (!gpsTrack || gpsTrack.length === 0) return null;
+    const simplified = simplifyRDP(gpsTrack, GPS_SIMPLIFY_TOLERANCE_M);
+    return simplified.map((p) => ({ latitude: p.lat, longitude: p.lng }));
+  }, [gpsTrack]);
 
   // Recompute region whenever the underlying inputs change. Memoized so
   // the useEffect below doesn't re-fire on unrelated re-renders.
