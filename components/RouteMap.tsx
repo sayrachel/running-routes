@@ -27,7 +27,9 @@ interface RouteMapProps {
   selectedRouteId: string | null;
   /** Live GPS track coordinates to draw during a run */
   gpsTrack?: RoutePoint[];
-  /** Current user position during a run */
+  /** Current user position during a run (latest recorded track point).
+   *  Drives camera follow only — the on-map position indicator is MapKit's
+   *  native user-location dot (CLAUDE.md #57), not a marker at this point. */
   currentPosition?: RoutePoint | null;
   /** When set, a directional arrow marker is rendered at the next maneuver
    *  point — the visual half of turn-by-turn navigation. Pass null when no
@@ -133,7 +135,13 @@ function RouteMapImpl({ center, routes, selectedRouteId, gpsTrack, currentPositi
         style={styles.map}
         provider={undefined}
         userInterfaceStyle="dark"
-        showsUserLocation={!currentPosition}
+        // Always on, including during a run (CLAUDE.md #57). MapKit draws
+        // this dot natively, straight from Core Location: no JS-bridge hop,
+        // animated between fixes, with an accuracy halo. During runs it
+        // replaced a custom <Marker> at the last recorded track point, which
+        // lagged behind the runner (EMA-smoothed, sometimes /nearest-snapped
+        // onto a different street, moved only on the 1s stats tick).
+        showsUserLocation
         showsMyLocationButton={false}
         showsCompass={false}
         initialRegion={region}
@@ -173,21 +181,6 @@ function RouteMapImpl({ center, routes, selectedRouteId, gpsTrack, currentPositi
             lineCap="round"
             lineJoin="round"
           />
-        )}
-
-        {currentPosition && (
-          <Marker
-            coordinate={{
-              latitude: currentPosition.lat,
-              longitude: currentPosition.lng,
-            }}
-            anchor={{ x: 0.5, y: 0.5 }}
-          >
-            <View style={styles.currentPosContainer}>
-              <View style={styles.currentPosGlow} />
-              <View style={styles.currentPosBody} />
-            </View>
-          </Marker>
         )}
 
         <Marker
@@ -308,27 +301,6 @@ const styles = StyleSheet.create({
     height: 7,
     borderRadius: 3.5,
     backgroundColor: Colors.background,
-  },
-  currentPosContainer: {
-    width: 28,
-    height: 28,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  currentPosGlow: {
-    position: 'absolute',
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    backgroundColor: '#00BFFF33',
-  },
-  currentPosBody: {
-    width: 14,
-    height: 14,
-    borderRadius: 7,
-    backgroundColor: '#00BFFF',
-    borderWidth: 3,
-    borderColor: Colors.background,
   },
   maneuverContainer: {
     width: 30,

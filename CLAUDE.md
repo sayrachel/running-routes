@@ -1045,6 +1045,103 @@ in-run UX bugs doesn't get the same blind-eye treatment):
     `{}` since 2026-05-11, so nothing was diffed. The ≥5-route manual
     check (step 3) happens on-device via the OTA update that ships this.
 
+### Location tracking accuracy (Nov 2026)
+
+Root-cause pass on the in-run tracking layer after the user reported "when
+I run, the blue arrow is rather inaccurate". These change how Core Location
+is configured and how fixes are recorded; they do NOT change any OSRM call
+pattern (the live /nearest snap stays distance-throttled at 20m, so its
+call rate is unchanged by the denser fix feed).
+
+55. **Core Location was asked for 10m-class accuracy, and background
+    updates could auto-pause.** The same root cause surfaced before as
+    #44 (jagged polyline), #50 (off-road track) and #52 (seismograph) —
+    each patched downstream with smoothing / snapping / simplification
+    while the input stayed coarse. Cause: both `watchPositionAsync` and
+    `startLocationUpdatesAsync` used `Location.Accuracy.High`, which
+    expo-location maps on iOS to `kCLLocationAccuracyNearestTenMeters`
+    (`node_modules/expo-location/ios/LocationAccuracy.swift`), not
+    Apple's best mode. The background task also left
+    `pausesUpdatesAutomatically` unset — its NATIVE default is `true`
+    (`EXLocationTaskConsumer.m`, `defaultValue:true`) despite expo's TS
+    docs saying `false` — with `activityType` `.other`, so iOS could
+    pause updates at a red light while the phone was locked and not
+    restart them on its own.
+    Fix (`lib/useLocationTracking.ts`): `Accuracy.BestForNavigation`
+    (`kCLLocationAccuracyBestForNavigation`, GPS fused with motion
+    sensors) for both streams; foreground distance filter 3m → none
+    (~1 Hz; the recorder drops sub-3m moves itself); background
+    `activityType: Fitness`, `pausesUpdatesAutomatically: false`.
+    Cost: battery. If that draws complaints, drop the BACKGROUND task to
+    `Accuracy.Highest` (`kCLLocationAccuracyBest`) first — the
+    foreground (where the dot is visible) is the part to keep at max.
+    What's NOT in this fix: a custom native module / iOS 17
+    `CLLocationUpdate.liveUpdates(.fitness)`. expo-location already
+    drives `CLLocationManager` directly, so a native module would cost a
+    TestFlight build for no accuracy gain; everything here is JS and
+    OTA-able. `watchPositionAsync` can't set `activityType` on iOS
+    (expo's Swift provider only reads accuracy + distanceInterval); the
+    background task's manager carries the fitness hint.
+    Harness gap: nothing in the repo exercises Core Location — on-device
+    only.
+
+56. **Two location streams with separate smoothing chains; pace assumed
+    a 3s cadence.** Found by code read while fixing #57, then confirmed
+    by simulating the old ingestion code (2.7 km loop, correlated 4m GPS
+    error, phone locked 2:00-8:00): after unlock the recorded position
+    sat ~100-210m behind the runner and took ~5-7s to catch up; distance
+    came out +14-20% (if RN timers keep running in the background) or
+    −20-25% (if they pause) — screen-on runs were fine (within 1%).
+    Current pace read 13:24/km or '--:--' at a true 5:33/km.
+    Cause: the foreground watch and background task are separate
+    `CLLocationManager`s and both receive fixes while foregrounded. Each
+    had its own EMA anchor (`lastPointRef` vs `lastBackgroundSmoothed`)
+    and its own copy of the track + distance, reconciled by array copies
+    on the 1s timer. Background fixes never refreshed the foreground
+    anchor, so the first fix after unlock was averaged with the pre-lock
+    position (and counted that jump as distance); if the foreground
+    handler ran before the timer sync it overwrote the shared copy,
+    erasing the background-recorded stretch. Pause stopped only the
+    foreground watch, so the background task kept adding distance while
+    paused. Current pace was `recentCount × 3s`, but iOS ignores
+    `timeInterval` and appends a point every ~1.1-1.3s.
+    Fix: one module-level `TrackRecorder` fed by BOTH streams through
+    `ingestFix`: timestamp dedupe (a fix delivered to both managers is
+    processed once; out-of-order fixes dropped; a ≥5-min backwards jump
+    is treated as a clock reset, not a reason to drop everything);
+    single EMA anchor + distance accumulator; a >15s gap re-seeds the
+    smoothing (the straight-line gap distance still counts, once);
+    `pauseRecorder` drops all fixes; `resumeRecorder` starts a fresh
+    segment (pause displacement not counted, pace window cleared).
+    `computeCurrentPace` uses real fix timestamps over a trailing 30s
+    window, '--:--' after 10s without movement.
+    Tests: `lib/__tests__/track-recorder.test.ts` (13 cases, incl. the
+    lock/unlock regression and cadence-independent pace).
+    Side note on #49: its "one sample per 3s" math was also wrong on iOS
+    — the 100-point `/match` cap was already hit after ~2 min, so the
+    post-run map-match effectively never ran for real runs, before or
+    after this change. Chunked `/match` is still the follow-up.
+    Harness gap: still no in-run tracking simulator (see the gap note
+    after #50); the recorder's pure functions are unit-tested instead.
+
+57. **Live position marker lagged and jumped.** User report (Nov 2026):
+    "when I run, the blue arrow is rather inaccurate". Cause: during a
+    run `RouteMap` hid MapKit's native dot (`showsUserLocation=
+    {!currentPosition}`, since the initial GPS commit 8f3dbca) and drew a
+    custom `<Marker>` at the last recorded track point — EMA-smoothed
+    (~1 fix behind), sometimes swapped for the `/nearest`-snapped road
+    point (#50, which can be the adjacent street), moved only on the 1s
+    stats tick across the JS bridge, and after a lock/unlock pulled back
+    toward the pre-lock position (#56).
+    Fix: `showsUserLocation` always on, custom marker removed. MapKit
+    draws the dot natively straight from Core Location, animates between
+    fixes, and shows an accuracy halo. `currentPosition` still drives
+    camera follow, off-route, turn-by-turn and auto-finish.
+    Expected: the recorded blue track (smoothed, snapped, RDP-simplified)
+    trails the dot by about one fix — that's the smoothing, not drift.
+    What's NOT in this fix: a brand-colored dot (`tintColor` would also
+    recolor the setup-screen dot; left system blue).
+
 ### Recurring-fix discipline
 
 User explicitly called out (May 2026) that the same class of bug ("route
