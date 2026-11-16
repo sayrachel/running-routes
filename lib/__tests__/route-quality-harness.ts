@@ -291,6 +291,42 @@ interface FixtureResult {
   error?: string;
   trace?: TraceEvent[];
   routePoints?: RoutePoint[];
+  /** Set with --timing: wall-clock for the fixture and the OSRM requests it
+   *  made (counted at the fetch layer, so retries/adjustments are included). */
+  timing?: FetchStats & { ms: number };
+}
+
+/** --timing instrumentation. Wraps global fetch to count OSRM /route and
+ *  /nearest requests and track peak concurrency, so generation-time work can
+ *  be measured as "round trips on the critical path" instead of guessed.
+ *  Pair with a latency-injecting proxy in front of local OSRM to get
+ *  public-OSRM-like wall-clock. Counts nothing in --mock-osrm mode (the mock
+ *  never calls fetch). */
+interface FetchStats { routeCalls: number; nearestCalls: number; peakInFlight: number }
+const fetchStats: FetchStats = { routeCalls: 0, nearestCalls: 0, peakInFlight: 0 };
+let fetchInFlight = 0;
+function resetFetchStats(): void {
+  fetchStats.routeCalls = 0;
+  fetchStats.nearestCalls = 0;
+  fetchStats.peakInFlight = 0;
+}
+function installFetchCounter(): void {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: any, init?: any) => {
+    const url = typeof input === 'string' ? input : String(input?.url ?? input);
+    const isRoute = url.includes('/route/');
+    const isNearest = url.includes('/nearest/');
+    if (isRoute) fetchStats.routeCalls++;
+    if (isNearest) fetchStats.nearestCalls++;
+    if (!isRoute && !isNearest) return realFetch(input, init);
+    fetchInFlight++;
+    fetchStats.peakInFlight = Math.max(fetchStats.peakInFlight, fetchInFlight);
+    try {
+      return await realFetch(input, init);
+    } finally {
+      fetchInFlight--;
+    }
+  }) as typeof fetch;
 }
 
 function applyThresholds(f: Fixture, m: RouteMetrics): string[] {
@@ -589,7 +625,10 @@ function fmtRow(r: FixtureResult): string {
     ? `  rej={bt=${rc.backtrack},pl=${rc.pendantLoop},d=${rc.distance},h=${rc.highway},b=${rc.barrier},n=${rc.osrmNull},as=${rc.aspect},td=${rc.turnDensity},pp=${rc.polsbyPopper},tc=${rc.turnCluster}}`
     : '';
   const tail = r.failures.length ? `  -- ${r.failures.join('; ')}` : '';
-  return `${tag}  ${dataTag}${pad(r.fixture.name, 32)}  ${summary}${rejectStr}${tail}`;
+  const timingStr = r.timing
+    ? `  t=${(r.timing.ms / 1000).toFixed(1)}s route=${r.timing.routeCalls} nearest=${r.timing.nearestCalls} peak=${r.timing.peakInFlight}`
+    : '';
+  return `${tag}  ${dataTag}${pad(r.fixture.name, 32)}  ${summary}${rejectStr}${timingStr}${tail}`;
 }
 
 interface SnapshotCounts { enriched: number; highway: number; osrm: number }
@@ -854,6 +893,9 @@ async function main() {
     writeBaselinePath = next;
   }
 
+  const timing = argv.includes('--timing');
+  if (timing) installFetchCounter();
+
   const fixtures = only ? FIXTURES.filter((f) => f.name.includes(only!)) : FIXTURES;
   if (fixtures.length === 0) {
     console.error(`No fixtures matched --only ${only}`);
@@ -895,7 +937,10 @@ async function main() {
 
   const results: FixtureResult[] = [];
   for (let i = 0; i < fixtures.length; i++) {
+    resetFetchStats();
+    const t0 = Date.now();
     const r = await runFixture(fixtures[i], dumpPath !== null, useSynthetic, mockOsrm, deterministic);
+    if (timing) r.timing = { ms: Date.now() - t0, ...fetchStats };
     results.push(r);
     console.log(fmtRow(r));
     // Only sleep between fixtures we expect to hit the network. In replay
@@ -958,6 +1003,7 @@ async function main() {
         : null,
       trace: r.trace ?? [],
       routePoints: r.routePoints ?? [],
+      timing: r.timing ?? null,
     }));
     fs.writeFileSync(dumpPath, JSON.stringify(dump, null, 2));
     console.log(`\nDumped trace for ${dump.length} fixture(s) to ${dumpPath}`);
@@ -972,6 +1018,21 @@ async function main() {
   console.log(`Summary: ${passed}/${evaluated.length} passed, ${failed} failed` +
     (skipped > 0 ? `, ${skipped} skipped (no OSRM coverage)` : '') +
     (fallback > 0 ? `  (${fallback} hit geometric-fallback path — Overpass unavailable for those)` : ''));
+
+  if (timing) {
+    const timed = evaluated.filter((r) => r.timing && r.metrics);
+    if (timed.length > 0) {
+      const ms = timed.map((r) => r.timing!.ms).sort((a, b) => a - b);
+      const q = (p: number) => ms[Math.min(ms.length - 1, Math.floor(p * ms.length))];
+      const mean = (f: (r: FixtureResult) => number) => timed.reduce((acc, r) => acc + f(r), 0) / timed.length;
+      console.log(
+        `Timing (${timed.length} fixtures): median ${(q(0.5) / 1000).toFixed(1)}s, p90 ${(q(0.9) / 1000).toFixed(1)}s, ` +
+        `max ${(ms[ms.length - 1] / 1000).toFixed(1)}s; mean route calls ${mean((r) => r.timing!.routeCalls).toFixed(1)}, ` +
+        `mean nearest calls ${mean((r) => r.timing!.nearestCalls).toFixed(1)}, ` +
+        `max peak in-flight ${Math.max(...timed.map((r) => r.timing!.peakInFlight))}`
+      );
+    }
+  }
 
   if (failed > 0) process.exit(1);
 }
