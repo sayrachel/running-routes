@@ -354,6 +354,41 @@ export function polylineDivergenceKm(a: RoutePoint[], b: RoutePoint[]): number {
 }
 
 /**
+ * Degree-space tolerances for a cheap, EXACT pre-check before
+ * `haversineDistance(a, b)` is compared against `tolKm` (CLAUDE.md #58).
+ *
+ * For any two points of `points`: if |Δlat| ≥ latTol or |Δlng| ≥ lngTol,
+ * then haversineDistance ≥ tolKm, so the pair can be skipped without
+ * computing it. Lower bounds used (R = 6371, same as haversineDistance):
+ *   d ≥ R·|Δφ|                         (exact)
+ *   d ≥ R·cos(φmax)·|Δλ|·(1 − Δλ²/24)  (asin x ≥ x, sin x ≥ x − x³/6)
+ * latTol carries a 1e-9 margin for float rounding; lngTol a 1% margin that
+ * covers the small-angle term. The longitude bound is disabled (Infinity)
+ * near the poles or if the points straddle the antimeridian.
+ *
+ * Callers still run the exact haversine comparison on pairs that pass, so
+ * every decision is identical to the unfiltered scan — this only skips the
+ * trig on pairs that can't possibly be within tolerance, which in the
+ * O(n²) scans below is nearly all of them.
+ */
+function nearBounds(points: RoutePoint[], tolKm: number): { latTol: number; lngTol: number } {
+  let maxAbsLat = 0;
+  let minLng = Infinity;
+  let maxLng = -Infinity;
+  for (const p of points) {
+    const absLat = Math.abs(p.lat);
+    if (absLat > maxAbsLat) maxAbsLat = absLat;
+    if (p.lng < minLng) minLng = p.lng;
+    if (p.lng > maxLng) maxLng = p.lng;
+  }
+  const latTol = (tolKm / 6371) * (180 / Math.PI) * (1 + 1e-9);
+  const lngTol = maxAbsLat > 80 || maxLng - minLng > 180
+    ? Infinity
+    : (latTol / Math.cos((maxAbsLat * Math.PI) / 180)) * 1.01;
+  return { latTol, lngTol };
+}
+
+/**
  * Fraction of total route distance covered by segments that overlap a later
  * segment in space — i.e. they sit within `proximityKm` of another segment
  * and run roughly parallel or antiparallel (same physical street).
@@ -382,12 +417,18 @@ export function overlapSegmentRatio(
   }
   if (totalLen === 0) return 0;
 
+  // O(n²) scan; the nearBounds pre-check skips the haversine for pairs that
+  // are provably farther apart than proximityKm (CLAUDE.md #58).
+  const { latTol, lngTol } = nearBounds(mid, proximityKm);
   let overlapLen = 0;
   for (let i = 0; i < n; i++) {
     let overlaps = false;
+    const mi = mid[i];
     // Skip near-adjacent segments — those are the route continuing forward.
     for (let j = i + 5; j < n; j++) {
-      if (haversineDistance(mid[i], mid[j]) > proximityKm) continue;
+      const mj = mid[j];
+      if (Math.abs(mi.lat - mj.lat) >= latTol || Math.abs(mi.lng - mj.lng) >= lngTol) continue;
+      if (haversineDistance(mi, mj) > proximityKm) continue;
       // Co-linear if bearings are equal (parallel) OR differ by 180° (antiparallel).
       const raw = Math.abs(brg[i] - brg[j]) % 360;
       const ang = Math.min(raw, 360 - raw);
@@ -700,10 +741,21 @@ function trimOnePendantLoop(points: RoutePoint[]): RoutePoint[] {
   const MIN_BODY_SEGS = 2;
   let totalKm = 0;
   for (let k = 1; k < points.length; k++) totalKm += haversineDistance(points[k - 1], points[k]);
+  // O(n²) scan; the nearBounds pre-check skips both haversines for pairs
+  // where either endpoint pair is provably ≥ TOL_KM apart (CLAUDE.md #58).
+  const { latTol, lngTol } = nearBounds(points, TOL_KM);
   for (let i = 0; i < points.length - 1; i++) {
+    const pi = points[i];
+    const pi1 = points[i + 1];
     for (let j = i + 1 + MIN_BODY_SEGS; j < points.length - 1; j++) {
-      const startMatches = haversineDistance(points[i], points[j + 1]) < TOL_KM;
-      const endMatches = haversineDistance(points[i + 1], points[j]) < TOL_KM;
+      const pj = points[j];
+      const pj1 = points[j + 1];
+      if (
+        Math.abs(pi.lat - pj1.lat) >= latTol || Math.abs(pi.lng - pj1.lng) >= lngTol ||
+        Math.abs(pi1.lat - pj.lat) >= latTol || Math.abs(pi1.lng - pj.lng) >= lngTol
+      ) continue;
+      const startMatches = haversineDistance(pi, pj1) < TOL_KM;
+      const endMatches = haversineDistance(pi1, pj) < TOL_KM;
       if (startMatches && endMatches) {
         const bridgeKm = haversineDistance(points[i], points[i + 1]);
         if (bridgeKm < MIN_BRIDGE_KM) continue;
@@ -789,12 +841,22 @@ export function countPendantLoops(points: RoutePoint[]): number {
   let totalKm = 0;
   for (let k = 1; k < points.length; k++) totalKm += haversineDistance(points[k - 1], points[k]);
 
+  // O(n²) scan; nearBounds pre-check as in trimOnePendantLoop (CLAUDE.md #58).
+  const { latTol, lngTol } = nearBounds(points, TOL_KM);
   for (let i = 0; i < points.length - 1; i++) {
     if (consumed[i]) continue;
+    const pi = points[i];
+    const pi1 = points[i + 1];
     for (let j = i + 1 + MIN_BODY_SEGS; j < points.length - 1; j++) {
       if (consumed[j]) continue;
-      const startMatches = haversineDistance(points[i], points[j + 1]) < TOL_KM;
-      const endMatches = haversineDistance(points[i + 1], points[j]) < TOL_KM;
+      const pj = points[j];
+      const pj1 = points[j + 1];
+      if (
+        Math.abs(pi.lat - pj1.lat) >= latTol || Math.abs(pi.lng - pj1.lng) >= lngTol ||
+        Math.abs(pi1.lat - pj.lat) >= latTol || Math.abs(pi1.lng - pj.lng) >= lngTol
+      ) continue;
+      const startMatches = haversineDistance(pi, pj1) < TOL_KM;
+      const endMatches = haversineDistance(pi1, pj) < TOL_KM;
       if (startMatches && endMatches) {
         const bridgeKm = haversineDistance(points[i], points[i + 1]);
         if (bridgeKm < MIN_BRIDGE_KM) continue;
@@ -1707,13 +1769,19 @@ function generateGreenSpaceLoop(
  * Variant produces different starting bearings so each macro-snap candidate
  * lands on a different rotation of the same shape, giving sectoring-style
  * variety without the anchor-clustering pathology.
+ *
+ * Synchronous PLAN only (CLAUDE.md #59): anchors are chosen without any
+ * network, and geometric vertices are returned unsnapped with their indices
+ * in `snapIdx`. `finishPlannedLoop` does the /nearest snap + U-turn reorder
+ * later, inside the candidate's own launch pipeline — so building this
+ * candidate no longer blocks every other candidate's OSRM requests.
  */
-async function generateMacroSnapLoop(
+function planMacroSnapLoop(
   center: RoutePoint,
   distanceKm: number,
   variant: number,
   greenSpaces: GreenSpace[],
-): Promise<{ waypoints: RoutePoint[]; anchors: GreenSpace[] }> {
+): PlannedLoop {
   // Same vertex-count and perimeter math as the step-3.5 geometric fallback,
   // so the macro-snap distance lands in the same neighborhood and the
   // distance-adjustment loop has a similar starting point.
@@ -1760,6 +1828,7 @@ async function generateMacroSnapLoop(
   const usedAnchorIdx = new Set<number>();
   const waypoints: RoutePoint[] = [center];
   const anchors: GreenSpace[] = [];
+  const snapIdx: number[] = [];
 
   // Bearing-jitter sequence: try the planned bearing first, then ±30°, ±60°
   // before giving up. When the planned bearing puts the vertex in water or
@@ -1800,25 +1869,52 @@ async function generateMacroSnapLoop(
       usedAnchorIdx.add(bestIdx);
     } else {
       // No anchor found across all jittered bearings — use the geometric
-      // vertex at the planned bearing, snapped to the nearest road via
-      // OSRM /nearest (CLAUDE.md #42). Without snap, OSRM has to detour
-      // from the geometric vertex (which may be in water, a building,
-      // or a private interior) back to the road network — that detour
-      // is what produces the user-reported block-loops.
-      // fetchOSRMNearest falls through to the input coord on any
-      // failure, so this never blocks generation.
-      const macroVertex = destinationPoint(center, baseAngle, waypointDist);
-      const snapped = await fetchOSRMNearest(macroVertex);
-      waypoints.push(snapped);
+      // vertex at the planned bearing, to be snapped to the nearest road
+      // via OSRM /nearest (CLAUDE.md #42) by finishPlannedLoop. Without
+      // snap, OSRM has to detour from the geometric vertex (which may be in
+      // water, a building, or a private interior) back to the road network
+      // — that detour is what produces the user-reported block-loops.
+      snapIdx.push(waypoints.length);
+      waypoints.push(destinationPoint(center, baseAngle, waypointDist));
     }
   }
 
   waypoints.push(center);
-  // Reorder intermediate vertices to minimize max turn severity (CLAUDE.md
-  // #37). Macro-snap's planned bearings are well-spread so the input order
-  // is usually optimal, but jitter retries can move vertices by ±60° from
-  // their planned bearing — the bearing-sorted (visit-in-planned-order)
-  // sequence isn't always U-turn-free after that.
+  return { waypoints, anchors, snapIdx };
+}
+
+/** A loop candidate planned without network access (CLAUDE.md #59). */
+interface PlannedLoop {
+  /** [center, ...vertices, center]; geometric vertices not yet road-snapped. */
+  waypoints: RoutePoint[];
+  anchors: GreenSpace[];
+  /** Indices into `waypoints` of geometric vertices that need a road snap. */
+  snapIdx: number[];
+}
+
+/**
+ * Finish a planned macro-snap / corridor loop: snap its geometric vertices
+ * to the nearest road via OSRM /nearest (CLAUDE.md #42) — one request at a
+ * time, so a candidate never has more than one request in flight — then
+ * reorder intermediate vertices to minimize max turn severity (CLAUDE.md
+ * #37) and re-pair anchors. Output is identical to the old awaited builders;
+ * only the timing moved (it now runs inside the candidate's own launch
+ * pipeline instead of serially in the candidate-building loop).
+ * fetchOSRMNearest falls through to the input coord on any failure, so this
+ * never blocks generation.
+ */
+async function finishPlannedLoop(
+  center: RoutePoint,
+  plan: PlannedLoop,
+): Promise<{ waypoints: RoutePoint[]; anchors: GreenSpace[] }> {
+  const waypoints = [...plan.waypoints];
+  for (const idx of plan.snapIdx) {
+    waypoints[idx] = await fetchOSRMNearest(waypoints[idx]);
+  }
+  const anchors = plan.anchors;
+  // Planned bearings are well-spread so the input order is usually optimal,
+  // but jitter retries can move vertices by ±60° from their planned bearing
+  // — the bearing-sorted sequence isn't always U-turn-free after that.
   const intermediate = waypoints.slice(1, -1);
   const reordered = reorderForLowestUTurn(center, intermediate);
   if (reordered !== intermediate) {
@@ -1857,13 +1953,16 @@ async function generateMacroSnapLoop(
  *
  * Falls back to geometric vertex when no corridor exists in a given
  * direction (rare in NYC but possible elsewhere).
+ *
+ * Synchronous PLAN only, like planMacroSnapLoop (CLAUDE.md #59); geometric
+ * fallback vertices are snapped later by finishPlannedLoop.
  */
-async function generateCorridorLoop(
+function planCorridorLoop(
   center: RoutePoint,
   distanceKm: number,
   variant: number,
   greenSpaces: GreenSpace[],
-): Promise<{ waypoints: RoutePoint[]; anchors: GreenSpace[] }> {
+): PlannedLoop {
   // Same vertex-count math as macro-snap so the two strategies produce
   // candidates at comparable target distances.
   const targetMi = distanceKm * 0.621371;
@@ -1885,7 +1984,7 @@ async function generateCorridorLoop(
   // If too few corridors, this strategy can't work — fall back to
   // macro-snap (which itself falls back to geometric if needed).
   if (corridors.length < numLoopWaypoints) {
-    return generateMacroSnapLoop(center, distanceKm, variant, greenSpaces);
+    return planMacroSnapLoop(center, distanceKm, variant, greenSpaces);
   }
 
   // Bearings spaced for variety, same seed math as macro-snap.
@@ -1910,6 +2009,7 @@ async function generateCorridorLoop(
   const usedAnchorIdx = new Set<number>();
   const waypoints: RoutePoint[] = [center];
   const anchors: GreenSpace[] = [];
+  const snapIdx: number[] = [];
 
   for (let k = 0; k < numLoopWaypoints; k++) {
     const targetBearing = (seedBearing + k * step) % 360;
@@ -1949,31 +2049,17 @@ async function generateCorridorLoop(
       usedAnchorIdx.add(bestIdx);
     } else {
       // No corridor in this direction — fall back to a geometric vertex at
-      // the target bearing, snapped to nearest road via OSRM /nearest
-      // (CLAUDE.md #42). Same rationale as macro-snap: prevents OSRM from
-      // detouring through a private interior or in-water position.
-      const fallback = destinationPoint(center, targetBearing, waypointDist);
-      const snapped = await fetchOSRMNearest(fallback);
-      waypoints.push(snapped);
+      // the target bearing, to be snapped to nearest road via OSRM /nearest
+      // (CLAUDE.md #42) by finishPlannedLoop. Same rationale as macro-snap:
+      // prevents OSRM from detouring through a private interior or in-water
+      // position.
+      snapIdx.push(waypoints.length);
+      waypoints.push(destinationPoint(center, targetBearing, waypointDist));
     }
   }
 
   waypoints.push(center);
-
-  // Reorder for lowest U-turn (same as macro-snap, CLAUDE.md #37).
-  const intermediate = waypoints.slice(1, -1);
-  const reordered = reorderForLowestUTurn(center, intermediate);
-  if (reordered !== intermediate) {
-    const newAnchors: GreenSpace[] = [];
-    for (const pt of reordered) {
-      const matched = anchors.find((a) =>
-        a.point.lat === pt.lat && a.point.lng === pt.lng
-      );
-      if (matched) newAnchors.push(matched);
-    }
-    return { waypoints: [center, ...reordered, center], anchors: newAnchors };
-  }
-  return { waypoints, anchors };
+  return { waypoints, anchors, snapIdx };
 }
 
 /**
@@ -3417,9 +3503,42 @@ export async function generateOSRMRoutes(
      *  fetch. Used to share one `alternatives=true` call across multiple
      *  alternative-route candidates without N parallel network requests. */
     prefetchedResult?: Promise<{ route: OSRMRoute | null; waypoints: RoutePoint[] }>;
+    /** Deferred preparation for macro-snap / corridor-loop candidates whose
+     *  geometric vertices still need a road snap (CLAUDE.md #59). Runs in
+     *  the candidate's own launch pipeline and fills in `waypoints` /
+     *  `anchors` before its first route request. */
+    prepare?: () => Promise<void>;
   };
   const candidates: CandidateSpec[] = [];
   const usedParkPoints: RoutePoint[] = []; // Parks already used by earlier candidates
+
+  // Post-build steps shared by every candidate: water-crossing removal (keeps
+  // anchors in sync so expandParkWaypoints and route naming see the actual
+  // post-replacement green spaces; distance-scaled threshold — a 6mi loop's
+  // natural wp1→wp2 chord is ~3km, well over the fixed 1.5km legacy default
+  // which would drop both waypoints), then expansion of large parks into
+  // entry/exit pairs so OSRM routes through the park interior, not just past
+  // its edge.
+  const finalizeCandidate = (
+    i: number,
+    strategy: CandidateStrategy,
+    variant: number,
+    builtWaypoints: RoutePoint[],
+    builtAnchors: GreenSpace[],
+  ): { waypoints: RoutePoint[]; anchors: GreenSpace[] } => {
+    const synced = removeWaterCrossingsWithAnchors(builtWaypoints, greenSpaces, center, builtAnchors, distanceKm);
+    const waypoints = expandParkWaypoints(synced.waypoints, synced.anchors);
+    traceEmit('candidate-built', {
+      i,
+      strategy,
+      variant,
+      anchorCount: synced.anchors.length,
+      anchorNames: synced.anchors.map((a) => a.name).filter(Boolean),
+      waypointCount: waypoints.length,
+      waypoints,
+    });
+    return { waypoints, anchors: synced.anchors };
+  };
 
   // For p2p, fire OSRM's `alternatives=true` request in parallel with the
   // candidate-generation loop so we have structurally-different routes ready
@@ -3489,20 +3608,38 @@ export async function generateOSRMRoutes(
       const result = generateGreenSpaceOutAndBack(center, distanceKm, prefs, variant, availableGreenSpaces, obStrategy);
       waypoints = result.waypoints;
       anchors = result.anchors;
-    } else {
-      // Loop. macro-snap plans the loop SHAPE first then snaps to anchors
-      // (#34); corridor-loop picks corridor anchors directly in cardinal
-      // directions (#38); other strategies pick anchors first then connect.
-      // macro-snap and corridor-loop are async because they snap their
-      // geometric (non-anchored) vertices to road via OSRM /nearest (#42).
-      let result;
-      if (strategy === 'macro-snap') {
-        result = await generateMacroSnapLoop(center, distanceKm, variant, availableGreenSpaces);
-      } else if (strategy === 'corridor-loop') {
-        result = await generateCorridorLoop(center, distanceKm, variant, availableGreenSpaces);
+    } else if (strategy === 'macro-snap' || strategy === 'corridor-loop') {
+      // macro-snap plans the loop SHAPE first then snaps to anchors (#34);
+      // corridor-loop picks corridor anchors directly in cardinal directions
+      // (#38). Their geometric (non-anchored) vertices need an OSRM /nearest
+      // road snap (#42). Planning is synchronous — anchors are known now, so
+      // the diversity filter for later candidates is unaffected — and the
+      // snap is deferred into this candidate's own launch pipeline (#59).
+      // Previously each snap was awaited right here, serially, so every
+      // candidate's first route request waited on all of them.
+      const plan = strategy === 'macro-snap'
+        ? planMacroSnapLoop(center, distanceKm, variant, availableGreenSpaces)
+        : planCorridorLoop(center, distanceKm, variant, availableGreenSpaces);
+      for (const a of plan.anchors) usedParkPoints.push(a.point);
+      const spec: CandidateSpec = { variant, waypoints: plan.waypoints, anchors: plan.anchors };
+      if (plan.snapIdx.length === 0) {
+        const finished = await finishPlannedLoop(center, plan); // no network: reorder only
+        const final = finalizeCandidate(i, strategy, variant, finished.waypoints, finished.anchors);
+        spec.waypoints = final.waypoints;
+        spec.anchors = final.anchors;
       } else {
-        result = generateGreenSpaceLoop(center, distanceKm, prefs, variant, availableGreenSpaces, strategy);
+        spec.prepare = async () => {
+          const finished = await finishPlannedLoop(center, plan);
+          const final = finalizeCandidate(i, strategy, variant, finished.waypoints, finished.anchors);
+          spec.waypoints = final.waypoints;
+          spec.anchors = final.anchors;
+        };
       }
+      candidates.push(spec);
+      continue;
+    } else {
+      // Loop, anchor-first strategies: pick anchors first then connect.
+      const result = generateGreenSpaceLoop(center, distanceKm, prefs, variant, availableGreenSpaces, strategy);
       waypoints = result.waypoints;
       anchors = result.anchors;
     }
@@ -3512,31 +3649,8 @@ export async function generateOSRMRoutes(
       usedParkPoints.push(a.point);
     }
 
-    // Apply water crossing removal before OSRM, keeping anchors in sync so
-    // expandParkWaypoints and route naming see the actual post-replacement
-    // green spaces. Pass route distance so the threshold scales — a 6mi
-    // loop's natural wp1→wp2 chord is ~3km, well over the fixed 1.5km
-    // legacy default which would drop both waypoints.
-    {
-      const synced = removeWaterCrossingsWithAnchors(waypoints, greenSpaces, center, anchors, distanceKm);
-      waypoints = synced.waypoints;
-      anchors = synced.anchors;
-    }
-
-    // Expand large parks into entry/exit pairs so OSRM routes through
-    // the park interior, not just past its edge
-    waypoints = expandParkWaypoints(waypoints, anchors);
-
-    traceEmit('candidate-built', {
-      i,
-      strategy,
-      variant,
-      anchorCount: anchors.length,
-      anchorNames: anchors.map((a) => a.name).filter(Boolean),
-      waypointCount: waypoints.length,
-      waypoints,
-    });
-    candidates.push({ variant, waypoints, anchors });
+    const final = finalizeCandidate(i, strategy, variant, waypoints, anchors);
+    candidates.push({ variant, waypoints: final.waypoints, anchors: final.anchors });
   }
 
   // For p2p, append two alternative-route candidates that share a single
@@ -3618,6 +3732,12 @@ export async function generateOSRMRoutes(
     const launchDelay = c.prefetchedResult ? 0 : idx * launchSpacingMs;
     const p = (async (): Promise<Tagged> => {
       if (launchDelay > 0) await new Promise((r) => setTimeout(r, launchDelay));
+      // Deferred road snap for macro-snap / corridor-loop candidates
+      // (CLAUDE.md #59). Runs after this candidate's launch stagger and before
+      // its first route request, so the candidate still has at most one OSRM
+      // request in flight at a time — the "in-flight ≤ candidate count"
+      // envelope from the Production OSRM Constraints section is unchanged.
+      if (c.prepare) await c.prepare();
       // 4 retries (5 total attempts). Was 2 (3 attempts), but the per-step
       // scale cap of [0.80, 1.25] meant a candidate starting at ratio 0.4
       // (waypoints landed in a tight pocket) could only reach ratio 0.625

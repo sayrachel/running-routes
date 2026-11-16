@@ -11,6 +11,8 @@
 
 Production hits the **free public** `router.project-osrm.org` endpoint. It is rate-limited and tail-latency-prone. Concrete lessons from past regressions:
 
+- **That endpoint only serves the CAR profile — `/foot/` in the URL is ignored** (verified Nov 2026: `/route/v1/foot/…` and `/route/v1/driving/…` return byte-identical routes at ~25 km/h; a real foot profile returns walking speed and different geometry). Every route this app has generated is a car route: it obeys one-way streets, can use highways/tunnels, and can NOT use park paths, greenways, esplanades, car-free park drives, or boardwalks. Many entries below (highway/tunnel/barrier gates, block-loop and zigzag penalties, "no waterfront paths") are workarounds for car-routing artifacts. See "Routing profile" under the Nov 2026 audit section before changing endpoints — a real foot server (e.g. FOSSGIS `routing.openstreetmap.de/routed-foot`) returns mostly UNNAMED sidewalk steps, which the off-street gate (#35) rejects wholesale.
+
 - **Total simultaneous request count matters more than per-candidate math.** A change that "only adds 2 parallel calls per candidate" with 7 candidates = 21 simultaneous requests. The endpoint will throttle that burst and return nulls. Keep the steady-state in-flight count ≤ candidate count (currently 7).
 - **The harness does NOT validate against the public endpoint.** `--synthetic` uses mock OSRM (zero latency, zero failure rate). Local OSRM (`--osrm-base http://localhost:5000/...`) has no rate limits. **Neither environment can detect a regression that only manifests under public-OSRM rate limiting.** A "quality bumped X/N → Y/N" number from the harness is a claim about algorithm correctness, NOT about endpoint behavior.
 - **Tail latency on public OSRM is real.** Typical 200-700ms, busy 1-2s, occasional 3-5s spikes. `OSRM_TIMEOUT_MS` is currently 8s. Don't tighten it without a way to measure the resulting null-rate against real users.
@@ -18,7 +20,7 @@ Production hits the **free public** `router.project-osrm.org` endpoint. It is ra
 
 ### Pre-flight checklist for any change that touches OSRM call patterns (volume, timeout, hedging, caching) or quality gates
 
-1. Run `npm test` and `npm run quality -- --synthetic`. Baselines: ~357/357 unit tests, ~59/60 synthetic harness (the 1 fail is `nyc-les-1mi-loop-quiet`, pre-existing).
+1. Run `npm test` and `npm run quality -- --synthetic`. Baselines: ~400/400 unit tests, ~59/60 synthetic harness (the 1 fail is `nyc-les-1mi-loop-quiet`, pre-existing).
 2. **Run `npm run quality:real`** — exercises every fixture against `router.project-osrm.org` and diffs against `lib/__tests__/fixtures/real-osrm-baseline.json`. Catches the harness/prod gap that `--synthetic` is structurally blind to (real-OSRM dense-grid pathologies, tail latency, rate limiting). Takes ~5 minutes (3s per fixture spacing). Exit code 1 on any regressed fixture. If a regression is real (the algorithm legitimately got worse for a fixture), fix it. If a regression is intended (the algorithm legitimately got better and the baseline is stale), refresh with `npm run quality:real:record`.
 3. **Manually generate ≥5 routes against public OSRM** from the actual app (or a dev build) before committing the change. Cover: a quick repeat (cache hit case), a fresh location (cold case), and a hard case (water-bounded grid like LES or DUMBO). If any route renders as straight lines or obviously degenerate triangles — STOP and investigate; even `quality:real` may not catch this.
 4. Don't ship a perf claim ("X% faster", "wall-clock from A to B") that wasn't measured against the production endpoint. Local/mock numbers are NOT a proxy.
@@ -1141,6 +1143,101 @@ call rate is unchanged by the denser fix feed).
     trails the dot by about one fix — that's the smoothing, not drift.
     What's NOT in this fix: a brand-colored dot (`tintColor` would also
     recolor the setup-screen dot; left system blue).
+
+### Generation speed + routing-profile audit (Nov 2026)
+
+Measured, not estimated. Tooling (all reusable):
+- **Local car OSRM = production stand-in.** `~/osrm-data/car/` (built
+  from the same NY extract with `car.lua`), serve with
+  `osrm-routed --algorithm mld --port 5002 ~/osrm-data/car/new-york-latest.osrm`.
+  Matches the public endpoint within ~1% (same street names, car speeds).
+- **Local foot OSRM (`~/osrm-data/`, port 5000) no longer works for QA:**
+  the Homebrew 26.4.1 foot profile routes ~85% of a Manhattan loop on
+  unnamed sidewalks, so the off-street gate (#35) rejects nearly every
+  candidate (2/60 fixtures pass). It IS a faithful stand-in for a real
+  foot server (FOSSGIS behaves the same) — use it for foot-migration work.
+- **Generation-time measurement:** `npm run quality -- --synthetic
+  --osrm-base http://localhost:5001/route/v1/foot --no-snapshot --timing
+  --only nyc-` with a latency-injecting proxy on :5001 forwarding to :5002
+  (400ms ±25%, 5% chance of +2s). `--timing` (harness) prints per-fixture
+  wall-clock, /route and /nearest counts, and peak in-flight.
+- Production-equivalent quality baseline (car OSRM + synthetic greens):
+  44/60 overall, 41/45 NYC (`--only nyc-`).
+
+58. **O(n²) geometry scans dominated on-device CPU.** `overlapSegmentRatio`,
+    `trimOnePendantLoop` (up to 2 passes) and `countPendantLoops` compared
+    every pair of polyline points with trig-heavy haversines (two per pair
+    in the pendant scans). On 360 real car-OSRM polylines (median 530 pts):
+    ~188 ms per candidate in Node with JIT, ~510 ms with `node --jitless`
+    (interpreter-only, closest proxy for Hermes) — i.e. ~6 s of JS-thread
+    CPU per 12-candidate generation on a fast Mac. It also stalled the
+    event loop: the harness saw peak in-flight 11 even against a local
+    server, because finished responses sat unread while CPU ran.
+    Fix: `nearBounds()` — exact degree-space lower bounds
+    (d ≥ R·|Δφ|; d ≥ R·cos φmax·|Δλ|·(1−Δλ²/24), with margins) let the scans
+    skip the haversine for pairs that provably can't be within tolerance.
+    Pairs that pass still get the exact comparison, so every decision is
+    identical: 0 mismatches on 360 polylines (trim path exercised on 179),
+    route geometry identical on 60/60 synthetic and 60/60 car-OSRM
+    fixtures. Speed: 13–18× faster interpreter-only (~30 ms/candidate),
+    40–57× with JIT. Regression guard: `near-bounds-equivalence.test.ts`
+    pins the three functions to naive reference copies of the old scans.
+
+59. **Candidate building serialized network round trips.** The macro-snap
+    and corridor-loop builders `await`ed OSRM /nearest per geometric
+    vertex inside the sequential candidate loop, so no candidate's first
+    route request could start until every snap had finished (~6 snaps per
+    generation in the harness). Fix: split into synchronous
+    `planMacroSnapLoop` / `planCorridorLoop` (anchors chosen without
+    network, so the usedParkPoints diversity filter is unaffected) +
+    `finishPlannedLoop` (snaps, one at a time, then the #37 U-turn
+    reorder), deferred into the candidate's own launch pipeline after its
+    stagger delay. Each candidate still has ≤1 request in flight, so the
+    in-flight ≤ candidate-count envelope is unchanged (peak 12 = candidate
+    count, before and after). Geometry identical (60/60 both harnesses).
+    Measured with #58, simulated public-OSRM latency, 45 NYC fixtures:
+    median 8.4s → 4.9s, p90 13.1s → 8.0s, max 26.0s → 10.2s; same route
+    calls (30.2/generation), same pass rate. On a phone the CPU share of
+    the old number was larger, so the real-world gain should be bigger.
+    Not yet validated on-device against public OSRM (pre-flight step 3).
+
+60. **Tried, not adopted: faster distance convergence.** Secant step on
+    (cumulative scale, ratio) after the first correction + shrink cap
+    0.80 → 0.65 for too-long routes in `fetchOSRMRouteAdjusted`. Fewer
+    candidates exhausted retries (give-ups 59 → 40) and 2 more NYC
+    fixtures passed (hudson-greenway-5mi, uws-4mi), but total route calls
+    didn't drop (30.2 → 30.0) and the 16 changed routes were mixed
+    (distance error 4.5% → 4.1%, but Polsby-Popper 0.33 → 0.27, turns/km
+    1.88 → 2.12, green 17% → 14%). Reverted. Baseline facts for the next
+    attempt: only 49% of first attempts land within ±15%; first-attempt
+    ratio p10/median/p90 = 0.76/1.03/1.71; 15% of chains use all 5
+    attempts, so most generations' critical path has one.
+
+61. **Tried, no effect under car routing: scenery-aware ranking.** Step 4
+    computes green / run-path / waterfront proximity for every candidate,
+    but the final sort has used `qualityPenalty` alone since 4b0ee6f, so
+    those scores are only logged. Adding them as a bonus (≤0.12) changed
+    0/49 NYC routes: bonuses are tiny (median 0.015) and their spread
+    within a candidate pool (median 0.019) is far below the winner's
+    typical lead (0.074). Expected — car routes can't enter parks or
+    greenways, so coverage is uniformly low (~15%). Reverted; revisit
+    after a foot-profile migration, where it should matter.
+
+**Routing profile — the biggest open quality lever.** Production routes
+with the car profile (see Production OSRM Constraints). Evidence: East
+Village loop, public "foot" = 4,201m / 595s (25 km/h) via 1st Ave, Avenue
+C/D service roads; real foot = 3,709m / 2,670s. W 14th → W 34th along the
+Hudson: public routes up West Street / 11th / 12th Ave (the West Side
+Highway corridor), 3,514m; real foot takes the Hudson River Park
+Esplanade, 1,943m. FOSSGIS `routing.openstreetmap.de/routed-foot/route/v1/foot`
+serves a real foot profile (also /nearest), reachable from the dev Mac.
+Migration blockers to solve first: (1) the off-street gate (#35) — in
+foot data sidewalks are unnamed (84% of that loop) while Stuy Town's
+interior paths ARE named ("Stuyvesant Walk"), so the unnamed-means-
+off-street signal inverts; (2) re-tune ROUTING_OVERHEAD (foot routes are
+more direct) and re-check turn/shape gates on sidewalk geometry;
+(3) FOSSGIS usage policy (free, limited use) vs the 12-candidate burst
+pattern. Use local foot OSRM (port 5000) to prototype and measure.
 
 ### Recurring-fix discipline
 
