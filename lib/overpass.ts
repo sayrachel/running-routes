@@ -52,6 +52,10 @@ export interface GreenSpace {
   kind: 'park' | 'garden' | 'nature' | 'path' | 'cycleway' | 'footway' | 'route' | 'waterfront' | 'other';
   name: string | null;
   areaSize: number; // estimated area in km², 0 for linear features
+  /** Bounding box of the OSM element (Overpass `bb`). Lets containment
+   *  checks cover long/linear parks (Hudson River Park, Brooklyn Bridge
+   *  Park) that a centroid circle misses. Absent in old snapshots. */
+  bounds?: { minLat: number; maxLat: number; minLng: number; maxLng: number };
 }
 
 /**
@@ -478,15 +482,22 @@ function parseGreenSpaceElements(elements: any[]): GreenSpace[] {
         : 2;
 
     let areaSize = 0;
+    let bounds: GreenSpace['bounds'];
     if (el.bounds && el.bounds.minlat != null) {
       const latSpan = Math.abs(el.bounds.maxlat - el.bounds.minlat);
       const lngSpan = Math.abs(el.bounds.maxlon - el.bounds.minlon);
       const latKm = latSpan * 111;
       const lngKm = lngSpan * 111 * Math.cos((point.lat * Math.PI) / 180);
       areaSize = latKm * lngKm;
+      bounds = {
+        minLat: Math.min(el.bounds.minlat, el.bounds.maxlat),
+        maxLat: Math.max(el.bounds.minlat, el.bounds.maxlat),
+        minLng: Math.min(el.bounds.minlon, el.bounds.maxlon),
+        maxLng: Math.max(el.bounds.minlon, el.bounds.maxlon),
+      };
     }
 
-    results.push({ point, tier, kind, name: tags.name || null, areaSize });
+    results.push({ point, tier, kind, name: tags.name || null, areaSize, ...(bounds ? { bounds } : {}) });
   }
 
   // Deduplicate within 50m

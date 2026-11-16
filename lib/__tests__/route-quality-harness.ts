@@ -262,7 +262,9 @@ interface RouteMetrics {
   /** Per-reason count of how many candidates were rejected during step 3.
    *  A high `backtrack` count combined with `chosenFromFallback=true` is
    *  the smoking gun for "hard-reject too aggressive for this area". */
-  rejectionCounts: { distance: number; barrier: number; highway: number; backtrack: number; pendantLoop: number; osrmNull: number; aspect: number; turnDensity: number; polsbyPopper: number; turnCluster: number };
+  rejectionCounts: { distance: number; barrier: number; highway: number; offStreet: number; backtrack: number; pendantLoop: number; osrmNull: number; aspect: number; turnDensity: number; polsbyPopper: number; turnCluster: number };
+  /** Running profile only: share of distance on greenways + paths. */
+  pathShare?: number;
   /** Turns per km — number of ≥45° heading changes per route km. */
   turnsPerKm: number;
   /** Bbox aspect ratio: max(NS, EW) / min(NS, EW). Catches degenerate-shape
@@ -428,7 +430,7 @@ function applyThresholds(f: Fixture, m: RouteMetrics): string[] {
   if (m.chosenFromFallback && m.hasOverpassData) {
     const breakdown = `backtrack=${m.rejectionCounts.backtrack}, pendant-loop=${m.rejectionCounts.pendantLoop}, ` +
       `distance=${m.rejectionCounts.distance}, barrier=${m.rejectionCounts.barrier}, ` +
-      `highway=${m.rejectionCounts.highway}, osrm-null=${m.rejectionCounts.osrmNull}, ` +
+      `highway=${m.rejectionCounts.highway}, off-street=${m.rejectionCounts.offStreet}, osrm-null=${m.rejectionCounts.osrmNull}, ` +
       `aspect=${m.rejectionCounts.aspect}, turn-density=${m.rejectionCounts.turnDensity}, ` +
       `polsby-popper=${m.rejectionCounts.polsbyPopper}, turn-cluster=${m.rejectionCounts.turnCluster}`;
     failures.push(
@@ -532,7 +534,7 @@ async function runFixture(f: Fixture, captureTrace: boolean, useSynthetic: boole
     // the algorithm dropped to geometric bearing-trial routing because every
     // step-3 candidate was rejected. That's the "Sidestreet Shuffle" anchorless
     // rectangle pattern in the East Village 4mi screenshot.
-    const rejectionCounts = { distance: 0, barrier: 0, highway: 0, backtrack: 0, pendantLoop: 0, osrmNull: 0, aspect: 0, turnDensity: 0, polsbyPopper: 0, turnCluster: 0 };
+    const rejectionCounts = { distance: 0, barrier: 0, highway: 0, offStreet: 0, backtrack: 0, pendantLoop: 0, osrmNull: 0, aspect: 0, turnDensity: 0, polsbyPopper: 0, turnCluster: 0 };
     let chosenFromFallback = false;
     for (const e of trace) {
       if (e.event === 'fallback-start') chosenFromFallback = true;
@@ -541,6 +543,7 @@ async function runFixture(f: Fixture, captureTrace: boolean, useSynthetic: boole
         if (reason === 'distance') rejectionCounts.distance++;
         else if (reason === 'barrier') rejectionCounts.barrier++;
         else if (reason === 'highway') rejectionCounts.highway++;
+        else if (reason === 'off-street') rejectionCounts.offStreet++;
         else if (reason === 'backtrack') rejectionCounts.backtrack++;
         else if (reason === 'pendant-loop') rejectionCounts.pendantLoop++;
         else if (reason === 'osrm-null') rejectionCounts.osrmNull++;
@@ -568,6 +571,7 @@ async function runFixture(f: Fixture, captureTrace: boolean, useSynthetic: boole
       aspectRatio: bboxAspectRatio(points),
       polsbyPopper: polsbyPopper(points),
       maxTurnCluster: actualKm > 0.5 ? maxTurnDensityInWindow(points, 0.5) : 0,
+      pathShare: r.pathShare,
     };
     const failures = applyThresholds(f, metrics);
     return {
@@ -614,15 +618,16 @@ function fmtRow(r: FixtureResult): string {
     `tc=${m.maxTurnCluster.toFixed(0)}  ` +
     `green=${(m.greenProximity * 100).toFixed(0)}%  ` +
     `anch=${m.anchorCount}  ` +
+    (m.pathShare !== undefined ? `path=${(m.pathShare * 100).toFixed(0)}%  ` : '') +
     `pts=${m.pointCount}`;
   // Show per-reason rejection breakdown only when something interesting
   // happened — otherwise it's noise on every clean PASS row.
   const rc = m.rejectionCounts;
-  const totalRejects = rc.distance + rc.barrier + rc.highway + rc.backtrack
+  const totalRejects = rc.distance + rc.barrier + rc.highway + rc.offStreet + rc.backtrack
     + rc.pendantLoop + rc.osrmNull + rc.aspect + rc.turnDensity
     + rc.polsbyPopper + rc.turnCluster;
   const rejectStr = totalRejects > 0
-    ? `  rej={bt=${rc.backtrack},pl=${rc.pendantLoop},d=${rc.distance},h=${rc.highway},b=${rc.barrier},n=${rc.osrmNull},as=${rc.aspect},td=${rc.turnDensity},pp=${rc.polsbyPopper},tc=${rc.turnCluster}}`
+    ? `  rej={bt=${rc.backtrack},pl=${rc.pendantLoop},d=${rc.distance},h=${rc.highway},os=${rc.offStreet},b=${rc.barrier},n=${rc.osrmNull},as=${rc.aspect},td=${rc.turnDensity},pp=${rc.polsbyPopper},tc=${rc.turnCluster}}`
     : '';
   const tail = r.failures.length ? `  -- ${r.failures.join('; ')}` : '';
   const timingStr = r.timing
@@ -908,7 +913,20 @@ async function main() {
   setOSRMCacheMax(5000);
 
   if (mockOsrm) setOSRMMock(true);
-  if (osrmBase) setOSRMBase(osrmBase);
+  // --profile running: the --osrm-base server was built from
+  // osrm/running.lua (CLAUDE.md #62), so profile-dependent calibration
+  // (ROUTING_OVERHEAD, class-aware off-street gate) switches with it.
+  const profileIdx = argv.indexOf('--profile');
+  const profileArg = profileIdx >= 0 ? argv[profileIdx + 1] : 'car';
+  if (profileArg !== 'car' && profileArg !== 'running') {
+    console.error(`--profile must be car or running (got ${profileArg})`);
+    process.exit(2);
+  }
+  if (profileArg === 'running' && !osrmBase) {
+    console.error('--profile running requires --osrm-base pointing at a running-profile server');
+    process.exit(2);
+  }
+  if (osrmBase) setOSRMBase(osrmBase, profileArg);
 
   // Skip OSRM cache when mocking — the recorded URLs are stale (they
   // correspond to a different algorithm version's waypoints) and loading

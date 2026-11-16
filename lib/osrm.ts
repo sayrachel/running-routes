@@ -7,11 +7,59 @@ import { isPopularRunningPark } from './popular-running-parks';
 
 const OSRM_BASE_DEFAULT = 'https://router.project-osrm.org/route/v1/foot';
 let osrmBase = OSRM_BASE_DEFAULT;
+
+/** Which OSRM profile the configured endpoint serves.
+ *  - 'car': the public router.project-osrm.org, which ignores /foot/ and
+ *    serves its car profile (CLAUDE.md "Production OSRM Constraints").
+ *  - 'running': a self-hosted server built from osrm/running.lua — walking
+ *    plus bike paths, named streets preferred over sidewalks, response
+ *    classes (CLAUDE.md #62).
+ *  Calibration constants that depend on the profile are switched here. */
+export type RoutingProfile = 'car' | 'running';
+let routingProfile: RoutingProfile = 'car';
+
+/** Self-hosted running-profile server (osrm/README.md). null until one is
+ *  deployed — production then routes everything through the public car
+ *  router exactly as before. When set, a generation whose start point is
+ *  inside `coverage` (the server's OSM extract) uses it; starts elsewhere
+ *  fall back to the public router. `base` is the /route/v1/<profile> URL,
+ *  e.g. 'https://routes.example.com/route/v1/foot'. */
+const RUNNING_SERVER: {
+  base: string;
+  coverage: { minLat: number; maxLat: number; minLng: number; maxLng: number };
+} | null = null;
+
+/** True once setOSRMBase pinned an endpoint (harness, tests) — production
+ *  backend selection then leaves it alone. */
+let osrmBaseOverridden = false;
+
 /** Override the OSRM endpoint. The harness uses this to point at a local
  *  self-hosted OSRM (real Manhattan-grid geometry, no public-endpoint rate
  *  limits). Production leaves it null and uses the public router. */
-export function setOSRMBase(url: string | null): void {
-  osrmBase = url ?? OSRM_BASE_DEFAULT;
+export function setOSRMBase(url: string | null, profile: RoutingProfile = 'car'): void {
+  osrmBaseOverridden = url !== null;
+  applyRoutingBackend(url ?? OSRM_BASE_DEFAULT, url ? profile : 'car');
+}
+
+function applyRoutingBackend(base: string, profile: RoutingProfile): void {
+  osrmBase = base;
+  routingProfile = profile;
+  ROUTING_OVERHEAD = ROUTING_OVERHEAD_BY_PROFILE[profile];
+}
+
+/** Production backend choice for a generation starting at `start`. */
+function selectRoutingBackend(start: RoutePoint): void {
+  if (osrmBaseOverridden) return;
+  const c = RUNNING_SERVER?.coverage;
+  if (RUNNING_SERVER && c && start.lat >= c.minLat && start.lat <= c.maxLat
+    && start.lng >= c.minLng && start.lng <= c.maxLng) {
+    applyRoutingBackend(RUNNING_SERVER.base, 'running');
+  } else {
+    applyRoutingBackend(OSRM_BASE_DEFAULT, 'car');
+  }
+}
+export function getRoutingProfile(): RoutingProfile {
+  return routingProfile;
 }
 // User-facing route count cap. The internal candidate pool is larger so
 // quality rejection has alternatives — see SAFETY_EXTRAS below.
@@ -77,8 +125,16 @@ export class OSRMUnavailableError extends Error {
  * the road network geometry (grid patterns, curves, one-way streets, etc).
  * We use this factor to shrink the geometric radius so the OSRM-routed
  * result ends up closer to the user's target distance.
+ *
+ * Per routing profile: 1.45 was calibrated against car routing (one-way
+ * detours). Foot routing is more direct — see CLAUDE.md #62 for the
+ * running-profile calibration.
  */
-const ROUTING_OVERHEAD = 1.45;
+const ROUTING_OVERHEAD_BY_PROFILE: Record<RoutingProfile, number> = {
+  car: 1.45,
+  running: 1.25,
+};
+let ROUTING_OVERHEAD = ROUTING_OVERHEAD_BY_PROFILE.car;
 
 // ---------------------------------------------------------------------------
 // Geometry helpers
@@ -2299,6 +2355,13 @@ interface OSRMStep {
     modifier?: string;
     location: [number, number];
   };
+  /** One entry per intersection the step passes, starting at the step's
+   *  maneuver. `location` is [lng, lat] and sits on a vertex of `geometry`.
+   *  `classes` describes the way LEAVING the intersection; the running
+   *  profile (osrm/running.lua) emits greenway / path / sidewalk / steps /
+   *  busy / service, the public car profile only toll / motorway / ferry /
+   *  restricted / tunnel. Absent in mock routes. */
+  intersections?: { location: [number, number]; classes?: string[] }[];
 }
 
 interface OSRMLeg {
@@ -2344,6 +2407,8 @@ interface ResolvedCandidate {
    *  drive turn-by-turn without a fresh routing call. Undefined for the
    *  step-3.5 geometric fallback when steps weren't fetched. */
   steps?: ManeuverStep[];
+  /** Running profile only: share of distance on greenways + paths. */
+  pathShare?: number;
 }
 
 /**
@@ -2809,6 +2874,14 @@ export function computeOffStreetRatio(
       // Unnamed step. Step distance ≤20m is often just a maneuver edge
       // (corner clipping, lane transition) — too short to matter.
       if (step.distance < 20) continue;
+      // Running profile (CLAUDE.md #62): the response says what each piece
+      // of the step runs on, so unnamed sidewalks, bike paths and busy
+      // roads — all public — stop counting as off-street. Only unnamed
+      // walkways / service roads / stairs outside green spaces count.
+      if (hasRunningClasses(step)) {
+        offStreetMeters += offStreetMetersByClass(step, greenSpaces);
+        continue;
+      }
       // Allow if the step's geometry centroid falls inside a known green
       // space catchment (parks, named cycleways, pedestrian zones,
       // waterfronts). One representative point is enough — green-space
@@ -2821,13 +2894,137 @@ export function computeOffStreetRatio(
   return offStreetMeters / totalMeters;
 }
 
+/** Classes emitted only by osrm/running.lua. */
+const RUNNING_CLASSES = new Set(['greenway', 'path', 'sidewalk', 'steps', 'busy', 'service']);
+/** Running-profile classes that are public right-of-way by definition. */
+const PUBLIC_WAY_CLASSES = new Set(['greenway', 'sidewalk', 'busy']);
+
+function hasRunningClasses(step: OSRMStep): boolean {
+  for (const it of step.intersections ?? []) {
+    for (const c of it.classes ?? []) if (RUNNING_CLASSES.has(c)) return true;
+  }
+  return false;
+}
+
+/** Split a step's geometry into pieces at its intersections. Each piece
+ *  carries the classes of the intersection it starts at (= the way the
+ *  route is on until the next intersection) and its share of the step's
+ *  geometric length. Intersection locations sit on geometry vertices; the
+ *  nearest-vertex scan tolerates float formatting differences. */
+function stepPieces(step: OSRMStep): { classes: string[]; frac: number; mid: [number, number] }[] {
+  const coords = step.geometry?.coordinates ?? [];
+  const ints = step.intersections ?? [];
+  if (coords.length < 2 || ints.length === 0) return [];
+  const marks: number[] = [];
+  let from = 0;
+  for (const it of ints) {
+    let best = from;
+    let bestD = Infinity;
+    for (let j = from; j < coords.length; j++) {
+      const dx = coords[j][0] - it.location[0];
+      const dy = coords[j][1] - it.location[1];
+      const d = dx * dx + dy * dy;
+      if (d < bestD) { bestD = d; best = j; }
+      if (d === 0) break;
+    }
+    marks.push(best);
+    from = best;
+  }
+  marks[0] = 0;
+  const segLen = (j: number) => haversineDistance(
+    { lat: coords[j][1], lng: coords[j][0] },
+    { lat: coords[j + 1][1], lng: coords[j + 1][0] },
+  );
+  const pieces: { classes: string[]; len: number; mid: [number, number] }[] = [];
+  let total = 0;
+  for (let i = 0; i < ints.length; i++) {
+    const start = marks[i];
+    const end = i + 1 < ints.length ? marks[i + 1] : coords.length - 1;
+    let len = 0;
+    for (let j = start; j < end; j++) len += segLen(j);
+    if (len <= 0) continue;
+    total += len;
+    pieces.push({ classes: ints[i].classes ?? [], len, mid: coords[Math.floor((start + end) / 2)] });
+  }
+  if (total <= 0) return [];
+  return pieces.map((p) => ({ classes: p.classes, frac: p.len / total, mid: p.mid }));
+}
+
+function offStreetMetersByClass(step: OSRMStep, greenSpaces: GreenSpace[]): number {
+  let meters = 0;
+  for (const piece of stepPieces(step)) {
+    if (piece.classes.some((c) => PUBLIC_WAY_CLASSES.has(c))) continue;
+    if (isPointInsideAnyGreenSpace({ lat: piece.mid[1], lng: piece.mid[0] }, greenSpaces, true)) continue;
+    meters += piece.frac * step.distance;
+  }
+  return meters;
+}
+
+/** Debug/trace only: the largest off-street pieces of a running-profile
+ *  route (class, meters, midpoint) so harness dumps show what tripped the
+ *  off-street gate. */
+function debugOffStreetPieces(route: OSRMRoute, greenSpaces: GreenSpace[]): { cls: string; m: number; at: string }[] {
+  const out: { cls: string; m: number; at: string }[] = [];
+  for (const leg of route.legs ?? []) {
+    for (const step of leg.steps) {
+      if ((step.name && step.name.trim().length > 0) || step.distance < 20 || !hasRunningClasses(step)) continue;
+      for (const piece of stepPieces(step)) {
+        if (piece.classes.some((c) => PUBLIC_WAY_CLASSES.has(c))) continue;
+        if (isPointInsideAnyGreenSpace({ lat: piece.mid[1], lng: piece.mid[0] }, greenSpaces, true)) continue;
+        out.push({ cls: piece.classes.join('+') || 'street', m: Math.round(piece.frac * step.distance), at: `${piece.mid[1].toFixed(5)},${piece.mid[0].toFixed(5)}` });
+      }
+    }
+  }
+  return out.sort((a, b) => b.m - a.m).slice(0, 6);
+}
+
+/** Distance share of a running-profile route by response class (greenway,
+ *  path, sidewalk, steps, busy, service; 'street' = no class). Returns null
+ *  for responses without running classes (public car router, mock). */
+export function routeClassShare(route: OSRMRoute): Record<string, number> | null {
+  if (!route.legs || route.distance <= 0) return null;
+  // Cheap scan first: car-profile responses (production today) never carry
+  // running classes, so they skip the per-step geometry split entirely.
+  if (!route.legs.some((leg) => leg.steps.some(hasRunningClasses))) return null;
+  const share: Record<string, number> = {};
+  for (const leg of route.legs) {
+    for (const step of leg.steps) {
+      for (const piece of stepPieces(step)) {
+        const cls = piece.classes.filter((c) => RUNNING_CLASSES.has(c));
+        const keys = cls.length > 0 ? cls : ['street'];
+        for (const k of keys) share[k] = (share[k] ?? 0) + (piece.frac * step.distance) / keys.length;
+      }
+    }
+  }
+  for (const k of Object.keys(share)) share[k] /= route.distance;
+  return share;
+}
+
 function isStepInsideAnyGreenSpace(step: OSRMStep, greenSpaces: GreenSpace[]): boolean {
   const coords = step.geometry?.coordinates;
   if (!coords || coords.length === 0) return false;
   const mid = coords[Math.floor(coords.length / 2)];
-  const point = { lat: mid[1], lng: mid[0] };
+  return isPointInsideAnyGreenSpace({ lat: mid[1], lng: mid[0] }, greenSpaces);
+}
 
+/** ~40m of slop around a park's bounding box. */
+const GREEN_BOUNDS_MARGIN_DEG = 0.00036;
+
+/** `useBounds` (running profile only, so the car path stays byte-identical):
+ *  areal green spaces with an Overpass bounding box count a point inside
+ *  the box (+~40m) as inside the park. A centroid circle covers maybe a
+ *  third of a long waterfront park, and walking routes — unlike car routes
+ *  — actually run on park paths, so the circle under-counted them as
+ *  off-street. The box is lenient for diagonal parks; that only loosens
+ *  the off-street gate near big parks, which is the safe direction. */
+function isPointInsideAnyGreenSpace(point: RoutePoint, greenSpaces: GreenSpace[], useBounds = false): boolean {
   for (const gs of greenSpaces) {
+    if (useBounds && gs.bounds) {
+      const m = GREEN_BOUNDS_MARGIN_DEG;
+      const mLng = m / Math.max(0.2, Math.cos((point.lat * Math.PI) / 180));
+      if (point.lat >= gs.bounds.minLat - m && point.lat <= gs.bounds.maxLat + m
+        && point.lng >= gs.bounds.minLng - mLng && point.lng <= gs.bounds.maxLng + mLng) return true;
+    }
     // Polygon green spaces (parks/gardens/nature reserves): catchment is
     // the effective radius derived from the OSM bounds, plus 50m of slop
     // to absorb perimeter paths that hug the edge of the park.
@@ -2840,6 +3037,15 @@ function isStepInsideAnyGreenSpace(step: OSRMStep, greenSpaces: GreenSpace[]): b
     if (haversineDistance(point, gs.point) <= radiusKm) return true;
   }
   return false;
+}
+
+/** Extra /route query parameters for the configured profile. Running
+ *  profile: `continue_straight=true` forbids U-turns AT via waypoints. The
+ *  car profile gets that by default; walking profiles don't, so without it
+ *  every off-path waypoint (park centroid, anchor) becomes an out-and-back
+ *  spur and loops retrace (CLAUDE.md #62). */
+function routeProfileParams(): string {
+  return routingProfile === 'running' ? '&continue_straight=true' : '';
 }
 
 /**
@@ -2875,7 +3081,7 @@ async function fetchOSRMRoute(waypoints: RoutePoint[]): Promise<OSRMRoute | null
   // superblocks (PCV/Stuy Town, college campuses, gated complexes). Costs
   // ~10-20% more response payload but no extra requests. See
   // `computeOffStreetRatio` for the consumer.
-  const url = `${osrmBase}/${coords}?overview=full&geometries=geojson&steps=true`;
+  const url = `${osrmBase}/${coords}?overview=full&geometries=geojson&steps=true${routeProfileParams()}`;
 
   const cached = osrmRouteCache.get(url);
   if (cached !== undefined) {
@@ -2915,7 +3121,9 @@ async function fetchOSRMRoute(waypoints: RoutePoint[]): Promise<OSRMRoute | null
 const osrmNearestCache = new Map<string, RoutePoint>();
 const NEAREST_CACHE_MAX = 500;
 function nearestCacheKey(p: RoutePoint): string {
-  return `${p.lat.toFixed(5)},${p.lng.toFixed(5)}`;
+  // Keyed by endpoint too: a car-profile snap (road centerline) must not be
+  // replayed as a running-profile snap (CLAUDE.md #62).
+  return `${osrmBase}|${p.lat.toFixed(5)},${p.lng.toFixed(5)}`;
 }
 export function clearOSRMNearestCache(): void { osrmNearestCache.clear(); }
 
@@ -3387,7 +3595,8 @@ export async function generateOSRMRoutes(
   // that returns [] so the UI can render "n/q/w" counts in the error
   // banner. A successful generation leaves it null.
   lastFailureDiagnostics = null;
-  traceEmit('generate-start', { center, distanceKm, routeType, count, prefs, end: end ?? null, retryAttempt: _retryAttempt });
+  if (_retryAttempt === 0) selectRoutingBackend(center);
+  traceEmit('generate-start', { center, distanceKm, routeType, count, prefs, end: end ?? null, retryAttempt: _retryAttempt, routingProfile });
   // Wall-clock anchor for the retry deadline check at the bottom — bounds
   // total time across first-pass + retry so the user can't sit on the
   // spinner past the existing degraded ceiling.
@@ -3988,7 +4197,7 @@ export async function generateOSRMRoutes(
         if (offStreetRatio > offStreetThreshold) {
           qualityRejectCount++;
           rejectReasons.offStreet++;
-          traceEmit('candidate-rejected', { i, reason: 'off-street', offStreetRatio, threshold: offStreetThreshold });
+          traceEmit('candidate-rejected', { i, reason: 'off-street', offStreetRatio, threshold: offStreetThreshold, classShare: routeClassShare(osrmRoute), offStreetPieces: debugOffStreetPieces(osrmRoute, greenSpaces) });
           continue;
         }
       }
@@ -4006,7 +4215,7 @@ export async function generateOSRMRoutes(
       // urban grids legitimately route up to ~40% on dominant avenues
       // even on coherent loops; 0.50 is the egregious floor.
       if (routeType === 'loop') {
-        const streetShare = maxStreetShare(candidateSteps);
+        const streetShare = maxStreetShare(candidateSteps, routingProfile === 'running');
         if (streetShare > 0.50) {
           qualityRejectCount++;
           rejectReasons.backtrack++;
@@ -4220,7 +4429,7 @@ export async function generateOSRMRoutes(
         : shortTurnSegmentRatio(points, 0.2);
       const streetShare = (isOutAndBack || routeType === 'point-to-point')
         ? 0
-        : maxStreetShare(candidateSteps);
+        : maxStreetShare(candidateSteps, routingProfile === 'running');
       // Start-spur and block-loop detection (CLAUDE.md #41). Both produce
       // routes that are visibly broken even when distance/retrace/etc. are
       // fine: start-spur means the start point is a dead-end branch off
@@ -4287,7 +4496,9 @@ export async function generateOSRMRoutes(
         blockLoopPenalty -
         anchorBonus
       );
-      traceEmit('candidate-evaluated', { i, distKm, distRatio, hwProximity, retraced, overlap, stubs, startPasses, reversalsPerKm, turnsPerKm, turnPenalty, roundingPenalty, aspectRatio, polsbyP, maxTurnCluster, shortTurnRatio, streetShare, startSpurM, blockLoopCount, qualityPenalty });
+      const classShare = routeClassShare(osrmRoute);
+      const pathShare = classShare ? (classShare.greenway ?? 0) + (classShare.path ?? 0) : undefined;
+      traceEmit('candidate-evaluated', { i, distKm, distRatio, hwProximity, retraced, overlap, stubs, startPasses, reversalsPerKm, turnsPerKm, turnPenalty, roundingPenalty, aspectRatio, polsbyP, maxTurnCluster, shortTurnRatio, streetShare, startSpurM, blockLoopCount, qualityPenalty, classShare });
       // Final gate: rounded-display match. The user-facing distance label is
       // an integer mile (or km, in metric). A 5mi request that returns a
       // 5.6mi route shows "6 mi" — the user reads it as the wrong route even
@@ -4297,7 +4508,7 @@ export async function generateOSRMRoutes(
       // wrong-display fallback pool so the algorithm has something to return
       // even when geometry simply can't fit the requested mile (LES 6mi-
       // sized cases).
-      const candidateRecord: ResolvedCandidate = { index: i, variant: candidates[i].variant, points, distKm, estimatedTime, fromOSRM: true, anchors: candidates[i].anchors, qualityPenalty, dirtiness: retraced + overlap, steps: candidateSteps };
+      const candidateRecord: ResolvedCandidate = { index: i, variant: candidates[i].variant, points, distKm, estimatedTime, fromOSRM: true, anchors: candidates[i].anchors, qualityPenalty, dirtiness: retraced + overlap, steps: candidateSteps, pathShare };
       const adjustUnitsForCheck = useAdjustment ? adjustUnits : null;
       if (adjustUnitsForCheck && !roundedDisplayMatches(distKm, distanceKm, adjustUnitsForCheck)) {
         wrongDisplayFallback.push(candidateRecord);
@@ -4793,6 +5004,7 @@ export async function generateOSRMRoutes(
       anchorPoints: candidate.anchors.map((a) => a.point),
       routeStyle: routeType,
       steps: candidate.steps,
+      ...(candidate.pathShare !== undefined ? { pathShare: candidate.pathShare } : {}),
     };
   });
 }

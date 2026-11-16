@@ -5,7 +5,10 @@
  * (down, rate-limited, or in CI environments without network).
  *
  * Coordinates are accurate to within a few hundred meters; areaSize
- * values are estimated from real park footprints (km²).
+ * values are estimated from real park footprints (km²). `bounds` (major
+ * NYC parks only) approximate the Overpass `bb` of the real polygon; the
+ * running-profile off-street gate uses them for long/linear parks that a
+ * centroid circle misses (CLAUDE.md #62).
  *
  * Keyed by `${lat.toFixed(3)},${lng.toFixed(3)}` of the fixture center.
  */
@@ -20,7 +23,7 @@ export const SYNTHETIC_GREEN_SPACES: Record<string, GreenSpace[]> = {
     { point: { lat: 40.7308, lng: -73.9973 }, tier: 1, kind: 'park',       name: 'Washington Square Park',    areaSize: 0.04  },
     { point: { lat: 40.7268, lng: -73.9817 }, tier: 1, kind: 'park',       name: 'Tompkins Square Park',      areaSize: 0.04  },
     { point: { lat: 40.7194, lng: -73.9919 }, tier: 1, kind: 'park',       name: 'Sara D. Roosevelt Park',    areaSize: 0.03  },
-    { point: { lat: 40.7186, lng: -73.9778 }, tier: 1, kind: 'park',       name: 'East River Park',           areaSize: 0.32  },
+    { point: { lat: 40.7186, lng: -73.9778 }, tier: 1, kind: 'park',       name: 'East River Park',           areaSize: 0.32, bounds: { minLat: 40.7105, maxLat: 40.729, minLng: -73.9795, maxLng: -73.9715 }  },
     { point: { lat: 40.7330, lng: -73.9846 }, tier: 1, kind: 'park',       name: 'Stuyvesant Square',         areaSize: 0.018 },
     { point: { lat: 40.7160, lng: -73.9750 }, tier: 1, kind: 'waterfront', name: 'East River Greenway',       areaSize: 0     },
     { point: { lat: 40.7300, lng: -74.0100 }, tier: 1, kind: 'waterfront', name: 'Hudson River Greenway',     areaSize: 0     },
@@ -29,7 +32,7 @@ export const SYNTHETIC_GREEN_SPACES: Record<string, GreenSpace[]> = {
 
   // NYC Lower East Side — dense Manhattan grid with East River edge.
   '40.715,-73.985': [
-    { point: { lat: 40.7186, lng: -73.9778 }, tier: 1, kind: 'park',       name: 'East River Park',           areaSize: 0.32  },
+    { point: { lat: 40.7186, lng: -73.9778 }, tier: 1, kind: 'park',       name: 'East River Park',           areaSize: 0.32, bounds: { minLat: 40.7105, maxLat: 40.729, minLng: -73.9795, maxLng: -73.9715 }  },
     { point: { lat: 40.7268, lng: -73.9817 }, tier: 1, kind: 'park',       name: 'Tompkins Square Park',      areaSize: 0.04  },
     { point: { lat: 40.7194, lng: -73.9919 }, tier: 1, kind: 'park',       name: 'Sara D. Roosevelt Park',    areaSize: 0.03  },
     { point: { lat: 40.7140, lng: -73.9920 }, tier: 1, kind: 'park',       name: 'Seward Park',               areaSize: 0.012 },
@@ -40,7 +43,7 @@ export const SYNTHETIC_GREEN_SPACES: Record<string, GreenSpace[]> = {
 
   // NYC Columbus Circle — anchored by Central Park + Hudson waterfront.
   '40.768,-73.982': [
-    { point: { lat: 40.7829, lng: -73.9654 }, tier: 1, kind: 'park',       name: 'Central Park',              areaSize: 3.41  },
+    { point: { lat: 40.7829, lng: -73.9654 }, tier: 1, kind: 'park',       name: 'Central Park',              areaSize: 3.41, bounds: { minLat: 40.7644, maxLat: 40.8007, minLng: -73.9819, maxLng: -73.9493 }  },
     { point: { lat: 40.7700, lng: -73.9920 }, tier: 1, kind: 'waterfront', name: 'Hudson River Greenway',     areaSize: 0     },
     { point: { lat: 40.7677, lng: -73.9870 }, tier: 2, kind: 'park',       name: "Hell's Kitchen Park",       areaSize: 0.005 },
     { point: { lat: 40.7725, lng: -73.9835 }, tier: 2, kind: 'park',       name: 'Lincoln Center Plaza',      areaSize: 0.012 },
@@ -49,7 +52,7 @@ export const SYNTHETIC_GREEN_SPACES: Record<string, GreenSpace[]> = {
 
   // NYC Williamsburg — Brooklyn waterfront + parks.
   '40.714,-73.961': [
-    { point: { lat: 40.7203, lng: -73.9525 }, tier: 1, kind: 'park',       name: 'McCarren Park',             areaSize: 0.14  },
+    { point: { lat: 40.7203, lng: -73.9525 }, tier: 1, kind: 'park',       name: 'McCarren Park',             areaSize: 0.14, bounds: { minLat: 40.7178, maxLat: 40.7232, minLng: -73.9553, maxLng: -73.9477 }  },
     { point: { lat: 40.7220, lng: -73.9613 }, tier: 1, kind: 'waterfront', name: 'East River State Park',     areaSize: 0.055 },
     { point: { lat: 40.7144, lng: -73.9685 }, tier: 1, kind: 'waterfront', name: 'Domino Park',               areaSize: 0.024 },
     { point: { lat: 40.7240, lng: -73.9617 }, tier: 1, kind: 'park',       name: 'Bushwick Inlet Park',       areaSize: 0.045 },
@@ -62,7 +65,7 @@ export const SYNTHETIC_GREEN_SPACES: Record<string, GreenSpace[]> = {
   // west on the waterfront — note this is a thin riverfront strip with only
   // one road in/out, exactly the geometry that triggers stub-detour spurs).
   '40.718,-73.961': [
-    { point: { lat: 40.7203, lng: -73.9525 }, tier: 1, kind: 'park',       name: 'McCarren Park',             areaSize: 0.14  },
+    { point: { lat: 40.7203, lng: -73.9525 }, tier: 1, kind: 'park',       name: 'McCarren Park',             areaSize: 0.14, bounds: { minLat: 40.7178, maxLat: 40.7232, minLng: -73.9553, maxLng: -73.9477 }  },
     { point: { lat: 40.7220, lng: -73.9613 }, tier: 1, kind: 'park',       name: 'Bushwick Inlet Park',       areaSize: 0.045 },
     { point: { lat: 40.7240, lng: -73.9617 }, tier: 1, kind: 'park',       name: 'East River State Park',     areaSize: 0.055 },
     { point: { lat: 40.7280, lng: -73.9655 }, tier: 1, kind: 'park',       name: 'Marsha P. Johnson State Park', areaSize: 0.022 },
@@ -121,8 +124,8 @@ export const SYNTHETIC_GREEN_SPACES: Record<string, GreenSpace[]> = {
 
   // NYC Upper West Side — Central Park to the east, Riverside Park along Hudson.
   '40.785,-73.975': [
-    { point: { lat: 40.7829, lng: -73.9654 }, tier: 1, kind: 'park',       name: 'Central Park',              areaSize: 3.41  },
-    { point: { lat: 40.7910, lng: -73.9760 }, tier: 1, kind: 'park',       name: 'Riverside Park',            areaSize: 1.30  },
+    { point: { lat: 40.7829, lng: -73.9654 }, tier: 1, kind: 'park',       name: 'Central Park',              areaSize: 3.41, bounds: { minLat: 40.7644, maxLat: 40.8007, minLng: -73.9819, maxLng: -73.9493 }  },
+    { point: { lat: 40.7910, lng: -73.9760 }, tier: 1, kind: 'park',       name: 'Riverside Park',            areaSize: 1.30, bounds: { minLat: 40.779, maxLat: 40.834, minLng: -73.989, maxLng: -73.947 }  },
     { point: { lat: 40.7912, lng: -73.9737 }, tier: 1, kind: 'park',       name: 'Joan of Arc Park',          areaSize: 0.005 },
     { point: { lat: 40.7787, lng: -73.9853 }, tier: 1, kind: 'waterfront', name: 'Hudson River Greenway',     areaSize: 0     },
     { point: { lat: 40.7920, lng: -73.9670 }, tier: 1, kind: 'park',       name: 'Theodore Roosevelt Park',   areaSize: 0.075 },
@@ -130,7 +133,7 @@ export const SYNTHETIC_GREEN_SPACES: Record<string, GreenSpace[]> = {
 
   // NYC Upper East Side — Central Park west, East River + Carl Schurz east.
   '40.777,-73.958': [
-    { point: { lat: 40.7794, lng: -73.9632 }, tier: 1, kind: 'park',       name: 'Central Park',              areaSize: 3.41  },
+    { point: { lat: 40.7794, lng: -73.9632 }, tier: 1, kind: 'park',       name: 'Central Park',              areaSize: 3.41, bounds: { minLat: 40.7644, maxLat: 40.8007, minLng: -73.9819, maxLng: -73.9493 }  },
     { point: { lat: 40.7773, lng: -73.9442 }, tier: 1, kind: 'park',       name: 'Carl Schurz Park',          areaSize: 0.060 },
     { point: { lat: 40.7706, lng: -73.9512 }, tier: 1, kind: 'park',       name: 'John Jay Park',             areaSize: 0.014 },
     { point: { lat: 40.7773, lng: -73.9437 }, tier: 1, kind: 'waterfront', name: 'East River Esplanade',      areaSize: 0     },
@@ -139,8 +142,8 @@ export const SYNTHETIC_GREEN_SPACES: Record<string, GreenSpace[]> = {
 
   // NYC Chelsea — Hudson River Park to west, High Line cuts through, Madison Sq south.
   '40.747,-74.002': [
-    { point: { lat: 40.7480, lng: -74.0086 }, tier: 1, kind: 'waterfront', name: 'Hudson River Park',         areaSize: 0     },
-    { point: { lat: 40.7480, lng: -74.0048 }, tier: 1, kind: 'route',      name: 'High Line',                 areaSize: 0     },
+    { point: { lat: 40.7480, lng: -74.0086 }, tier: 1, kind: 'waterfront', name: 'Hudson River Park',         areaSize: 0, bounds: { minLat: 40.703, maxLat: 40.7745, minLng: -74.0195, maxLng: -73.9925 }     },
+    { point: { lat: 40.7480, lng: -74.0048 }, tier: 1, kind: 'route',      name: 'High Line',                 areaSize: 0, bounds: { minLat: 40.7395, maxLat: 40.7578, minLng: -74.009, maxLng: -74.0 }     },
     { point: { lat: 40.7423, lng: -73.9881 }, tier: 1, kind: 'park',       name: 'Madison Square Park',       areaSize: 0.027 },
     { point: { lat: 40.7505, lng: -74.0020 }, tier: 1, kind: 'park',       name: 'Chelsea Park',              areaSize: 0.012 },
     { point: { lat: 40.7398, lng: -73.9960 }, tier: 1, kind: 'park',       name: 'Union Square Park',         areaSize: 0.024 },
@@ -149,7 +152,7 @@ export const SYNTHETIC_GREEN_SPACES: Record<string, GreenSpace[]> = {
 
   // NYC Brooklyn Heights — narrow grid + Brooklyn Bridge Park along East River.
   '40.696,-73.994': [
-    { point: { lat: 40.7008, lng: -73.9966 }, tier: 1, kind: 'waterfront', name: 'Brooklyn Bridge Park',      areaSize: 0.34  },
+    { point: { lat: 40.7008, lng: -73.9966 }, tier: 1, kind: 'waterfront', name: 'Brooklyn Bridge Park',      areaSize: 0.34, bounds: { minLat: 40.6905, maxLat: 40.705, minLng: -74.0035, maxLng: -73.989 }  },
     { point: { lat: 40.6952, lng: -73.9937 }, tier: 1, kind: 'park',       name: 'Brooklyn Heights Promenade', areaSize: 0.014 },
     { point: { lat: 40.6920, lng: -73.9906 }, tier: 1, kind: 'park',       name: 'Cadman Plaza Park',         areaSize: 0.040 },
     { point: { lat: 40.6900, lng: -73.9810 }, tier: 1, kind: 'park',       name: 'Fort Greene Park',          areaSize: 0.120 },
@@ -158,7 +161,7 @@ export const SYNTHETIC_GREEN_SPACES: Record<string, GreenSpace[]> = {
 
   // NYC DUMBO — pocket between bridges, water-bounded.
   '40.703,-73.989': [
-    { point: { lat: 40.7027, lng: -73.9922 }, tier: 1, kind: 'waterfront', name: 'Brooklyn Bridge Park',      areaSize: 0.34  },
+    { point: { lat: 40.7027, lng: -73.9922 }, tier: 1, kind: 'waterfront', name: 'Brooklyn Bridge Park',      areaSize: 0.34, bounds: { minLat: 40.6905, maxLat: 40.705, minLng: -74.0035, maxLng: -73.989 }  },
     { point: { lat: 40.7019, lng: -73.9890 }, tier: 1, kind: 'park',       name: 'Pearl Street Triangle',     areaSize: 0.001 },
     { point: { lat: 40.7045, lng: -73.9870 }, tier: 1, kind: 'park',       name: 'Main Street Park',          areaSize: 0.008 },
     { point: { lat: 40.6972, lng: -73.9858 }, tier: 1, kind: 'park',       name: 'Cadman Plaza Park',         areaSize: 0.040 },
@@ -169,27 +172,27 @@ export const SYNTHETIC_GREEN_SPACES: Record<string, GreenSpace[]> = {
   // 3.4km², runners are typically already inside. The algorithm should
   // route within the park (not detour to streets).
   '40.783,-73.965': [
-    { point: { lat: 40.7829, lng: -73.9654 }, tier: 1, kind: 'park',       name: 'Central Park',              areaSize: 3.41  },
+    { point: { lat: 40.7829, lng: -73.9654 }, tier: 1, kind: 'park',       name: 'Central Park',              areaSize: 3.41, bounds: { minLat: 40.7644, maxLat: 40.8007, minLng: -73.9819, maxLng: -73.9493 }  },
     { point: { lat: 40.7950, lng: -73.9580 }, tier: 1, kind: 'park',       name: 'Central Park North',        areaSize: 0.30  },
     { point: { lat: 40.7710, lng: -73.9740 }, tier: 1, kind: 'park',       name: 'Sheep Meadow',              areaSize: 0.06  },
     { point: { lat: 40.7745, lng: -73.9750 }, tier: 1, kind: 'park',       name: 'The Mall',                  areaSize: 0.025 },
-    { point: { lat: 40.7910, lng: -73.9760 }, tier: 1, kind: 'park',       name: 'Riverside Park',            areaSize: 1.30  },
+    { point: { lat: 40.7910, lng: -73.9760 }, tier: 1, kind: 'park',       name: 'Riverside Park',            areaSize: 1.30, bounds: { minLat: 40.779, maxLat: 40.834, minLng: -73.989, maxLng: -73.947 }  },
   ],
 
   // NYC Hudson River Greenway — the Hudson waterfront path, popular runner
   // corridor. Out-and-back along the river is the canonical case.
   '40.772,-73.993': [
     { point: { lat: 40.7720, lng: -73.9930 }, tier: 1, kind: 'waterfront', name: 'Hudson River Greenway',     areaSize: 0     },
-    { point: { lat: 40.7910, lng: -73.9760 }, tier: 1, kind: 'park',       name: 'Riverside Park',            areaSize: 1.30  },
+    { point: { lat: 40.7910, lng: -73.9760 }, tier: 1, kind: 'park',       name: 'Riverside Park',            areaSize: 1.30, bounds: { minLat: 40.779, maxLat: 40.834, minLng: -73.989, maxLng: -73.947 }  },
     { point: { lat: 40.7830, lng: -73.9854 }, tier: 1, kind: 'park',       name: 'DeWitt Clinton Park',       areaSize: 0.020 },
-    { point: { lat: 40.7660, lng: -73.9920 }, tier: 1, kind: 'waterfront', name: 'Hudson River Park',         areaSize: 0     },
+    { point: { lat: 40.7660, lng: -73.9920 }, tier: 1, kind: 'waterfront', name: 'Hudson River Park',         areaSize: 0, bounds: { minLat: 40.703, maxLat: 40.7745, minLng: -74.0195, maxLng: -73.9925 }     },
     { point: { lat: 40.7677, lng: -73.9870 }, tier: 2, kind: 'park',       name: "Hell's Kitchen Park",       areaSize: 0.005 },
   ],
 
   // NYC Prospect Park (Brooklyn) — second-most popular running park.
   // Start on the loop drive.
   '40.660,-73.969': [
-    { point: { lat: 40.6602, lng: -73.9690 }, tier: 1, kind: 'park',       name: 'Prospect Park',             areaSize: 2.13  },
+    { point: { lat: 40.6602, lng: -73.9690 }, tier: 1, kind: 'park',       name: 'Prospect Park',             areaSize: 2.13, bounds: { minLat: 40.6505, maxLat: 40.6745, minLng: -73.981, maxLng: -73.962 }  },
     { point: { lat: 40.6710, lng: -73.9710 }, tier: 1, kind: 'park',       name: 'Long Meadow',               areaSize: 0.30  },
     { point: { lat: 40.6710, lng: -73.9626 }, tier: 1, kind: 'park',       name: 'Brooklyn Botanic Garden',   areaSize: 0.21  },
     { point: { lat: 40.6677, lng: -73.9716 }, tier: 1, kind: 'park',       name: 'The Nethermead',            areaSize: 0.08  },

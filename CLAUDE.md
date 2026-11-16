@@ -11,7 +11,7 @@
 
 Production hits the **free public** `router.project-osrm.org` endpoint. It is rate-limited and tail-latency-prone. Concrete lessons from past regressions:
 
-- **That endpoint only serves the CAR profile — `/foot/` in the URL is ignored** (verified Nov 2026: `/route/v1/foot/…` and `/route/v1/driving/…` return byte-identical routes at ~25 km/h; a real foot profile returns walking speed and different geometry). Every route this app has generated is a car route: it obeys one-way streets, can use highways/tunnels, and can NOT use park paths, greenways, esplanades, car-free park drives, or boardwalks. Many entries below (highway/tunnel/barrier gates, block-loop and zigzag penalties, "no waterfront paths") are workarounds for car-routing artifacts. See "Routing profile" under the Nov 2026 audit section before changing endpoints — a real foot server (e.g. FOSSGIS `routing.openstreetmap.de/routed-foot`) returns mostly UNNAMED sidewalk steps, which the off-street gate (#35) rejects wholesale.
+- **That endpoint only serves the CAR profile — `/foot/` in the URL is ignored** (verified Nov 2026: `/route/v1/foot/…` and `/route/v1/driving/…` return byte-identical routes at ~25 km/h; a real foot profile returns walking speed and different geometry). Every route this app has generated is a car route: it obeys one-way streets, can use highways/tunnels, and can NOT use park paths, greenways, esplanades, car-free park drives, or boardwalks. Many entries below (highway/tunnel/barrier gates, block-loop and zigzag penalties, "no waterfront paths") are workarounds for car-routing artifacts. See "Routing profile" under the Nov 2026 audit section before changing endpoints — a real foot server (e.g. FOSSGIS `routing.openstreetmap.de/routed-foot`) returns mostly UNNAMED sidewalk steps, which the off-street gate (#35) rejects wholesale. **Migration in progress (#62):** `osrm/running.lua` (walking + bike paths) for a self-hosted server; the app switches per generation via `RUNNING_SERVER` in `lib/osrm.ts`, which is `null` until a server is deployed (car path byte-identical until then). Both free public servers' usage policies say max 1 request/second — this app bursts ~12 and makes ~30 per generation.
 
 - **Total simultaneous request count matters more than per-candidate math.** A change that "only adds 2 parallel calls per candidate" with 7 candidates = 21 simultaneous requests. The endpoint will throttle that burst and return nulls. Keep the steady-state in-flight count ≤ candidate count (currently 7).
 - **The harness does NOT validate against the public endpoint.** `--synthetic` uses mock OSRM (zero latency, zero failure rate). Local OSRM (`--osrm-base http://localhost:5000/...`) has no rate limits. **Neither environment can detect a regression that only manifests under public-OSRM rate limiting.** A "quality bumped X/N → Y/N" number from the harness is a claim about algorithm correctness, NOT about endpoint behavior.
@@ -20,7 +20,7 @@ Production hits the **free public** `router.project-osrm.org` endpoint. It is ra
 
 ### Pre-flight checklist for any change that touches OSRM call patterns (volume, timeout, hedging, caching) or quality gates
 
-1. Run `npm test` and `npm run quality -- --synthetic`. Baselines: ~400/400 unit tests, ~59/60 synthetic harness (the 1 fail is `nyc-les-1mi-loop-quiet`, pre-existing).
+1. Run `npm test` and `npm run quality -- --synthetic`. Baselines: ~410/410 unit tests, ~59/60 synthetic harness (the 1 fail is `nyc-les-1mi-loop-quiet`, pre-existing).
 2. **Run `npm run quality:real`** — exercises every fixture against `router.project-osrm.org` and diffs against `lib/__tests__/fixtures/real-osrm-baseline.json`. Catches the harness/prod gap that `--synthetic` is structurally blind to (real-OSRM dense-grid pathologies, tail latency, rate limiting). Takes ~5 minutes (3s per fixture spacing). Exit code 1 on any regressed fixture. If a regression is real (the algorithm legitimately got worse for a fixture), fix it. If a regression is intended (the algorithm legitimately got better and the baseline is stale), refresh with `npm run quality:real:record`.
 3. **Manually generate ≥5 routes against public OSRM** from the actual app (or a dev build) before committing the change. Cover: a quick repeat (cache hit case), a fresh location (cold case), and a hard case (water-bounded grid like LES or DUMBO). If any route renders as straight lines or obviously degenerate triangles — STOP and investigate; even `quality:real` may not catch this.
 4. Don't ship a perf claim ("X% faster", "wall-clock from A to B") that wasn't measured against the production endpoint. Local/mock numbers are NOT a proxy.
@@ -1238,6 +1238,74 @@ off-street signal inverts; (2) re-tune ROUTING_OVERHEAD (foot routes are
 more direct) and re-check turn/shape gates on sidewalk geometry;
 (3) FOSSGIS usage policy (free, limited use) vs the 12-candidate burst
 pattern. Use local foot OSRM (port 5000) to prototype and measure.
+
+62. **Walking + bike-path routing (self-hosted running profile).** User
+    asked to switch to walking routes and include bike paths. Groundwork
+    shipped behind a switch; production is unchanged until a server exists.
+    **Why a custom server:** both free public routers cap usage at 1
+    request/second (this app: ~30 route + ~7 /nearest calls per generation,
+    ~12 in flight). Stock `foot.lua` (OSRM 26.4) is also a poor running
+    profile: it blocks any carriageway tagged `sidewalk=separate`, so NYC
+    routes are 84–91% unnamed sidewalk ways (no street names, jogs at every
+    crosswalk, retrace hidden across opposite sidewalks), and it drops
+    `highway=cycleway` without `foot=*` — 17% of NY State cycleways,
+    including Hudson River / East River Greenway segments. FOSSGIS's foot
+    profile includes cycleways but prefers sidewalks (same unnamed problem).
+    **`osrm/running.lua`** (build: `osrm/build.sh`, deploy: `osrm/Dockerfile`,
+    notes: `osrm/README.md`): bike paths runnable unless `foot=no`; street
+    centerlines kept routable and sidewalks/crossings weighted 0.8 so routes
+    follow named streets; runner weights (greenway 1.2 — shared-use paths,
+    `foot`-designated cycleways, and car-free park drives, which in OSM are
+    `highway=pedestrian` + `bicycle=designated`; unnamed footways 0.9 so
+    housing-complex cut-throughs must save >10%; primary 0.85, alleys/parking
+    aisles 0.75, steps 0.6, tunnels/indoor 0.5); quadratic turn cost (4s per
+    90°) so grid staircases resolve to fewest turns; only real way types
+    (stock helpers made a `foot=yes` ferry a 1.5km "walk" across the Hudson
+    to Weehawken — fixed); no ferries; classes greenway / path / sidewalk /
+    steps / busy / service on every intersection. Untagged cycleways are
+    runnable but neutral: some are protected on-street lanes (Broadway, Pike
+    St, Tillary St) that shouldn't pull routes onto their avenue.
+    **App changes, all keyed to the profile (car geometry identical 45/45):**
+    `RoutingProfile` + `RUNNING_SERVER` coverage box chosen per generation
+    (`null` → public car router everywhere, as before); ROUTING_OVERHEAD
+    1.25 for running (first-attempt ratio median 1.01; 1.45 would undershoot
+    ~13%); `continue_straight=true` on /route (walking profiles allow U-turns
+    AT via waypoints, so every off-path waypoint became an out-and-back spur:
+    30 → 36/45); class-aware off-street gate — unnamed sidewalk / greenway /
+    busy pieces are public and no longer count, other unnamed pieces are
+    split at intersections; park containment uses Overpass bounding boxes
+    (new `GreenSpace.bounds`) because a centroid circle covers ~⅓ of Hudson
+    River Park or Brooklyn Bridge Park; `maxStreetShare` divides by all
+    distance, not named distance (one named greenway read as 60% of a DUMBO
+    loop that was ⅓ greenway); /nearest cache keyed by endpoint;
+    `pathShare` (greenway + path share) on GeneratedRoute.
+    **Measured** (local servers, 45 NYC fixtures, synthetic greens; synthetic
+    fixtures now carry bounds for 8 big NYC parks): just pointing the
+    unchanged algorithm at the profile 16/45 → profile fixes + class gate +
+    overhead 30 → continue_straight 36 → ferry fix 37–38 → park bounds 39/45
+    (car baseline 41/45). By group: loops ≤7mi car 32/34, running 33/34
+    (fixes greenpoint-4mi, uws-4mi; breaks dumbo-3mi); out-and-back car 5/6,
+    running 6/6; loops >7mi car 4/5, running 0/5. Running routes put a
+    median 16% (mean 25%) of distance on greenways/paths (car: 0 by
+    construction), distance error 3.1% vs 4.0%, but turns/km 2.05 vs 1.40.
+    Tried and reverted: neutral weight for unnamed footways (37/45, no
+    path-share gain).
+    **Harness:** `--profile running` (with `--osrm-base` pointing at a
+    running server), `os=` off-street rejections, `path=` column; off-street
+    rejections in `--dump` traces list the offending pieces. The
+    `greenProximity` metric counts points within 200m of park CENTROIDS, so
+    it can't see a route crossing a big park — use `path=` for foot routes.
+    **Open before production:** (1) a hosted server (user decision; NY State
+    extract needs ~3 GB RAM, HTTPS in front); (2) long loops near water —
+    Columbus 8–30mi pick out-and-backs over one bridge (Queensboro) or one
+    park drive; car routing hid this because a car crosses on separate
+    one-way roadways; (3) dumbo-3mi: geometric waypoints land across the
+    river, the Brooklyn/Manhattan Bridge loop is 8–12km, and distance
+    scaling then drags waypoints into the water (routes collapse to <2km);
+    (4) named interior walks (Stuy Town's "Stuyvesant Walk", "14th Street
+    Loop") pass the name-based part of the off-street gate; (5) the #54
+    /nearest warm-up still warms the car endpoint; (6) pre-flight steps 2–4
+    against the deployed server, incl. ≥5 on-device generations.
 
 ### Recurring-fix discipline
 

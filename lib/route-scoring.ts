@@ -368,12 +368,19 @@ export function shortTurnSegmentRatio(
  *
  * Returns 0 when no step data or all steps unnamed.
  */
-export function maxStreetShare(steps: ManeuverStep[] | undefined): number {
+export function maxStreetShare(steps: ManeuverStep[] | undefined, includeUnnamedInTotal = false): number {
   if (!steps || steps.length === 0) return 0;
   const byName = new Map<string, number>();
   let namedTotal = 0;
   for (const step of steps) {
-    if (!step.name) continue;
+    // Running profile (CLAUDE.md #62): a third or more of a walking route
+    // is unnamed (sidewalks, park paths), so dividing by NAMED distance
+    // alone inflates one named greenway past 50% on ordinary waterfront
+    // loops. With includeUnnamedInTotal the denominator is all distance.
+    if (!step.name) {
+      if (includeUnnamedInTotal) namedTotal += step.distanceM;
+      continue;
+    }
     byName.set(step.name, (byName.get(step.name) ?? 0) + step.distanceM);
     namedTotal += step.distanceM;
   }

@@ -40,6 +40,10 @@ export interface GeneratedRoute {
   // style. Optional because routes loaded from firestore (favorites, run
   // history) predate this field.
   routeStyle?: "loop" | "out-and-back" | "point-to-point"
+  // Share of the route's distance on greenways, bike paths and park/walking
+  // paths. Only set when routing with the self-hosted running profile
+  // (osrm/running.lua); undefined for the public car router.
+  pathShare?: number
   // Turn-by-turn maneuver list, in order. Drives the in-run banner / voice
   // prompts / map arrow. Optional because firestore-loaded routes predate it
   // and because the run UI degrades to "passive tracing" when missing.
