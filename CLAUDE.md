@@ -996,6 +996,55 @@ in-run UX bugs doesn't get the same blind-eye treatment):
     results from errors at the fetch layer — defer until we see real
     user reports of network-related failures.
 
+### Generation latency (Jun 2026)
+
+54. **Serial start-snap before Overpass on the cold path.** Every
+    `generateOSRMRoutes` call snaps the user's start to the nearest road
+    via OSRM `/nearest` (#42), then — only after that resolves — fires the
+    Overpass green-space/highway fetch. On a cold generate (cache not yet
+    warmed by prefetch) this stacked a full /nearest round trip
+    (~0.2–0.7s, more under public-OSRM tail latency) in front of the
+    Overpass fetch for no reason: the two hit DIFFERENT endpoints (OSRM
+    vs Overpass), and the snap moves the center <30m which is immaterial
+    to the km-scale search radius and anchor selection. Fix (two parts):
+    - `lib/osrm.ts`: compute `radiusKm` from the input center, then fire
+      `fetchOSRMNearest(center)` and `fetchGreenSpacesAndHighways(center,
+      radiusKm)` together via `Promise.all`. Apply the snap result
+      afterward. This adds ZERO peak OSRM-route concurrency — no candidate
+      route calls are in flight during step 1, so the rate-limit envelope
+      CLAUDE.md guards is untouched. Pure wall-clock win on the cold path.
+    - `app/index.tsx`: call `fetchOSRMNearest(center)` (fire-and-forget,
+      never rejects) alongside the existing Overpass prefetch + OSRM
+      prewarm, both on GPS-lock (`ctx.center`) and on map-pan settle.
+      `fetchOSRMNearest` caches by rounded coord, so the generate-time
+      snap becomes a cache hit (≈0ms) on the warm path — removing the
+      call from the critical path entirely for the common case where the
+      user spends a few seconds adjusting distance before tapping
+      Generate.
+    What's NOT in this change: candidate count (still 12), launch stagger
+    (150ms), OSRM timeout (8s), resolution budget (18s), and the
+    distance-adjustment retry count (5) are all untouched — those are the
+    big OSRM-volume levers CLAUDE.md gates behind the public-OSRM
+    pre-flight checklist (which requires manual generation against the
+    real endpoint, not just the harness). Reducing any of them could cut
+    wall-clock further but risks the documented rate-limit / quality
+    regressions; don't touch them without running the checklist. A
+    further safe-ish win not taken here: the macro-snap / corridor-loop
+    candidate builders run their geometric-vertex /nearest snaps serially
+    inside the candidate-building loop (gated by the sequential
+    `usedParkPoints` diversity filter). Batching those snaps would shave
+    cold-path time but is more invasive and shifts /nearest timing, so it
+    needs the checklist too.
+    Verification (Nov 2026, at commit): `npm test` 384/384;
+    `npm run quality -- --synthetic` 59/60 (the known
+    `nyc-les-1mi-loop-quiet`). `quality:real` only runs from the dev Mac
+    with `NODE_USE_ENV_PROXY=1` (Claude Code sandbox proxy) and was
+    inconclusive: every Overpass mirror failed, so all 60 fixtures took
+    the geometric-fallback path (57/60; fails: les-3mi-quiet stub,
+    columbus-15mi/30mi retrace), and `real-osrm-baseline.json` has been
+    `{}` since 2026-05-11, so nothing was diffed. The ≥5-route manual
+    check (step 3) happens on-device via the OTA update that ships this.
+
 ### Recurring-fix discipline
 
 User explicitly called out (May 2026) that the same class of bug ("route

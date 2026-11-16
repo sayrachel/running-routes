@@ -25,7 +25,7 @@ import { RouteMap } from '@/components/RouteMap';
 import { ProfileDrawer } from '@/components/ProfileDrawer';
 import { useAppContext, type RouteStyle, type RunPreferences } from '@/lib/AppContext';
 import { distanceUnit } from '@/lib/units';
-import { generateOSRMRoutes, prewarmOSRMConnection, OSRMUnavailableError, getLastFailureDiagnostics } from '@/lib/osrm';
+import { generateOSRMRoutes, prewarmOSRMConnection, fetchOSRMNearest, OSRMUnavailableError, getLastFailureDiagnostics } from '@/lib/osrm';
 import { findMatchingHistoricalRoute } from '@/lib/route-history';
 import { isDevUser } from '@/lib/dev-mode';
 import * as Updates from 'expo-updates';
@@ -311,6 +311,13 @@ export default function SetupScreen() {
     if (ctx.center) {
       prefetchGreenSpacesAndHighways(ctx.center);
       prewarmOSRMConnection(ctx.center);
+      // Warm the start-snap cache (CLAUDE.md #54). generateOSRMRoutes snaps
+      // the start to the nearest road via OSRM /nearest on every call;
+      // fetchOSRMNearest caches by rounded coord, so firing it here turns
+      // the generate-time snap into a cache hit (≈0ms). Fire-and-forget —
+      // the function never rejects (falls back to the input coord on
+      // failure), but .catch keeps lint/Promise hygiene clean.
+      fetchOSRMNearest(ctx.center).catch(() => {});
       // Wait briefly for the prefetch to settle before persisting.
       // 5s comfortably covers a typical Overpass round trip even on
       // public mirrors with tail latency, and persistOverpassCache is
@@ -344,6 +351,9 @@ export default function SetupScreen() {
       if (distFromLast < 0.5 || distFromCenter < 0.5) return;
       lastPrewarmRef.current = newCenter;
       prefetchGreenSpacesAndHighways(newCenter);
+      // Warm the start-snap cache for the panned-to region too (CLAUDE.md
+      // #54) so a Generate there hits a cached /nearest result.
+      fetchOSRMNearest(newCenter).catch(() => {});
       // Persist after prefetch settles (same 5s window as ctx.center prewarm).
       setTimeout(() => persistOverpassCache(), 5000);
     }, 800);

@@ -3317,17 +3317,30 @@ export async function generateOSRMRoutes(
   // (typically <30m and visually indistinguishable from GPS error).
   // Falls through to the original center on /nearest failure so this
   // never blocks generation.
-  const snappedCenter = await fetchOSRMNearest(center);
+  //
+  // LATENCY (CLAUDE.md #54): the /nearest snap and the Overpass round trip
+  // are fired CONCURRENTLY rather than serially. The snap hits a different
+  // endpoint (OSRM /nearest) than the green-space/highway fetch (Overpass),
+  // so running them together adds zero peak OSRM-route concurrency — the
+  // rate-limit concern CLAUDE.md guards is unaffected (no candidate route
+  // calls are in flight yet). The search radius is computed from the input
+  // center; the snap moves it <30m, immaterial at the km radius scale, so
+  // the Overpass result is identical whether keyed on input or snapped
+  // center. This removes one serial /nearest round trip (~0.2–0.7s, more
+  // under load) from the cold critical path.
+  // Step 1: Fetch enriched green spaces and highway segments in a single
+  // Overpass round trip (shared across all candidates).
+  const radiusKm = calculateSearchRadius(routeType, distanceKm, center, end);
+  const [snappedCenter, overpassResult] = await Promise.all([
+    fetchOSRMNearest(center),
+    fetchGreenSpacesAndHighways(center, radiusKm),
+  ]);
   const centerSnapKm = haversineDistance(center, snappedCenter);
   if (centerSnapKm > 0) {
     traceEmit('start-snap', { input: center, snapped: snappedCenter, distanceM: centerSnapKm * 1000 });
   }
   center = snappedCenter;
-
-  // Step 1: Fetch enriched green spaces and highway segments in a single
-  // Overpass round trip (shared across all candidates).
-  const radiusKm = calculateSearchRadius(routeType, distanceKm, center, end);
-  const { greenSpaces: rawGreenSpaces, highwayPoints } = await fetchGreenSpacesAndHighways(center, radiusKm);
+  const { greenSpaces: rawGreenSpaces, highwayPoints } = overpassResult;
   // Refresh exclusion: drop green spaces within 0.5km of any anchor used by
   // the previously-shown route. Forces the sectoring/scoring to pick a
   // different park set, which in turn produces different waypoints, which
