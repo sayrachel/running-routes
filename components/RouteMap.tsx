@@ -12,6 +12,7 @@ import { Ionicons } from '@expo/vector-icons';
 import type { GeneratedRoute, RoutePoint, ManeuverStep } from '@/lib/route-generator';
 import { Colors } from '@/lib/theme';
 import { simplifyRDP } from '@/lib/gps-simplify';
+import { MapboxAttribution } from '@/components/MapboxAttribution';
 
 /** Perpendicular-distance tolerance for the live GPS polyline simplifier.
  *  Vertices whose offset from the line through their neighbors is below
@@ -215,6 +216,9 @@ function RouteMapImpl({ center, routes, selectedRouteId, gpsTrack, currentPositi
           </Marker>
         )}
       </MapView>
+
+      {/* Mapbox-routed route on screen → Mapbox attribution (CLAUDE.md #64). */}
+      {selectedRoute?.source === 'mapbox' && <MapboxAttribution />}
 
       {routes.length === 0 && !gpsTrack?.length && (
         <View style={styles.emptyOverlay}>

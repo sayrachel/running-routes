@@ -11,7 +11,7 @@
 
 Production hits the **free public** `router.project-osrm.org` endpoint. It is rate-limited and tail-latency-prone. Concrete lessons from past regressions:
 
-- **That endpoint only serves the CAR profile — `/foot/` in the URL is ignored** (verified Nov 2026: `/route/v1/foot/…` and `/route/v1/driving/…` return byte-identical routes at ~25 km/h; a real foot profile returns walking speed and different geometry). Every route this app has generated is a car route: it obeys one-way streets, can use highways/tunnels, and can NOT use park paths, greenways, esplanades, car-free park drives, or boardwalks. Many entries below (highway/tunnel/barrier gates, block-loop and zigzag penalties, "no waterfront paths") are workarounds for car-routing artifacts. See "Routing profile" under the Nov 2026 audit section before changing endpoints — a real foot server (e.g. FOSSGIS `routing.openstreetmap.de/routed-foot`) returns mostly UNNAMED sidewalk steps, which the off-street gate (#35) rejects wholesale. **Migration in progress (#62, #63):** the user will NOT self-host a server (personal project); the candidate walking router is Mapbox Directions `mapbox/walking` (free tier, OSRM-shaped responses, token in gitignored `.env.local` as `EXPO_PUBLIC_MAPBOX_TOKEN`), not yet wired into the app. Everything walking-specific is keyed to `isWalkingProfile()` (`'running'` = osrm/running.lua, `'walking'` = Mapbox-style router without running classes); production stays on the car router until then and car geometry is byte-identical. Both free public OSRM servers' usage policies say max 1 request/second — this app bursts ~12 and makes ~30 per generation (walking loops ~36, #63).
+- **That endpoint only serves the CAR profile — `/foot/` in the URL is ignored** (verified Nov 2026: `/route/v1/foot/…` and `/route/v1/driving/…` return byte-identical routes at ~25 km/h; a real foot profile returns walking speed and different geometry). Every route this app has generated is a car route: it obeys one-way streets, can use highways/tunnels, and can NOT use park paths, greenways, esplanades, car-free park drives, or boardwalks. Many entries below (highway/tunnel/barrier gates, block-loop and zigzag penalties, "no waterfront paths") are workarounds for car-routing artifacts. See "Routing profile" under the Nov 2026 audit section before changing endpoints — a real foot server (e.g. FOSSGIS `routing.openstreetmap.de/routed-foot`) returns mostly UNNAMED sidewalk steps, which the off-street gate (#35) rejects wholesale. **Walking routes now come from Mapbox (#62–#64):** the user will NOT self-host a server (personal project). When the bundle has a token (`EXPO_PUBLIC_MAPBOX_TOKEN` in gitignored `.env.local`, inlined by Expo at export, so `eas update` must run from a checkout that has the file), generation, favorites re-fetch and in-run reroutes use Mapbox Directions `mapbox/walking` (OSRM-shaped responses, no /nearest, terms bar storing/exporting results; see #64). Without a token (jest, harness, CI) the default is the public car router below, unchanged. Everything walking-specific is keyed to `isWalkingProfile()` (`'running'` = osrm/running.lua, `'walking'` = Mapbox-style router without running classes); car geometry is byte-identical. Both free public OSRM servers' usage policies say max 1 request/second — this app bursts ~12 and makes ~30 per generation (walking loops ~36, #63).
 
 - **Total simultaneous request count matters more than per-candidate math.** A change that "only adds 2 parallel calls per candidate" with 7 candidates = 21 simultaneous requests. The endpoint will throttle that burst and return nulls. Keep the steady-state in-flight count ≤ candidate count (currently 7).
 - **The harness does NOT validate against the public endpoint.** `--synthetic` uses mock OSRM (zero latency, zero failure rate). Local OSRM (`--osrm-base http://localhost:5000/...`) has no rate limits. **Neither environment can detect a regression that only manifests under public-OSRM rate limiting.** A "quality bumped X/N → Y/N" number from the harness is a claim about algorithm correctness, NOT about endpoint behavior.
@@ -20,7 +20,7 @@ Production hits the **free public** `router.project-osrm.org` endpoint. It is ra
 
 ### Pre-flight checklist for any change that touches OSRM call patterns (volume, timeout, hedging, caching) or quality gates
 
-1. Run `npm test` and `npm run quality -- --synthetic`. Baselines: ~423/423 unit tests, ~59/60 synthetic harness (the 1 fail is `nyc-les-1mi-loop-quiet`, pre-existing).
+1. Run `npm test` and `npm run quality -- --synthetic`. Baselines: ~432/432 unit tests, ~59/60 synthetic harness (the 1 fail is `nyc-les-1mi-loop-quiet`, pre-existing).
 2. **Run `npm run quality:real`** — exercises every fixture against `router.project-osrm.org` and diffs against `lib/__tests__/fixtures/real-osrm-baseline.json`. Catches the harness/prod gap that `--synthetic` is structurally blind to (real-OSRM dense-grid pathologies, tail latency, rate limiting). Takes ~5 minutes (3s per fixture spacing). Exit code 1 on any regressed fixture. If a regression is real (the algorithm legitimately got worse for a fixture), fix it. If a regression is intended (the algorithm legitimately got better and the baseline is stale), refresh with `npm run quality:real:record`.
 3. **Manually generate ≥5 routes against public OSRM** from the actual app (or a dev build) before committing the change. Cover: a quick repeat (cache hit case), a fresh location (cold case), and a hard case (water-bounded grid like LES or DUMBO). If any route renders as straight lines or obviously degenerate triangles — STOP and investigate; even `quality:real` may not catch this.
 4. Don't ship a perf claim ("X% faster", "wall-clock from A to B") that wasn't measured against the production endpoint. Local/mock numbers are NOT a proxy.
@@ -1370,14 +1370,74 @@ pattern. Use local foot OSRM (port 5000) to prototype and measure.
     attempts; 27% of candidates use all 5). Ablation with the final stub trim:
     repair off 44/45 + 43/45 at 29 calls; ≥150m only 44/45 + 45/45 at 33;
     ≥80m (chosen) 45/45 + 45/45 at 36.
-    **Open:** wire Mapbox in (URL builder + token, no /nearest — skip snapping
-    or use returned waypoint locations, `alternatives=true` boolean only,
-    on-device check); Mapbox terms changes (no persisted route cache
-    (osrm-persist), favorites store waypoints and re-route on open, GPX export
-    off for Mapbox routes, Mapbox logo + © Mapbox © OpenStreetMap under the
-    map); route names still credit an anchor a detour repair moved away from;
+    **Open:** ~~wire Mapbox in; Mapbox terms changes~~ (done in #64); route names still credit an anchor a detour repair moved away from;
     Mapbox walking ignores greenways (`walkway_bias=1` changed nothing on
     W 14th→W 34th), so path share relies on anchors.
+
+64. **Mapbox Directions wired in as the production walking router.** User
+    approved Mapbox (#63) plus the terms changes below.
+    **Backend:** `EXPO_PUBLIC_MAPBOX_TOKEN` set → default backend
+    `https://api.mapbox.com/directions/v5/mapbox/walking`, profile `'walking'`;
+    unset → public car router as before. `setOSRMBase(url)` still overrides
+    (harness `--osrm-base`); `isMapboxBackend()` / `isMapboxUrl()` gate
+    everything Mapbox-specific. `withAuth` adds `access_token` to api.mapbox.com
+    URLs only. /nearest is skipped (returns the input: Mapbox snaps waypoints
+    itself; saves the start snap + geometric-vertex snaps). `alternatives=true`
+    (Mapbox takes a boolean, ≤2 alternatives). Prewarm opens the connection
+    with an unauthenticated request (401, not billed). Post-run /match (#49)
+    stays on public OSRM.
+    **Mapbox terms** (no caching/storing/exporting results, attribution):
+    - The 30-day AsyncStorage route cache (osrm-persist) never holds Mapbox
+      responses: `dumpOSRMCache` drops Mapbox URLs, `loadOSRMCache` skips them.
+      The in-memory session cache and the 5-route in-memory history (refresh
+      fallback) still hold them until the app closes.
+    - Routes carry `source: 'mapbox'` and the request `waypoints`
+      (`GeneratedRoute`). Favorites of Mapbox routes store waypoints, not
+      points; `FavoritePreview` re-fetches with `fetchRouteThroughWaypoints`
+      (one request + step-3 polyline cleanup; nothing drawn while it loads or
+      if it fails). `addFavoriteRoute` strips undefined fields (Firestore
+      setDoc rejects them; free-run favorites already sent `points: undefined`).
+      The startup favorites cache mapping passes waypoints/source too.
+    - GPX export off (`canExportGpx`; `generateGpx` throws). Open in Google
+      Maps sends the waypoints, so Google computes its own route.
+    - `MapboxAttribution`: Mapbox logo + "© Mapbox" (mapbox.com/about/maps) +
+      "© OpenStreetMap" (openstreetmap.org/about), top-left over the map
+      while the selected route is from Mapbox (bottom sheets cover the bottom).
+      Logo PNGs rendered from Mapbox's official SVG (`assets/mapbox-logo*.png`).
+    - In-run reroutes (#46) take `source` from `fetchInRunRoute` and get
+      waypoints `[pos, destination]`, so a reroute from Mapbox follows the
+      same rules even if the original route didn't.
+    - Saved runs store only the user's GPS track (unchanged).
+    - p2p alternative candidates on Mapbox get waypoints
+      `[start, alternativeViaPoint(alt, primary), end]` (the alternative's
+      point farthest from the primary route); `[start, end]` alone would
+      re-fetch the primary route.
+    **Measured** (production code path, real Mapbox, no proxy, 4 fixtures):
+    East Village 3mi loop, Columbus 5mi, DUMBO 3mi, East Village 3mi out —
+    4/4 pass, 22–46 requests (mean 33), 2.0–2.6s per generation. Without the
+    token: synthetic 59/60 (known les-1mi), unit tests 432/432. `expo export`
+    from the dev Mac logs `env: load .env.local .env`; the bundle contains the
+    token and the logo assets. Favorite re-fetch (cold cache, 1 request) of an
+    East Village 3mi loop redrew the shown route exactly (100% of points
+    within 25m both ways; `/tmp/rr-tools/fav-refetch.ts`).
+    **Mapbox walking returned no alternatives** for three NYC pairs (3.8,
+    5.5, 9.1km; `alternatives=true` → 1 route). p2p refresh skips the direct
+    candidate, so its variety comes from green-space candidates only; with
+    none, refresh falls back to route history or the "Couldn't find a
+    different route" banner (car OSRM usually returned alternatives).
+    **Quota:** without a card, 10k Directions requests/month (~300
+    generations at ~33 each), 300/min. Adding a card raises the free tier to
+    100k and then bills $2/1k with no spend cap.
+    **Spot-check command** (≤10 fixtures, terms bar bulk automated queries):
+    `EXPO_PUBLIC_MAPBOX_TOKEN=$(sed -n 's/^EXPO_PUBLIC_MAPBOX_TOKEN=//p' .env.local) NODE_USE_ENV_PROXY=1 npx tsx lib/__tests__/route-quality-harness.ts --synthetic --no-mock-osrm --no-snapshot --timing --only <fixture>`.
+    `--timing` counts `/directions/` as route calls; Mapbox routes print a
+    `[mapbox]` line. `quality:real` still targets the public car router, so
+    it no longer measures production.
+    **Open:** on-device check (pre-flight step 3) via OTA; Firestore console
+    rules (not in the repo) may reject the new favorite fields if they
+    validate keys; Mapbox walking ignores greenways (path share relies on
+    anchors); route names may credit an anchor a detour repair moved away from;
+    p2p refresh variety without alternatives (above).
 
 ### Recurring-fix discipline
 

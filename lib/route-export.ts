@@ -17,9 +17,13 @@ function sampleWaypoints(points: RoutePoint[], maxWaypoints: number): RoutePoint
 
 /**
  * Build a Google Maps Directions URL from a route.
+ *
+ * Mapbox routes (CLAUDE.md #64) hand Google the route's own waypoints — the
+ * inputs we sent Mapbox — instead of points sampled from Mapbox's polyline,
+ * which its terms don't let us export.
  */
 export function buildGoogleMapsUrl(route: GeneratedRoute): string {
-  const pts = route.points;
+  const pts = route.source === 'mapbox' ? route.waypoints ?? [] : route.points;
   if (pts.length < 2) return '';
 
   const origin = `${pts[0].lat},${pts[0].lng}`;
@@ -43,10 +47,17 @@ export function buildGoogleMapsUrl(route: GeneratedRoute): string {
   return `https://www.google.com/maps/dir/?${params.toString()}`;
 }
 
+/** GPX export is off for Mapbox routes: Mapbox's terms bar exporting its
+ *  results (CLAUDE.md #64). */
+export function canExportGpx(route: GeneratedRoute): boolean {
+  return route.source !== 'mapbox';
+}
+
 /**
  * Generate a GPX XML string from a route.
  */
 export function generateGpx(route: GeneratedRoute): string {
+  if (!canExportGpx(route)) throw new Error('GPX export is not available for Mapbox routes');
   const timestamp = new Date().toISOString();
 
   const trackpoints = route.points

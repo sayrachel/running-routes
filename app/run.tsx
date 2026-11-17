@@ -193,7 +193,11 @@ export default function RunScreen() {
         terrain: (ctx.selectedRoute?.terrain as 'Loop' | 'Out & Back' | 'Point to Point') || 'Loop',
         lat: ctx.center.lat,
         lng: ctx.center.lng,
-        points: ctx.selectedRoute?.points,
+        // Mapbox routes can't be stored (CLAUDE.md #64): keep the request
+        // waypoints and let the preview re-fetch the route.
+        ...(ctx.selectedRoute?.source === 'mapbox'
+          ? { waypoints: ctx.selectedRoute.waypoints, source: 'mapbox' as const }
+          : { points: ctx.selectedRoute?.points }),
       });
     }
   }, [ctx, isFavorited, favId, tracking.stats.totalDistanceKm]);
@@ -275,6 +279,10 @@ export default function RunScreen() {
         steps: result.steps,
         distance: newDistanceMiles,
         anchorPoints: undefined,
+        // The new geometry's router decides the Mapbox rules (#64), not the
+        // original route's: a favorite of the reroute re-fetches pos → destination.
+        source: result.source,
+        waypoints: result.source === 'mapbox' ? [pos, destination] : undefined,
       };
       // Reroute path: replace selectedRoute. The route-change useEffect
       // above will clear turnStateRef / recalcSteps / offRouteStateRef.

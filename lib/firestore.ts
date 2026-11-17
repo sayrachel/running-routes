@@ -112,7 +112,11 @@ export async function addFavoriteRoute(
 ): Promise<string> {
   const colRef = collection(db, 'users', userId, 'favorites');
   const docRef = doc(colRef);
-  await setDoc(docRef, fav);
+  // Firestore rejects `undefined` field values (no ignoreUndefinedProperties),
+  // and optional fields are often absent: `points` for Mapbox routes and free
+  // runs, `waypoints` / `source` for everything else.
+  const clean = Object.fromEntries(Object.entries(fav).filter(([, v]) => v !== undefined));
+  await setDoc(docRef, clean);
   return docRef.id;
 }
 
@@ -200,7 +204,7 @@ export async function deleteUserData(userId: string): Promise<void> {
  *  favorites" message. */
 export async function migrateGuestDataToFirestore(
   userId: string,
-  favorites: { routeName: string; distance: number; terrain: 'Loop' | 'Out & Back' | 'Point to Point'; lat: number; lng: number; points?: { lat: number; lng: number }[]; createdAt?: number }[],
+  favorites: { routeName: string; distance: number; terrain: 'Loop' | 'Out & Back' | 'Point to Point'; lat: number; lng: number; points?: { lat: number; lng: number }[]; waypoints?: { lat: number; lng: number }[]; source?: 'mapbox'; createdAt?: number }[],
   runHistory: Omit<RunRecord, 'id'>[],
 ): Promise<{ favoritesUploaded: number; runsUploaded: number; failures: number }> {
   let favoritesUploaded = 0;
@@ -216,6 +220,8 @@ export async function migrateGuestDataToFirestore(
         lat: fav.lat,
         lng: fav.lng,
         points: fav.points,
+        waypoints: fav.waypoints,
+        source: fav.source,
         createdAt: fav.createdAt ?? Date.now(),
       });
       favoritesUploaded++;

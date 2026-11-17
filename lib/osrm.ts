@@ -6,7 +6,30 @@ import { emit as traceEmit } from './debug-trace';
 import { isPopularRunningPark } from './popular-running-parks';
 
 const OSRM_BASE_DEFAULT = 'https://router.project-osrm.org/route/v1/foot';
-let osrmBase = OSRM_BASE_DEFAULT;
+
+/** Mapbox Directions walking (CLAUDE.md #64) — the hosted walking router.
+ *  When EXPO_PUBLIC_MAPBOX_TOKEN is set at bundle time (gitignored
+ *  .env.local), every generation routes through it with the 'walking'
+ *  profile; without a token the app keeps the public car router. Mapbox
+ *  speaks the OSRM v5 response format, so the same parsing applies; it has
+ *  no /nearest or /match service (see fetchOSRMNearest / fetchOSRMMapMatch).
+ *  Its terms bar caching, storing or exporting results: the persisted route
+ *  cache skips Mapbox responses, favorites keep waypoints instead of the
+ *  polyline, and GPX export is off for Mapbox routes. */
+const MAPBOX_TOKEN: string = process.env.EXPO_PUBLIC_MAPBOX_TOKEN ?? '';
+const MAPBOX_API = 'https://api.mapbox.com/';
+const MAPBOX_WALKING_BASE = `${MAPBOX_API}directions/v5/mapbox/walking`;
+export function isMapboxUrl(url: string): boolean {
+  return url.startsWith(MAPBOX_API);
+}
+/** Append the access token at request time, so it never appears in cache
+ *  keys, traces or logs. */
+function withAuth(url: string): string {
+  if (!isMapboxUrl(url) || !MAPBOX_TOKEN) return url;
+  return `${url}${url.includes('?') ? '&' : '?'}access_token=${encodeURIComponent(MAPBOX_TOKEN)}`;
+}
+
+let osrmBase = MAPBOX_TOKEN ? MAPBOX_WALKING_BASE : OSRM_BASE_DEFAULT;
 
 /** Which OSRM profile the configured endpoint serves.
  *  - 'car': the public router.project-osrm.org, which ignores /foot/ and
@@ -19,7 +42,12 @@ let osrmBase = OSRM_BASE_DEFAULT;
  *    sidewalks carry their street's name, park paths are unnamed.
  *  Calibration constants that depend on the profile are switched here. */
 export type RoutingProfile = 'car' | 'running' | 'walking';
-let routingProfile: RoutingProfile = 'car';
+let routingProfile: RoutingProfile = MAPBOX_TOKEN ? 'walking' : 'car';
+
+/** True when the configured router is Mapbox (routes may not be stored). */
+export function isMapboxBackend(): boolean {
+  return isMapboxUrl(osrmBase);
+}
 
 /** Both walking profiles. Streets work in both directions on foot, so loop
  *  geometry, waypoint-detour repair and some quality gates differ from the
@@ -49,7 +77,14 @@ let osrmBaseOverridden = false;
  *  limits). Production leaves it null and uses the public router. */
 export function setOSRMBase(url: string | null, profile: RoutingProfile = 'car'): void {
   osrmBaseOverridden = url !== null;
-  applyRoutingBackend(url ?? OSRM_BASE_DEFAULT, url ? profile : 'car');
+  if (url) applyRoutingBackend(url, profile);
+  else applyDefaultBackend();
+}
+
+/** Mapbox walking when a token is configured, else the public car router. */
+function applyDefaultBackend(): void {
+  if (MAPBOX_TOKEN) applyRoutingBackend(MAPBOX_WALKING_BASE, 'walking');
+  else applyRoutingBackend(OSRM_BASE_DEFAULT, 'car');
 }
 
 function applyRoutingBackend(base: string, profile: RoutingProfile): void {
@@ -66,7 +101,7 @@ function selectRoutingBackend(start: RoutePoint): void {
     && start.lng >= c.minLng && start.lng <= c.maxLng) {
     applyRoutingBackend(RUNNING_SERVER.base, 'running');
   } else {
-    applyRoutingBackend(OSRM_BASE_DEFAULT, 'car');
+    applyDefaultBackend();
   }
 }
 export function getRoutingProfile(): RoutingProfile {
@@ -146,7 +181,7 @@ const ROUTING_OVERHEAD_BY_PROFILE: Record<RoutingProfile, number> = {
   running: 1.25,
   walking: 1.25,
 };
-let ROUTING_OVERHEAD = ROUTING_OVERHEAD_BY_PROFILE.car;
+let ROUTING_OVERHEAD = ROUTING_OVERHEAD_BY_PROFILE[routingProfile];
 
 // ---------------------------------------------------------------------------
 // Geometry helpers
@@ -2350,7 +2385,7 @@ async function fetchWithRetry(url: string, retries = 1): Promise<Response> {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), OSRM_TIMEOUT_MS);
       try {
-        const res = await fetch(url, { signal: controller.signal });
+        const res = await fetch(withAuth(url), { signal: controller.signal });
         if (res.ok || res.status < 500) return res;
       } finally {
         clearTimeout(timeout);
@@ -2442,6 +2477,10 @@ interface ResolvedCandidate {
   steps?: ManeuverStep[];
   /** Running profile only: share of distance on greenways + paths. */
   pathShare?: number;
+  /** Waypoints of the request that produced `points` (after distance
+   *  adjustment / detour repair). Mapbox routes carry these instead of a
+   *  stored polyline (CLAUDE.md #64). */
+  waypoints?: RoutePoint[];
 }
 
 /**
@@ -3007,6 +3046,12 @@ export function prewarmOSRMConnection(center: RoutePoint): void {
   // Tiny ~110m route (1° lat ≈ 111km, so 0.001° ≈ 110m) — minimal OSRM
   // compute, just enough to establish the connection. Skip when mocked.
   if (osrmMockEnabled) return;
+  // Mapbox bills every authenticated request, so warm the TLS connection
+  // with an unauthenticated one instead (answered 401, not billed).
+  if (isMapboxBackend()) {
+    fetch(MAPBOX_WALKING_BASE).catch(() => {});
+    return;
+  }
   const wp1 = `${center.lng},${center.lat}`;
   const wp2 = `${center.lng},${center.lat + 0.001}`;
   const url = `${osrmBase}/${wp1};${wp2}?overview=false`;
@@ -3025,12 +3070,15 @@ export interface OSRMSnapshot {
 }
 
 export function dumpOSRMCache(): OSRMSnapshot {
-  return { routes: Array.from(osrmRouteCache.entries()) };
+  // Never export Mapbox responses (CLAUDE.md #64: its terms bar storing
+  // results) — this snapshot is what osrm-persist writes to AsyncStorage
+  // and what the harness records.
+  return { routes: Array.from(osrmRouteCache.entries()).filter(([url]) => !isMapboxUrl(url)) };
 }
 
 export function loadOSRMCache(snapshot: Partial<OSRMSnapshot>): void {
   if (snapshot.routes) {
-    for (const [k, v] of snapshot.routes) osrmRouteCache.set(k, v);
+    for (const [k, v] of snapshot.routes) if (!isMapboxUrl(k)) osrmRouteCache.set(k, v);
   }
 }
 
@@ -3367,6 +3415,10 @@ export async function fetchOSRMNearest(point: RoutePoint): Promise<RoutePoint> {
     return cached;
   }
 
+  // Mapbox has no /nearest; its Directions API snaps every waypoint to the
+  // nearest walkable way itself, so skip the extra request (CLAUDE.md #64).
+  if (isMapboxBackend()) return point;
+
   // Derive the /nearest endpoint from the configured /route base. Same
   // OSRM server, just a different service path. number=1 returns just the
   // single closest road point.
@@ -3422,7 +3474,7 @@ export async function snapWaypointsToRoad(points: RoutePoint[]): Promise<RoutePo
  */
 export async function fetchInRunRoute(
   waypoints: RoutePoint[],
-): Promise<{ points: RoutePoint[]; distanceMeters: number; steps: ManeuverStep[] | undefined } | null> {
+): Promise<{ points: RoutePoint[]; distanceMeters: number; steps: ManeuverStep[] | undefined; source?: 'mapbox' } | null> {
   if (waypoints.length < 2) return null;
   const route = await fetchOSRMRoute(waypoints);
   if (!route) return null;
@@ -3432,7 +3484,40 @@ export async function fetchInRunRoute(
     points,
     distanceMeters: route.distance,
     steps: extractManeuvers(route),
+    // Mapbox geometry carries the same display / storage rules as generated
+    // routes (#64): attribution on the map, favorites keep waypoints only.
+    ...(isMapboxBackend() ? { source: 'mapbox' as const } : {}),
   };
+}
+
+/**
+ * Re-fetch a saved route from its waypoints (CLAUDE.md #64). Mapbox routes
+ * can't be stored, so favorites keep the request waypoints and the preview
+ * re-routes them — one request — then applies the same polyline cleanup as
+ * generation's step 3 (lollipop, stub, pendant-loop and retraced-spur trims;
+ * the final stub pass on walking profiles). Same router + same waypoints
+ * gives the same route unless the map data changed. Null on failure.
+ */
+export async function fetchRouteThroughWaypoints(
+  waypoints: RoutePoint[],
+  routeType: 'loop' | 'out-and-back' | 'point-to-point',
+): Promise<{ points: RoutePoint[]; distanceKm: number } | null> {
+  if (waypoints.length < 2) return null;
+  const route = await fetchOSRMRoute(waypoints);
+  if (!route) return null;
+  let points: RoutePoint[] = route.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }));
+  if (points.length < 2) return null;
+  if (routeType !== 'out-and-back') {
+    const stubThresholdKm = Math.min(0.30, (route.distance / 1000) * 0.08);
+    points = removeSelfintersections(points);
+    points = trimStubs(points, stubThresholdKm);
+    points = trimPendantLoops(points);
+    points = trimRetracedSpurs(points, 50);
+    if (isWalkingProfile()) points = trimStubs(points, stubThresholdKm);
+  }
+  let distanceKm = 0;
+  for (let k = 1; k < points.length; k++) distanceKm += haversineDistance(points[k - 1], points[k]);
+  return { points, distanceKm };
 }
 
 /**
@@ -3465,7 +3550,10 @@ export async function fetchOSRMMapMatch(
   const coordsStr = coordinates
     .map((p) => `${p.lng.toFixed(6)},${p.lat.toFixed(6)}`)
     .join(';');
-  const matchBase = osrmBase.replace('/route/', '/match/');
+  // Mapbox has no OSRM-style /match; recorded runs keep matching against the
+  // public OSRM endpoint as before (CLAUDE.md #64). The track is the user's
+  // own data, so storing the matched result raises no Mapbox-terms issue.
+  const matchBase = (isMapboxBackend() ? OSRM_BASE_DEFAULT : osrmBase).replace('/route/', '/match/');
   const url = `${matchBase}/${coordsStr}?overview=full&geometries=geojson&tidy=true`;
 
   try {
@@ -3514,6 +3602,32 @@ const osrmAlternativesCache = new Map<string, OSRMRoute[]>();
  * fetchOSRMRoute would return), routes[1+] are the alternatives. Returns
  * empty array on network failure.
  */
+/**
+ * Via point that reproduces an alternative route (CLAUDE.md #64): the point
+ * of `alt` farthest from the primary route, i.e. on the streets where the
+ * alternative differs. Falls back to the alternative's middle point when it
+ * never leaves the primary by 30m. Samples ~60 points of `alt`; stops
+ * scanning `primary` for a sample as soon as it's within 30m.
+ */
+export function alternativeViaPoint(alt: OSRMRoute, primary: OSRMRoute | undefined): RoutePoint {
+  const altPts: RoutePoint[] = alt.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }));
+  const mid = altPts[Math.floor(altPts.length / 2)];
+  if (!primary) return mid;
+  const primPts: RoutePoint[] = primary.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }));
+  const stride = Math.max(1, Math.floor(altPts.length / 60));
+  let best = mid;
+  let bestD = 0;
+  for (let i = stride; i < altPts.length - 1; i += stride) {
+    let d = Infinity;
+    for (const q of primPts) {
+      d = Math.min(d, haversineDistance(altPts[i], q));
+      if (d < 0.03) break;
+    }
+    if (d > bestD) { bestD = d; best = altPts[i]; }
+  }
+  return bestD >= 0.03 ? best : mid;
+}
+
 async function fetchOSRMRouteAlternatives(
   waypoints: RoutePoint[],
   alternativesCount: number,
@@ -3528,7 +3642,9 @@ async function fetchOSRMRouteAlternatives(
   }
 
   const coords = coordsString(waypoints);
-  const url = `${osrmBase}/${coords}?overview=full&geometries=geojson&steps=true&alternatives=${alternativesCount}`;
+  // Mapbox takes alternatives=true|false only (up to 2 alternatives).
+  const alternatives = isMapboxBackend() ? 'true' : String(alternativesCount);
+  const url = `${osrmBase}/${coords}?overview=full&geometries=geojson&steps=true&alternatives=${alternatives}${routeProfileParams()}`;
 
   const cached = osrmAlternativesCache.get(url);
   if (cached !== undefined) {
@@ -4327,7 +4443,14 @@ export async function generateOSRMRoutes(
       const altWaypoints: RoutePoint[] = [center, end];
       const prefetchedResult = (async () => {
         const alts = await p2pAlternativesPromise;
-        return { route: alts[altIdx] ?? null, waypoints: altWaypoints };
+        const alt = alts[altIdx] ?? null;
+        // Mapbox routes are re-fetched from their waypoints (favorites, #64),
+        // and [center, end] alone gives back the primary route: pin the
+        // alternative with a via point on its own streets.
+        const waypoints = alt && isMapboxBackend()
+          ? [center, alternativeViaPoint(alt, alts[0]), end]
+          : altWaypoints;
+        return { route: alt, waypoints };
       })();
       candidates.push({
         variant: timeSeed + 1000 + altIdx,
@@ -4971,7 +5094,7 @@ export async function generateOSRMRoutes(
       // wrong-display fallback pool so the algorithm has something to return
       // even when geometry simply can't fit the requested mile (LES 6mi-
       // sized cases).
-      const candidateRecord: ResolvedCandidate = { index: i, variant: candidates[i].variant, points, distKm, estimatedTime, fromOSRM: true, anchors: candidates[i].anchors, qualityPenalty, dirtiness: retraced + overlap, steps: candidateSteps, pathShare };
+      const candidateRecord: ResolvedCandidate = { index: i, variant: candidates[i].variant, points, distKm, estimatedTime, fromOSRM: true, anchors: candidates[i].anchors, qualityPenalty, dirtiness: retraced + overlap, steps: candidateSteps, pathShare, waypoints: osrmResult.waypoints };
       const adjustUnitsForCheck = useAdjustment ? adjustUnits : null;
       if (adjustUnitsForCheck && !roundedDisplayMatches(distKm, distanceKm, adjustUnitsForCheck)) {
         wrongDisplayFallback.push(candidateRecord);
@@ -5242,6 +5365,7 @@ export async function generateOSRMRoutes(
           anchors: [],
           qualityPenalty: 0.5, // step-3.5 emergency fallback — no anchors, but real OSRM geometry
           steps: extractManeuvers(chosen.route),
+          waypoints: chosen.waypoints,
         };
         // Same right-display gate as step 3. If the bearing trials couldn't
         // converge to the requested mile/km, send the result to the wrong-
@@ -5470,6 +5594,9 @@ export async function generateOSRMRoutes(
       routeStyle: routeType,
       steps: candidate.steps,
       ...(candidate.pathShare !== undefined ? { pathShare: candidate.pathShare } : {}),
+      // Mapbox routes may not be stored (CLAUDE.md #64): keep the request
+      // waypoints so a favorite can re-fetch the route instead.
+      ...(isMapboxBackend() ? { source: 'mapbox' as const, waypoints: candidate.waypoints } : {}),
     };
   });
 }

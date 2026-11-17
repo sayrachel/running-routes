@@ -316,7 +316,8 @@ function installFetchCounter(): void {
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async (input: any, init?: any) => {
     const url = typeof input === 'string' ? input : String(input?.url ?? input);
-    const isRoute = url.includes('/route/');
+    // Mapbox Directions (CLAUDE.md #64) is the route call on the hosted backend.
+    const isRoute = url.includes('/route/') || url.includes('/directions/');
     const isNearest = url.includes('/nearest/');
     if (isRoute) fetchStats.routeCalls++;
     if (isNearest) fetchStats.nearestCalls++;
@@ -507,6 +508,8 @@ async function runFixture(f: Fixture, captureTrace: boolean, useSynthetic: boole
       };
     }
     const r = routes[0];
+    // Mapbox-backed routes carry their waypoints for favorites / Google Maps (#64).
+    if (r.source === 'mapbox') console.log(`  [mapbox] ${f.name}: ${r.waypoints?.length ?? 0} waypoints, ${r.points.length} pts`);
     const points = r.points;
     let actualKm = 0;
     for (let i = 1; i < points.length; i++) actualKm += haversineDistance(points[i - 1], points[i]);

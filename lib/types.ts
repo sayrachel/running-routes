@@ -33,6 +33,11 @@ export interface FavoriteRouteRecord {
   lat: number;
   lng: number;
   points?: { lat: number; lng: number }[];
+  /** Mapbox routes (CLAUDE.md #64): the request waypoints, stored instead of
+   *  `points` because Mapbox's terms bar storing its routes. The preview
+   *  re-fetches the route from them. */
+  waypoints?: { lat: number; lng: number }[];
+  source?: 'mapbox';
   createdAt: number; // timestamp ms
 }
 

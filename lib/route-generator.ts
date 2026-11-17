@@ -48,6 +48,12 @@ export interface GeneratedRoute {
   // prompts / map arrow. Optional because firestore-loaded routes predate it
   // and because the run UI degrades to "passive tracing" when missing.
   steps?: ManeuverStep[]
+  // Set when the route came from Mapbox Directions (CLAUDE.md #64). Mapbox's
+  // terms bar storing or exporting its routes: favorites save `waypoints`
+  // (the request inputs) and re-fetch, GPX export is off, and the map shows
+  // Mapbox attribution.
+  source?: "mapbox"
+  waypoints?: RoutePoint[]
 }
 
 function toRad(deg: number): number {

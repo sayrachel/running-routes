@@ -44,6 +44,9 @@ export interface FavoriteRoute {
   lat: number;
   lng: number;
   points?: { lat: number; lng: number }[];
+  /** Mapbox routes: waypoints to re-fetch from, instead of `points`. */
+  waypoints?: { lat: number; lng: number }[];
+  source?: 'mapbox';
   createdAt?: number;
 }
 
@@ -188,6 +191,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             lat: f.lat,
             lng: f.lng,
             points: f.points,
+            waypoints: f.waypoints,
+            source: f.source,
             createdAt: f.createdAt,
           }))
         );
@@ -237,6 +242,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           lat: f.lat,
           lng: f.lng,
           points: f.points,
+          waypoints: f.waypoints,
+          source: f.source,
           createdAt: f.createdAt,
         }))
       );
@@ -264,6 +271,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           lat: favWithDate.lat,
           lng: favWithDate.lng,
           points: favWithDate.points,
+          waypoints: favWithDate.waypoints,
+          source: favWithDate.source,
           createdAt: now,
         }).catch(console.warn);
       }

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { View, Text, Pressable, StyleSheet, Linking, ActivityIndicator } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
@@ -6,7 +6,8 @@ import { Ionicons } from '@expo/vector-icons';
 import { RouteMap } from '@/components/RouteMap';
 import { useAppContext } from '@/lib/AppContext';
 import { generateRoutes } from '@/lib/route-generator';
-import { generateOSRMRoutes } from '@/lib/osrm';
+import { generateOSRMRoutes, fetchRouteThroughWaypoints } from '@/lib/osrm';
+import type { RoutePoint } from '@/lib/route-generator';
 import type { FavoriteRoute } from '@/lib/AppContext';
 import { Colors, Fonts } from '@/lib/theme';
 import { distanceUnit } from '@/lib/units';
@@ -31,19 +32,35 @@ export function FavoritePreview({ favorite, onClose }: FavoritePreviewProps) {
   const center = { lat: favorite.lat, lng: favorite.lng };
   const routeType = mapTerrain(favorite.terrain);
 
-  // Use stored points if available, otherwise fall back to mock generator
-  const previewRoute = favorite.points && favorite.points.length > 0
+  // Mapbox favorites (CLAUDE.md #64) store waypoints, not the polyline:
+  // re-fetch the route from them. Until it arrives (or if it fails) the map
+  // shows no route rather than a made-up one.
+  const fromWaypoints = !(favorite.points && favorite.points.length > 0) && !!favorite.waypoints?.length;
+  const [fetchedPoints, setFetchedPoints] = useState<RoutePoint[] | null>(null);
+  useEffect(() => {
+    if (!fromWaypoints || !favorite.waypoints) return;
+    let cancelled = false;
+    fetchRouteThroughWaypoints(favorite.waypoints, routeType)
+      .then((r) => { if (!cancelled && r) setFetchedPoints(r.points); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [favorite.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const storedPoints = favorite.points && favorite.points.length > 0 ? favorite.points : fetchedPoints;
+  // Use stored (or re-fetched) points if available, otherwise fall back to mock generator
+  const previewRoute = storedPoints
     ? {
         id: favorite.id,
         name: favorite.routeName,
-        points: favorite.points,
+        points: storedPoints,
         distance: favorite.distance,
         estimatedTime: 0,
         elevationGain: 0,
         terrain: favorite.terrain,
         difficulty: 'moderate' as const,
+        ...(fromWaypoints ? { source: 'mapbox' as const } : {}),
       }
-    : (generateRoutes(
+    : fromWaypoints ? null : (generateRoutes(
         center,
         favorite.distance,
         routeType === 'point-to-point' ? 'out-and-back' : routeType,
