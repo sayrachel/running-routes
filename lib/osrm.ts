@@ -14,9 +14,20 @@ let osrmBase = OSRM_BASE_DEFAULT;
  *  - 'running': a self-hosted server built from osrm/running.lua — walking
  *    plus bike paths, named streets preferred over sidewalks, response
  *    classes (CLAUDE.md #62).
+ *  - 'walking': a hosted walking router with OSRM-shaped responses but no
+ *    running classes (Mapbox Directions `mapbox/walking`, CLAUDE.md #63):
+ *    sidewalks carry their street's name, park paths are unnamed.
  *  Calibration constants that depend on the profile are switched here. */
-export type RoutingProfile = 'car' | 'running';
+export type RoutingProfile = 'car' | 'running' | 'walking';
 let routingProfile: RoutingProfile = 'car';
+
+/** Both walking profiles. Streets work in both directions on foot, so loop
+ *  geometry, waypoint-detour repair and some quality gates differ from the
+ *  car profile, where one-way streets kept outbound and return legs apart
+ *  (CLAUDE.md #63). Car behavior is unchanged by everything keyed to this. */
+export function isWalkingProfile(profile: RoutingProfile = routingProfile): boolean {
+  return profile !== 'car';
+}
 
 /** Self-hosted running-profile server (osrm/README.md). null until one is
  *  deployed — production then routes everything through the public car
@@ -133,6 +144,7 @@ export class OSRMUnavailableError extends Error {
 const ROUTING_OVERHEAD_BY_PROFILE: Record<RoutingProfile, number> = {
   car: 1.45,
   running: 1.25,
+  walking: 1.25,
 };
 let ROUTING_OVERHEAD = ROUTING_OVERHEAD_BY_PROFILE.car;
 
@@ -1175,8 +1187,14 @@ export function hasRoutedBarrierCrossing(
   // and was being rejected as a barrier crossing. Real tunnels/bridges are
   // typically longer than 1km of fully-straight constant-bearing geometry.
   const minStraightKm = 1.2;
+  // Skipped for walking profiles (CLAUDE.md #63): walkers can't use the car
+  // tunnels this targets (they're motorways, excluded on foot), so on foot
+  // it only fired on long straight greenways and avenues — which walking
+  // loops with the start on the perimeter use more. Ferries are rejected
+  // separately from the response (routeUsesFerry).
+  const checkStraightSegments = !isWalkingProfile();
 
-  for (let i = 0; i < routePoints.length - sampleInterval * 3; i += sampleInterval) {
+  for (let i = 0; checkStraightSegments && i < routePoints.length - sampleInterval * 3; i += sampleInterval) {
     // Look ahead by multiple sample intervals to catch longer straight segments
     for (let lookAhead = 3; lookAhead <= 8; lookAhead++) {
       const j = i + sampleInterval * lookAhead;
@@ -1227,7 +1245,13 @@ export function hasRoutedBarrierCrossing(
   if (center && targetDistanceKm) {
     // Max allowed distance from center: proportional to route distance,
     // but capped conservatively. A 5km loop should stay within ~2km of start.
-    const maxDriftKm = Math.min(targetDistanceKm * 0.45, 8);
+    // Walking loops (CLAUDE.md #63) have the start on the perimeter, so
+    // their far side is ~0.27–0.29× the route length away (vs ~0.2× with
+    // the start in the middle): the 8km cap rejected every 20mi+ candidate.
+    // No cap on foot — there are no car tunnels to wander through.
+    const maxDriftKm = isWalkingProfile()
+      ? targetDistanceKm * 0.45
+      : Math.min(targetDistanceKm * 0.45, 8);
 
     for (let i = 0; i < routePoints.length; i += sampleInterval) {
       const drift = haversineDistance(center, routePoints[i]);
@@ -1738,7 +1762,12 @@ export function expandParkWaypoints(
   // Was 0.1 km² which caught medium parks like East River Park (0.32) and
   // Boston Common (0.20) — those got stubby routes; better to just route
   // to the park center and let OSRM pick the natural approach.
-  minAreaForExpansion: number = 0.5
+  minAreaForExpansion: number = 0.5,
+  // Find each waypoint's anchor by position instead of by index. Walking
+  // loops (CLAUDE.md #63) mix anchored and geometric vertices, and `anchors`
+  // lists only the anchored ones, so index pairing would expand a geometric
+  // vertex using some other waypoint's park. Off for car (unchanged).
+  matchByPoint: boolean = false,
 ): RoutePoint[] {
   if (waypoints.length < 3 || anchors.length === 0) return waypoints;
 
@@ -1746,12 +1775,14 @@ export function expandParkWaypoints(
 
   for (let i = 1; i < waypoints.length - 1; i++) {
     const anchorIdx = i - 1;
-    if (anchorIdx >= anchors.length || anchors[anchorIdx].areaSize < minAreaForExpansion) {
+    const anchor = matchByPoint
+      ? anchors.find((a) => a.point.lat === waypoints[i].lat && a.point.lng === waypoints[i].lng)
+      : anchors[anchorIdx];
+    if (!anchor || anchor.areaSize < minAreaForExpansion) {
       result.push(waypoints[i]);
       continue;
     }
 
-    const anchor = anchors[anchorIdx];
     // Estimate park "radius" from area (assuming roughly square)
     // and cap offset so we don't overshoot small-medium parks
     const parkRadiusKm = Math.sqrt(anchor.areaSize) / 2;
@@ -1792,9 +1823,9 @@ function generateGreenSpaceLoop(
   greenSpaces: GreenSpace[],
   strategy: CandidateStrategy
 ): { waypoints: RoutePoint[]; anchors: GreenSpace[] } {
-  const result = selectGreenSpaceWaypoints(
-    center, greenSpaces, distanceKm, prefs.lowTraffic, variant, strategy
-  );
+  const result = isWalkingProfile()
+    ? selectWalkingGreenSpaceWaypoints(center, greenSpaces, distanceKm, prefs.lowTraffic, variant, strategy)
+    : selectGreenSpaceWaypoints(center, greenSpaces, distanceKm, prefs.lowTraffic, variant, strategy);
 
   if (result) return result;
 
@@ -2362,6 +2393,8 @@ interface OSRMStep {
    *  busy / service, the public car profile only toll / motorway / ferry /
    *  restricted / tunnel. Absent in mock routes. */
   intersections?: { location: [number, number]; classes?: string[] }[];
+  /** Travel mode for the step ('walking', 'driving', 'ferry', ...). */
+  mode?: string;
 }
 
 interface OSRMLeg {
@@ -2430,6 +2463,146 @@ export function scaleWaypoints(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Waypoint detour repair (walking profiles, CLAUDE.md #63)
+// ---------------------------------------------------------------------------
+
+/** Per-leg polylines from a route's step geometries (needs steps=true). */
+function legPolylines(route: OSRMRoute): RoutePoint[][] | null {
+  if (!route.legs || route.legs.length === 0) return null;
+  const legs: RoutePoint[][] = [];
+  for (const leg of route.legs) {
+    const pts: RoutePoint[] = [];
+    for (const step of leg.steps) {
+      for (const [lng, lat] of step.geometry?.coordinates ?? []) {
+        const last = pts[pts.length - 1];
+        if (!last || last.lat !== lat || last.lng !== lng) pts.push({ lat, lng });
+      }
+    }
+    if (pts.length < 2) return null;
+    legs.push(pts);
+  }
+  return legs;
+}
+
+/** Points every ~stepKm along a polyline, with cumulative distance `s` (km). */
+function resamplePolyline(points: RoutePoint[], stepKm: number): { p: RoutePoint; s: number }[] {
+  const out = [{ p: points[0], s: 0 }];
+  let s = 0;
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1];
+    const b = points[i];
+    const len = haversineDistance(a, b);
+    const k = Math.max(1, Math.ceil(len / stepKm));
+    for (let t = 1; t <= k; t++) {
+      out.push({ p: { lat: a.lat + ((b.lat - a.lat) * t) / k, lng: a.lng + ((b.lng - a.lng) * t) / k }, s: s + (len * t) / k });
+    }
+    s += len;
+  }
+  return out;
+}
+
+export interface WaypointDetour {
+  /** Waypoint index (1..n-2) the detour goes out to. */
+  index: number;
+  /** Point on the incoming leg where the detour starts. */
+  divergence: RoutePoint;
+  /** True when the detour starts at the previous waypoint (whole leg doubled). */
+  wholeLeg: boolean;
+  /** Route length of the detour (km): incoming leg from the divergence point
+   *  to the waypoint, plus the outgoing leg back to that point. */
+  detourKm: number;
+  /** Incoming-leg distance the outgoing leg runs back over (km). */
+  doubledKm: number;
+}
+
+/**
+ * Dead-end detours at via waypoints of a walking route: the route reaches
+ * waypoint k and leaves back the way it came (with continue_straight=true it
+ * turns at the next corner or loops a block, then retraces). Walks back from
+ * the waypoint along the incoming leg while the outgoing leg's early part
+ * (≤ 2× the walked-back distance + 400m) passes within 25m. Uncovered gaps of
+ * ≤400m are tolerated so a loop at the tip (lollipop) still counts as one
+ * detour. Only detours that double back ≥ minDoubledKm are reported.
+ */
+export function findWaypointDetours(route: OSRMRoute, minDoubledKm = 0.08): WaypointDetour[] {
+  const legs = legPolylines(route);
+  if (!legs || legs.length < 2) return [];
+  const TOL_KM = 0.025;
+  const STEP_KM = 0.01;
+  const GAP_KM = 0.4;
+  const CELL_DEG = 0.0003; // ~33m lat, ~25m lng at NYC — neighbor cells cover TOL
+  const detours: WaypointDetour[] = [];
+  for (let k = 1; k < legs.length; k++) {
+    const inPts = resamplePolyline(legs[k - 1], STEP_KM);
+    const outPts = resamplePolyline(legs[k], STEP_KM);
+    const inLen = inPts[inPts.length - 1].s;
+    const grid = new Map<string, number[]>();
+    outPts.forEach((q, idx) => {
+      const key = `${Math.floor(q.p.lat / CELL_DEG)},${Math.floor(q.p.lng / CELL_DEG)}`;
+      const list = grid.get(key);
+      if (list) list.push(idx);
+      else grid.set(key, [idx]);
+    });
+    let lastCovered = -1;
+    let lastMatchS = 0;
+    let doubledKm = 0;
+    let prevCovered = false;
+    for (let i = inPts.length - 1; i >= 0; i--) {
+      const back = inLen - inPts[i].s;
+      const coveredBack = lastCovered >= 0 ? inLen - inPts[lastCovered].s : 0;
+      if (back - coveredBack > GAP_KM) break;
+      const maxOutS = 2 * back + 0.4;
+      const p = inPts[i].p;
+      const ci = Math.floor(p.lat / CELL_DEG);
+      const cj = Math.floor(p.lng / CELL_DEG);
+      let matchS = -1;
+      for (let di = -1; di <= 1 && matchS < 0; di++) {
+        for (let dj = -1; dj <= 1 && matchS < 0; dj++) {
+          for (const idx of grid.get(`${ci + di},${cj + dj}`) ?? []) {
+            const q = outPts[idx];
+            if (q.s <= maxOutS && haversineDistance(p, q.p) <= TOL_KM) { matchS = q.s; break; }
+          }
+        }
+      }
+      const covered = matchS >= 0;
+      if (covered) {
+        if (prevCovered && i + 1 < inPts.length) doubledKm += inPts[i + 1].s - inPts[i].s;
+        lastCovered = i;
+        lastMatchS = matchS;
+      }
+      prevCovered = covered;
+    }
+    if (lastCovered < 0 || doubledKm < minDoubledKm) continue;
+    detours.push({
+      index: k,
+      divergence: inPts[lastCovered].p,
+      wholeLeg: inPts[lastCovered].s < 0.05,
+      detourKm: (inLen - inPts[lastCovered].s) + lastMatchS,
+      doubledKm,
+    });
+  }
+  return detours;
+}
+
+/** Move each detour's waypoint back to where its detour starts, so the next
+ *  request passes that point and continues instead of going out and back.
+ *  A detour spanning the whole incoming leg means the waypoint is a pure
+ *  spur off the previous one: drop it, if ≥2 intermediate waypoints remain. */
+export function applyDetourRepairs(waypoints: RoutePoint[], detours: WaypointDetour[]): RoutePoint[] {
+  const out = [...waypoints];
+  const drop = new Set<number>();
+  for (const d of detours) {
+    if (d.index <= 0 || d.index >= out.length - 1) continue;
+    if (d.wholeLeg) {
+      if (out.length - 2 - drop.size - 1 >= 2) drop.add(d.index);
+      continue;
+    }
+    out[d.index] = d.divergence;
+  }
+  return out.filter((_, i) => !drop.has(i));
+}
+
 /**
  * Fetch an OSRM route and iteratively adjust waypoint distances so the
  * routed distance lands within ±30% of the target. This handles cases
@@ -2481,6 +2654,10 @@ async function fetchOSRMRouteAdjusted(
   // If iteration runs out without satisfying both, returns best-so-far (the
   // caller decides whether to accept or hard-reject the wrong-display result).
   requireRoundedTargetUnits: 'imperial' | 'metric' | null = null,
+  // Walking loops (CLAUDE.md #63): repair dead-end detours at via waypoints
+  // between attempts (findWaypointDetours / applyDetourRepairs), and don't
+  // accept a route that still has one while attempts remain.
+  repairDetours: boolean = false,
 ): Promise<{ route: OSRMRoute | null; waypoints: RoutePoint[] }> {
   // Sequential first attempt + iterative refinement. A previous experiment
   // hedged 3 parallel scales upfront for wall-clock wins, but tripled the
@@ -2491,7 +2668,7 @@ async function fetchOSRMRouteAdjusted(
   let currentWaypoints = waypoints;
   // Track the best result we've seen across attempts so we don't accidentally
   // return a worse-fitting later attempt just because it ran last.
-  let best: { route: OSRMRoute; waypoints: RoutePoint[]; ratio: number } | null = null;
+  let best: { route: OSRMRoute; waypoints: RoutePoint[]; ratio: number; err: number } | null = null;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const route = await fetchOSRMRoute(currentWaypoints);
@@ -2503,13 +2680,19 @@ async function fetchOSRMRouteAdjusted(
 
     const routeDistKm = route.distance / 1000;
     const ratio = routeDistKm / targetDistanceKm;
-    traceEmit('adjust-attempt', { attempt, distKm: routeDistKm, ratio, target: targetDistanceKm });
+    const detours = repairDetours ? findWaypointDetours(route) : [];
+    const detourKm = detours.reduce((sum, d) => sum + d.detourKm, 0);
+    traceEmit('adjust-attempt', {
+      attempt, distKm: routeDistKm, ratio, target: targetDistanceKm,
+      ...(repairDetours ? { detourKm, detours: detours.length, waypoints: currentWaypoints } : {}),
+    });
 
-    // Track best-so-far by closeness to ratio = 1.
-    const prevBestErr = best ? Math.abs(1 - best.ratio) : Infinity;
-    const thisErr = Math.abs(1 - ratio);
+    // Track best-so-far by closeness to ratio = 1, plus (walking loops) the
+    // share of the route spent on detours — ground covered twice.
+    const prevBestErr = best ? best.err : Infinity;
+    const thisErr = Math.abs(1 - ratio) + (routeDistKm > 0 ? detourKm / routeDistKm : 0);
     if (!best || thisErr < prevBestErr) {
-      best = { route, waypoints: currentWaypoints, ratio };
+      best = { route, waypoints: currentWaypoints, ratio, err: thisErr };
     }
 
     // Accept window ±15%. Tighter (±7%) caused over-iteration and
@@ -2523,7 +2706,7 @@ async function fetchOSRMRouteAdjusted(
       const roundedOk =
         !requireRoundedTargetUnits ||
         roundedDisplayMatches(routeDistKm, targetDistanceKm, requireRoundedTargetUnits);
-      if (roundedOk) {
+      if (roundedOk && detours.length === 0) {
         return { route, waypoints: currentWaypoints };
       }
     }
@@ -2589,10 +2772,23 @@ async function fetchOSRMRouteAdjusted(
     // the next attempt. Trace data showed candidates oscillating
     // 10km → 28km → 7km → 11km when an unbounded scale (1.8×) pushed
     // waypoints across the East/Hudson rivers.
-    const scaleFactor = 1 / ratio;
+    // Walking loops: move detour waypoints back to where their detours start
+    // first, and scale for the distance that leaves (the detours come off).
+    let nextWaypoints = currentWaypoints;
+    let scaleRatio = ratio;
+    if (detours.length > 0) {
+      nextWaypoints = applyDetourRepairs(currentWaypoints, detours);
+      scaleRatio = Math.max(0.3, (routeDistKm - detourKm) / targetDistanceKm);
+      traceEmit('adjust-detour-repair', {
+        attempt,
+        detours: detours.map((d) => ({ index: d.index, detourKm: d.detourKm, doubledKm: d.doubledKm, wholeLeg: d.wholeLeg })),
+        expectedRatio: scaleRatio,
+      });
+    }
+    const scaleFactor = 1 / scaleRatio;
     const dampedScale = 1 + (scaleFactor - 1) * 0.7;
     const cappedScale = Math.max(0.80, Math.min(1.25, dampedScale));
-    currentWaypoints = scaleWaypoints(currentWaypoints, center, cappedScale);
+    currentWaypoints = scaleWaypoints(nextWaypoints, center, cappedScale);
   }
 
   return best
@@ -2886,8 +3082,12 @@ export function computeOffStreetRatio(
       // space catchment (parks, named cycleways, pedestrian zones,
       // waterfronts). One representative point is enough — green-space
       // catchments are tens-to-hundreds of meters and steps are typically
-      // <500m in dense areas.
-      if (isStepInsideAnyGreenSpace(step, greenSpaces)) continue;
+      // <500m in dense areas. Walking profile without classes (Mapbox,
+      // CLAUDE.md #63): park paths are its unnamed steps, so use park
+      // bounding boxes as the running profile does — the centroid circle
+      // alone rejected 6 of 12 Columbus Circle candidates for Central Park
+      // paths.
+      if (isStepInsideAnyGreenSpace(step, greenSpaces, isWalkingProfile())) continue;
       offStreetMeters += step.distance;
     }
   }
@@ -3000,11 +3200,11 @@ export function routeClassShare(route: OSRMRoute): Record<string, number> | null
   return share;
 }
 
-function isStepInsideAnyGreenSpace(step: OSRMStep, greenSpaces: GreenSpace[]): boolean {
+function isStepInsideAnyGreenSpace(step: OSRMStep, greenSpaces: GreenSpace[], useBounds = false): boolean {
   const coords = step.geometry?.coordinates;
   if (!coords || coords.length === 0) return false;
   const mid = coords[Math.floor(coords.length / 2)];
-  return isPointInsideAnyGreenSpace({ lat: mid[1], lng: mid[0] }, greenSpaces);
+  return isPointInsideAnyGreenSpace({ lat: mid[1], lng: mid[0] }, greenSpaces, useBounds);
 }
 
 /** ~40m of slop around a park's bounding box. */
@@ -3039,13 +3239,26 @@ function isPointInsideAnyGreenSpace(point: RoutePoint, greenSpaces: GreenSpace[]
   return false;
 }
 
-/** Extra /route query parameters for the configured profile. Running
- *  profile: `continue_straight=true` forbids U-turns AT via waypoints. The
+/** Extra /route query parameters for the configured profile. Walking
+ *  profiles: `continue_straight=true` forbids U-turns AT via waypoints. The
  *  car profile gets that by default; walking profiles don't, so without it
  *  every off-path waypoint (park centroid, anchor) becomes an out-and-back
  *  spur and loops retrace (CLAUDE.md #62). */
 function routeProfileParams(): string {
-  return routingProfile === 'running' ? '&continue_straight=true' : '';
+  return isWalkingProfile() ? '&continue_straight=true' : '';
+}
+
+/** True when any step of the route is a ferry crossing. Walking routers
+ *  can include ferries (osrm/running.lua drops them; hosted routers may
+ *  not), and a ferry is never part of a run (CLAUDE.md #63). */
+export function routeUsesFerry(route: OSRMRoute): boolean {
+  for (const leg of route.legs ?? []) {
+    for (const step of leg.steps) {
+      if (step.mode === 'ferry') return true;
+      for (const it of step.intersections ?? []) if (it.classes?.includes('ferry')) return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -3379,6 +3592,9 @@ function generateLoopWaypoints(
   const numWaypoints = targetMi >= 22 ? 4 : targetMi >= 14 ? 3 : 2;
   const seedBearing = (variant * 73) % 360;
 
+  // Walking profiles: start on the loop, not in its middle (CLAUDE.md #63).
+  if (isWalkingProfile()) return walkingLoopWaypoints(center, distanceKm, seedBearing);
+
   if (numWaypoints === 2) {
     // Original triangle shape — keep byte-identical for distances where
     // it works (avoids regression on the well-tested ≤14mi path).
@@ -3412,6 +3628,240 @@ function generateLoopWaypoints(
     wps.push(destinationPoint(center, angle, waypointDist));
   }
   return [center, ...wps, center];
+}
+
+// ---------------------------------------------------------------------------
+// Walking loop geometry (CLAUDE.md #63)
+// ---------------------------------------------------------------------------
+//
+// Every car-era loop generator places waypoints AROUND the start: two
+// waypoints sit on roughly opposite sides of it (bearings θ and θ+165°..210°),
+// three or more spread over 330–360°. Under car routing one-way streets kept
+// the outbound and return legs on different avenues, so those shapes still
+// came back as loops. On foot the router uses the same street both ways, so
+// the leg between two opposite waypoints runs back past the start along the
+// streets the first leg used: out-and-backs, figure-8s through the start, and
+// in-and-out park visits (45-fixture audit: 428 of 468 loop candidates had a
+// near-U-turn ≥150° at some waypoint).
+//
+// Walking loops instead put the start ON a circle and the waypoints on the
+// rest of it — the round-trip construction other running-route generators
+// use. Every leg moves on to new ground, and the two legs at the start leave
+// it 360/(n+1)° apart.
+
+/** Waypoints (excluding the start) for a walking loop of this length. */
+function walkingLoopVertexCount(distanceKm: number): number {
+  const mi = distanceKm * 0.621371;
+  // ≤2.5mi: a triangle — square sides would be 2–3 blocks and the router
+  // block-weaves between waypoints that close. Long loops get more vertices
+  // so each stays within reach of the start, as in the car generators.
+  return mi < 2.5 ? 2 : mi < 14 ? 3 : mi < 22 ? 4 : 5;
+}
+
+/** A regular (n+1)-gon inscribed in a circle through the start. The circle's
+ *  center lies `radiusKm` from the start at the plan's bearing; vertex j sits
+ *  j·stepDeg around the circle from the start. */
+export interface WalkingLoopPlan {
+  circleCenter: RoutePoint;
+  radiusKm: number;
+  /** Bearing of the start as seen from circleCenter. */
+  startAngle: number;
+  stepDeg: number;
+  /** Polygon side: straight-line spacing of consecutive vertices (km). */
+  sideKm: number;
+  n: number;
+}
+
+export function planWalkingLoop(
+  center: RoutePoint,
+  distanceKm: number,
+  bearing: number,
+  n: number = walkingLoopVertexCount(distanceKm),
+): WalkingLoopPlan {
+  const k = n + 1;
+  const sidePerRadius = 2 * Math.sin(Math.PI / k);
+  // Perimeter k·side, inflated by ROUTING_OVERHEAD to approximate routed length.
+  const radiusKm = distanceKm / (k * sidePerRadius * ROUTING_OVERHEAD);
+  return {
+    circleCenter: destinationPoint(center, bearing, radiusKm),
+    radiusKm,
+    startAngle: (bearing + 180) % 360,
+    stepDeg: 360 / k,
+    sideKm: radiusKm * sidePerRadius,
+    n,
+  };
+}
+
+/** Vertex j (1..n) of a plan, optionally slid `jitterDeg` along the circle. */
+export function walkingLoopVertex(plan: WalkingLoopPlan, j: number, jitterDeg = 0): RoutePoint {
+  return destinationPoint(plan.circleCenter, (plan.startAngle + j * plan.stepDeg + jitterDeg + 720) % 360, plan.radiusKm);
+}
+
+/** Position of a point along a plan's loop: degrees around the circle from
+ *  the start, in traversal order (0 = start, 360 = back at start). */
+function walkingLoopAngle(plan: WalkingLoopPlan, p: RoutePoint): number {
+  return (bearingFrom(plan.circleCenter, p) - plan.startAngle + 720) % 360;
+}
+
+/** Purely geometric walking loop: [center, ...n vertices, center]. */
+export function walkingLoopWaypoints(center: RoutePoint, distanceKm: number, bearing: number): RoutePoint[] {
+  const plan = planWalkingLoop(center, distanceKm, bearing);
+  const vertices: RoutePoint[] = [];
+  for (let j = 1; j <= plan.n; j++) vertices.push(walkingLoopVertex(plan, j));
+  return [center, ...vertices, center];
+}
+
+const WALKING_LINEAR_KINDS = new Set<GreenSpace['kind']>(['cycleway', 'footway', 'path', 'route', 'waterfront']);
+
+/** Walking counterpart of planMacroSnapLoop: plan the loop's vertices on a
+ *  circle through the start, then snap each to the nearest scenic anchor
+ *  within reach (linear corridors at half distance, as in the car version),
+ *  sliding the vertex up to ±30° along the circle before giving up. */
+function planWalkingMacroSnapLoop(
+  center: RoutePoint,
+  distanceKm: number,
+  variant: number,
+  greenSpaces: GreenSpace[],
+): PlannedLoop {
+  const plan = planWalkingLoop(center, distanceKm, (variant * 137) % 360);
+  const snapRadiusKm = Math.max(0.4, Math.min(2.0, plan.sideKm * 0.4));
+  const JITTER_DEGREES = [0, 15, -15, 30, -30];
+  const used = new Set<number>();
+  const waypoints: RoutePoint[] = [center];
+  const anchors: GreenSpace[] = [];
+  const snapIdx: number[] = [];
+  for (let j = 1; j <= plan.n; j++) {
+    let bestIdx = -1;
+    let bestEffective = snapRadiusKm;
+    for (const jitter of JITTER_DEGREES) {
+      const vertex = walkingLoopVertex(plan, j, jitter);
+      for (let idx = 0; idx < greenSpaces.length; idx++) {
+        if (used.has(idx)) continue;
+        const d = haversineDistance(vertex, greenSpaces[idx].point);
+        if (d > snapRadiusKm) continue;
+        const effective = WALKING_LINEAR_KINDS.has(greenSpaces[idx].kind) ? d * 0.5 : d;
+        if (effective < bestEffective) {
+          bestEffective = effective;
+          bestIdx = idx;
+        }
+      }
+      if (bestIdx !== -1) break;
+    }
+    if (bestIdx !== -1) {
+      waypoints.push(greenSpaces[bestIdx].point);
+      anchors.push(greenSpaces[bestIdx]);
+      used.add(bestIdx);
+    } else {
+      snapIdx.push(waypoints.length);
+      waypoints.push(walkingLoopVertex(plan, j));
+    }
+  }
+  waypoints.push(center);
+  return { waypoints, anchors, snapIdx };
+}
+
+/** Walking counterpart of planCorridorLoop: for each planned vertex, the
+ *  closest unused linear corridor (greenway, waterfront, named path) within
+ *  0.6 side lengths; geometric vertex otherwise. */
+function planWalkingCorridorLoop(
+  center: RoutePoint,
+  distanceKm: number,
+  variant: number,
+  greenSpaces: GreenSpace[],
+): PlannedLoop {
+  const corridors = greenSpaces.filter((gs) => WALKING_LINEAR_KINDS.has(gs.kind));
+  const plan = planWalkingLoop(center, distanceKm, (variant * 137) % 360);
+  if (corridors.length < Math.min(2, plan.n)) {
+    return planWalkingMacroSnapLoop(center, distanceKm, variant, greenSpaces);
+  }
+  const searchKm = plan.sideKm * 0.6;
+  const used = new Set<number>();
+  const waypoints: RoutePoint[] = [center];
+  const anchors: GreenSpace[] = [];
+  const snapIdx: number[] = [];
+  for (let j = 1; j <= plan.n; j++) {
+    const vertex = walkingLoopVertex(plan, j);
+    let bestIdx = -1;
+    let bestScore = Infinity;
+    for (let idx = 0; idx < corridors.length; idx++) {
+      if (used.has(idx)) continue;
+      const d = haversineDistance(vertex, corridors[idx].point);
+      if (d > searchKm) continue;
+      const score = d / plan.sideKm + (corridors[idx].tier === 1 ? -0.1 : 0);
+      if (score < bestScore) {
+        bestScore = score;
+        bestIdx = idx;
+      }
+    }
+    if (bestIdx !== -1) {
+      waypoints.push(corridors[bestIdx].point);
+      anchors.push(corridors[bestIdx]);
+      used.add(bestIdx);
+    } else {
+      snapIdx.push(waypoints.length);
+      waypoints.push(vertex);
+    }
+  }
+  waypoints.push(center);
+  return { waypoints, anchors, snapIdx };
+}
+
+/** Walking counterpart of selectGreenSpaceWaypoints (anchor-first
+ *  strategies). Same scoring and refresh perturbation, but anchors are drawn
+ *  from a band around a circle through the start and picked one per arc of
+ *  that circle, then visited in order around it. Arcs without a usable
+ *  anchor get the plan's geometric vertex. Returns null when no arc has an
+ *  anchor (caller falls back to the geometric loop). */
+export function selectWalkingGreenSpaceWaypoints(
+  center: RoutePoint,
+  greenSpaces: GreenSpace[],
+  targetDistanceKm: number,
+  strict: boolean,
+  variant: number,
+  strategy: CandidateStrategy,
+): { waypoints: RoutePoint[]; anchors: GreenSpace[] } | null {
+  const plan = planWalkingLoop(center, targetDistanceKm, (variant * 137 + 60) % 360);
+  const waypointKinds = new Set(['park', 'garden', 'nature', 'waterfront']);
+  const minStartDist = Math.min(Math.max(0.3, targetDistanceKm * 0.08), 0.6);
+  // Keep clear of the start's own position on the circle so the first and
+  // last legs don't share streets near the start.
+  const MIN_ARC_DEG = Math.min(30, plan.stepDeg / 2);
+  const annotated = greenSpaces
+    .filter((gs) => waypointKinds.has(gs.kind) || (gs.kind === 'route' && gs.name))
+    .map((gs) => {
+      const perturbation = Math.sin(variant * 1000 + gs.point.lat * 10000 + gs.point.lng * 10000) * 2;
+      const radialKm = haversineDistance(plan.circleCenter, gs.point);
+      const radialMiss = Math.abs(radialKm - plan.radiusKm) / plan.radiusKm;
+      return {
+        gs,
+        arc: walkingLoopAngle(plan, gs.point),
+        radialKm,
+        score: scoreGreenSpace(gs, strategy, strict) + perturbation - radialMiss * 10,
+      };
+    })
+    .filter((a) => a.radialKm >= plan.radiusKm * 0.5 && a.radialKm <= plan.radiusKm * 1.5)
+    .filter((a) => a.arc >= MIN_ARC_DEG && a.arc <= 360 - MIN_ARC_DEG)
+    .filter((a) => haversineDistance(center, a.gs.point) >= minStartDist);
+
+  const slots: { point: RoutePoint; anchor: GreenSpace | null }[] = [];
+  for (let j = 1; j <= plan.n; j++) {
+    const lo = Math.max(MIN_ARC_DEG, (j - 0.5) * plan.stepDeg);
+    const hi = Math.min(360 - MIN_ARC_DEG, (j + 0.5) * plan.stepDeg);
+    let best: typeof annotated[number] | null = null;
+    for (const a of annotated) {
+      if (a.arc < lo || a.arc >= hi) continue;
+      if (slots.some((s) => s.anchor === a.gs)) continue;
+      if (!best || a.score > best.score) best = a;
+    }
+    slots.push(best
+      ? { point: best.gs.point, anchor: best.gs }
+      : { point: walkingLoopVertex(plan, j), anchor: null });
+  }
+  if (!slots.some((s) => s.anchor)) return null;
+  return {
+    waypoints: [center, ...slots.map((s) => s.point), center],
+    anchors: slots.filter((s) => s.anchor).map((s) => s.anchor!),
+  };
 }
 
 /**
@@ -3736,7 +4186,7 @@ export async function generateOSRMRoutes(
     builtAnchors: GreenSpace[],
   ): { waypoints: RoutePoint[]; anchors: GreenSpace[] } => {
     const synced = removeWaterCrossingsWithAnchors(builtWaypoints, greenSpaces, center, builtAnchors, distanceKm);
-    const waypoints = expandParkWaypoints(synced.waypoints, synced.anchors);
+    const waypoints = expandParkWaypoints(synced.waypoints, synced.anchors, undefined, isWalkingProfile());
     traceEmit('candidate-built', {
       i,
       strategy,
@@ -3826,9 +4276,10 @@ export async function generateOSRMRoutes(
       // snap is deferred into this candidate's own launch pipeline (#59).
       // Previously each snap was awaited right here, serially, so every
       // candidate's first route request waited on all of them.
+      const walking = isWalkingProfile();
       const plan = strategy === 'macro-snap'
-        ? planMacroSnapLoop(center, distanceKm, variant, availableGreenSpaces)
-        : planCorridorLoop(center, distanceKm, variant, availableGreenSpaces);
+        ? (walking ? planWalkingMacroSnapLoop : planMacroSnapLoop)(center, distanceKm, variant, availableGreenSpaces)
+        : (walking ? planWalkingCorridorLoop : planCorridorLoop)(center, distanceKm, variant, availableGreenSpaces);
       for (const a of plan.anchors) usedParkPoints.push(a.point);
       const spec: CandidateSpec = { variant, waypoints: plan.waypoints, anchors: plan.anchors };
       if (plan.snapIdx.length === 0) {
@@ -3913,6 +4364,9 @@ export async function generateOSRMRoutes(
   // property mask those scorer blind spots until we can address them
   // properly.
   const useAdjustment = routeType !== 'point-to-point';
+  // Walking loops: repair dead-end detours at via waypoints between distance
+  // attempts (CLAUDE.md #63). Out-and-back is one big detour by design.
+  const repairWalkingDetours = isWalkingProfile() && routeType === 'loop';
   // Loop and out-and-back targets are user-chosen — we should land on the
   // displayed mile/km the user requested. Point-to-point distance is fixed
   // by the start/end pair; nothing to converge to.
@@ -3958,7 +4412,7 @@ export async function generateOSRMRoutes(
       const result = c.prefetchedResult
         ? await c.prefetchedResult
         : useAdjustment
-          ? await fetchOSRMRouteAdjusted(c.waypoints, center, distanceKm, 4, adjustUnits)
+          ? await fetchOSRMRouteAdjusted(c.waypoints, center, distanceKm, 4, adjustUnits, repairWalkingDetours)
           : { route: await fetchOSRMRoute(c.waypoints), waypoints: c.waypoints };
       return { idx, result };
     })();
@@ -4111,16 +4565,23 @@ export async function generateOSRMRoutes(
       // property. Bounded blast radius inside the trimmer caps removal at
       // 25% of route length so degenerate near-OAB candidates don't get
       // gutted.
-      const points = routeType === 'out-and-back'
+      const afterRetrace = routeType === 'out-and-back'
         ? afterPendant
         : trimRetracedSpurs(afterPendant, 50);
-      if (points !== afterPendant) {
+      if (afterRetrace !== afterPendant) {
         let retraceTrimKm = 0;
-        for (let k = 1; k < points.length; k++) {
-          retraceTrimKm += haversineDistance(points[k - 1], points[k]);
+        for (let k = 1; k < afterRetrace.length; k++) {
+          retraceTrimKm += haversineDistance(afterRetrace[k - 1], afterRetrace[k]);
         }
         traceEmit('post-process-trim', { i, stage: 'retrace-spurs', before: afterPendantKm, after: retraceTrimKm });
       }
+      // Walking profiles (CLAUDE.md #63): the pendant / retraced-spur trims
+      // can leave a reversal of a few meters at their cut (e.g. 2m in, 2m
+      // out at a waypoint on a Mapbox route), which trimStubs — run before
+      // them — never sees. One more stub pass removes it. Car unchanged.
+      const points = isWalkingProfile() && routeType !== 'out-and-back'
+        ? trimStubs(afterRetrace, stubThresholdKm)
+        : afterRetrace;
       // Recompute distance from the FINAL points (after both lollipop
       // removal and stub trimming) so the displayed mileage matches the
       // polyline drawn on the map.
@@ -4144,8 +4605,10 @@ export async function generateOSRMRoutes(
         traceEmit('candidate-rejected', { i, reason: 'distance', distKm, distRatio, target: distanceKm });
         continue;
       }
-      // HARD REJECT: route crosses a clear barrier (tunnel, bridge, water)
-      if (routeType !== 'point-to-point' && hasRoutedBarrierCrossing(points, greenSpaces, center, distanceKm)) {
+      // HARD REJECT: route crosses a clear barrier (tunnel, bridge, water),
+      // or (walking profiles) takes a ferry anywhere, p2p included.
+      if ((isWalkingProfile() && routeUsesFerry(osrmRoute)) ||
+          (routeType !== 'point-to-point' && hasRoutedBarrierCrossing(points, greenSpaces, center, distanceKm))) {
         qualityRejectCount++;
         rejectReasons.barrier++;
         traceEmit('candidate-rejected', { i, reason: 'barrier', distKm });
@@ -4215,7 +4678,7 @@ export async function generateOSRMRoutes(
       // urban grids legitimately route up to ~40% on dominant avenues
       // even on coherent loops; 0.50 is the egregious floor.
       if (routeType === 'loop') {
-        const streetShare = maxStreetShare(candidateSteps, routingProfile === 'running');
+        const streetShare = maxStreetShare(candidateSteps, isWalkingProfile());
         if (streetShare > 0.50) {
           qualityRejectCount++;
           rejectReasons.backtrack++;
@@ -4429,7 +4892,7 @@ export async function generateOSRMRoutes(
         : shortTurnSegmentRatio(points, 0.2);
       const streetShare = (isOutAndBack || routeType === 'point-to-point')
         ? 0
-        : maxStreetShare(candidateSteps, routingProfile === 'running');
+        : maxStreetShare(candidateSteps, isWalkingProfile());
       // Start-spur and block-loop detection (CLAUDE.md #41). Both produce
       // routes that are visibly broken even when distance/retrace/etc. are
       // fine: start-spur means the start point is a dead-end branch off
@@ -4599,6 +5062,8 @@ export async function generateOSRMRoutes(
       const buildWaypoints = (bearing: number): RoutePoint[] => {
         if (routeType === 'out-and-back') {
           return [center, destinationPoint(center, bearing, halfDist), center];
+        } else if (isWalkingProfile()) {
+          return walkingLoopWaypoints(center, distanceKm, bearing);
         } else if (numLoopWaypoints === 2) {
           return [
             center,
@@ -4631,7 +5096,7 @@ export async function generateOSRMRoutes(
             const bearing = (seedBearing + phase + (k * 360) / FIRST_PASS_BEARINGS) % 360;
             const i = passIdx * FIRST_PASS_BEARINGS + k;
             const wps = buildWaypoints(bearing);
-            return fetchOSRMRouteAdjusted(wps, center, distanceKm, 3, adjustUnits)
+            return fetchOSRMRouteAdjusted(wps, center, distanceKm, 3, adjustUnits, repairWalkingDetours)
               .then((t) => ({ i, bearing, t }));
           })
         );

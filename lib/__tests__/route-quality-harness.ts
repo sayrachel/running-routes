@@ -916,14 +916,16 @@ async function main() {
   // --profile running: the --osrm-base server was built from
   // osrm/running.lua (CLAUDE.md #62), so profile-dependent calibration
   // (ROUTING_OVERHEAD, class-aware off-street gate) switches with it.
+  // --profile walking: a walking router without running classes, e.g.
+  // Mapbox through /tmp/rr-tools/mapbox-proxy.mjs (CLAUDE.md #63).
   const profileIdx = argv.indexOf('--profile');
   const profileArg = profileIdx >= 0 ? argv[profileIdx + 1] : 'car';
-  if (profileArg !== 'car' && profileArg !== 'running') {
-    console.error(`--profile must be car or running (got ${profileArg})`);
+  if (profileArg !== 'car' && profileArg !== 'running' && profileArg !== 'walking') {
+    console.error(`--profile must be car, running or walking (got ${profileArg})`);
     process.exit(2);
   }
-  if (profileArg === 'running' && !osrmBase) {
-    console.error('--profile running requires --osrm-base pointing at a running-profile server');
+  if (profileArg !== 'car' && !osrmBase) {
+    console.error(`--profile ${profileArg} requires --osrm-base pointing at a ${profileArg}-profile server`);
     process.exit(2);
   }
   if (osrmBase) setOSRMBase(osrmBase, profileArg);

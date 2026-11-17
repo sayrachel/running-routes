@@ -11,7 +11,7 @@
 
 Production hits the **free public** `router.project-osrm.org` endpoint. It is rate-limited and tail-latency-prone. Concrete lessons from past regressions:
 
-- **That endpoint only serves the CAR profile — `/foot/` in the URL is ignored** (verified Nov 2026: `/route/v1/foot/…` and `/route/v1/driving/…` return byte-identical routes at ~25 km/h; a real foot profile returns walking speed and different geometry). Every route this app has generated is a car route: it obeys one-way streets, can use highways/tunnels, and can NOT use park paths, greenways, esplanades, car-free park drives, or boardwalks. Many entries below (highway/tunnel/barrier gates, block-loop and zigzag penalties, "no waterfront paths") are workarounds for car-routing artifacts. See "Routing profile" under the Nov 2026 audit section before changing endpoints — a real foot server (e.g. FOSSGIS `routing.openstreetmap.de/routed-foot`) returns mostly UNNAMED sidewalk steps, which the off-street gate (#35) rejects wholesale. **Migration in progress (#62):** `osrm/running.lua` (walking + bike paths) for a self-hosted server; the app switches per generation via `RUNNING_SERVER` in `lib/osrm.ts`, which is `null` until a server is deployed (car path byte-identical until then). Both free public servers' usage policies say max 1 request/second — this app bursts ~12 and makes ~30 per generation.
+- **That endpoint only serves the CAR profile — `/foot/` in the URL is ignored** (verified Nov 2026: `/route/v1/foot/…` and `/route/v1/driving/…` return byte-identical routes at ~25 km/h; a real foot profile returns walking speed and different geometry). Every route this app has generated is a car route: it obeys one-way streets, can use highways/tunnels, and can NOT use park paths, greenways, esplanades, car-free park drives, or boardwalks. Many entries below (highway/tunnel/barrier gates, block-loop and zigzag penalties, "no waterfront paths") are workarounds for car-routing artifacts. See "Routing profile" under the Nov 2026 audit section before changing endpoints — a real foot server (e.g. FOSSGIS `routing.openstreetmap.de/routed-foot`) returns mostly UNNAMED sidewalk steps, which the off-street gate (#35) rejects wholesale. **Migration in progress (#62, #63):** the user will NOT self-host a server (personal project); the candidate walking router is Mapbox Directions `mapbox/walking` (free tier, OSRM-shaped responses, token in gitignored `.env.local` as `EXPO_PUBLIC_MAPBOX_TOKEN`), not yet wired into the app. Everything walking-specific is keyed to `isWalkingProfile()` (`'running'` = osrm/running.lua, `'walking'` = Mapbox-style router without running classes); production stays on the car router until then and car geometry is byte-identical. Both free public OSRM servers' usage policies say max 1 request/second — this app bursts ~12 and makes ~30 per generation (walking loops ~36, #63).
 
 - **Total simultaneous request count matters more than per-candidate math.** A change that "only adds 2 parallel calls per candidate" with 7 candidates = 21 simultaneous requests. The endpoint will throttle that burst and return nulls. Keep the steady-state in-flight count ≤ candidate count (currently 7).
 - **The harness does NOT validate against the public endpoint.** `--synthetic` uses mock OSRM (zero latency, zero failure rate). Local OSRM (`--osrm-base http://localhost:5000/...`) has no rate limits. **Neither environment can detect a regression that only manifests under public-OSRM rate limiting.** A "quality bumped X/N → Y/N" number from the harness is a claim about algorithm correctness, NOT about endpoint behavior.
@@ -20,7 +20,7 @@ Production hits the **free public** `router.project-osrm.org` endpoint. It is ra
 
 ### Pre-flight checklist for any change that touches OSRM call patterns (volume, timeout, hedging, caching) or quality gates
 
-1. Run `npm test` and `npm run quality -- --synthetic`. Baselines: ~410/410 unit tests, ~59/60 synthetic harness (the 1 fail is `nyc-les-1mi-loop-quiet`, pre-existing).
+1. Run `npm test` and `npm run quality -- --synthetic`. Baselines: ~423/423 unit tests, ~59/60 synthetic harness (the 1 fail is `nyc-les-1mi-loop-quiet`, pre-existing).
 2. **Run `npm run quality:real`** — exercises every fixture against `router.project-osrm.org` and diffs against `lib/__tests__/fixtures/real-osrm-baseline.json`. Catches the harness/prod gap that `--synthetic` is structurally blind to (real-OSRM dense-grid pathologies, tail latency, rate limiting). Takes ~5 minutes (3s per fixture spacing). Exit code 1 on any regressed fixture. If a regression is real (the algorithm legitimately got worse for a fixture), fix it. If a regression is intended (the algorithm legitimately got better and the baseline is stale), refresh with `npm run quality:real:record`.
 3. **Manually generate ≥5 routes against public OSRM** from the actual app (or a dev build) before committing the change. Cover: a quick repeat (cache hit case), a fresh location (cold case), and a hard case (water-bounded grid like LES or DUMBO). If any route renders as straight lines or obviously degenerate triangles — STOP and investigate; even `quality:real` may not catch this.
 4. Don't ship a perf claim ("X% faster", "wall-clock from A to B") that wasn't measured against the production endpoint. Local/mock numbers are NOT a proxy.
@@ -1295,6 +1295,7 @@ pattern. Use local foot OSRM (port 5000) to prototype and measure.
     rejections in `--dump` traces list the offending pieces. The
     `greenProximity` metric counts points within 200m of park CENTROIDS, so
     it can't see a route crossing a big park — use `path=` for foot routes.
+    **Status (Nov 17):** (1) superseded — user won't self-host; Mapbox walking is the candidate (#63); (2) and (3) fixed by #63. Original list:
     **Open before production:** (1) a hosted server (user decision; NY State
     extract needs ~3 GB RAM, HTTPS in front); (2) long loops near water —
     Columbus 8–30mi pick out-and-backs over one bridge (Queensboro) or one
@@ -1306,6 +1307,77 @@ pattern. Use local foot OSRM (port 5000) to prototype and measure.
     Loop") pass the name-based part of the off-street gate; (5) the #54
     /nearest warm-up still warms the car endpoint; (6) pre-flight steps 2–4
     against the deployed server, incl. ≥5 on-device generations.
+
+63. **Walking-router loop fixes: start on the loop, detour repair, Mapbox
+    gates.** User declined to self-host (#62 open item 1); Mapbox Directions
+    `mapbox/walking` is the candidate hosted walking router (10k req/month free
+    without a card, 300 req/min even on trial, OSRM-shaped responses, sidewalks
+    named after their street, park paths unnamed, no /nearest). Spot check with
+    the unchanged generator (5 NYC fixtures via `/tmp/rr-tools/mapbox-proxy.mjs`,
+    which maps OSRM URLs to Mapbox): 2/5 vs car 4/5 — out-and-back detours
+    (retrace 9–17%) and 6/12 Columbus candidates rejected off-street for Central
+    Park paths. Mapbox terms bar bulk/automated queries: never run the full
+    harness against it, only ~10-fixture spot checks.
+    **Root cause:** every loop generator put waypoints AROUND the start — two
+    at bearings θ and θ+165–210°, three or more over 330–360°. One-way streets
+    kept car legs on different avenues; on foot the router uses the same street
+    both ways, so the leg between opposite waypoints ran back past the start:
+    out-and-backs, figure-8s through the start, in-and-out park visits (428 of
+    468 loop candidates had a ≥150° turn at some waypoint). Same cause as #62's
+    Columbus 8–30mi and DUMBO failures.
+    **Fixes (all behind `isWalkingProfile()`; car geometry identical 45/45):**
+    - `RoutingProfile` gains `'walking'` (walking router without running
+      classes); `isWalkingProfile()` covers running + walking for
+      continue_straight, total-distance street share and overhead 1.25.
+    - Loop shape: `planWalkingLoop` / `walkingLoopVertex` put the start ON a
+      circle — regular (n+1)-gon, n = 2 under 2.5mi, 3 under 14mi, 4 under
+      22mi, else 5, sized so perimeter × ROUTING_OVERHEAD = target. Walking
+      versions of macro-snap (anchor within 0.4 side, slide ±30° along the
+      circle), corridor-loop (nearest corridor within 0.6 side of each vertex),
+      the anchor-first strategies (`selectWalkingGreenSpaceWaypoints`: anchors
+      in a 0.5–1.5r band, one per arc, ≥30° of arc clear of the start, −10 per
+      unit radial miss) and both geometric fallbacks. Distance scaling about
+      the start keeps the shape. `expandParkWaypoints(..., matchByPoint)`
+      pairs parks to waypoints by position (mixed anchored/geometric loops
+      list only anchored vertices in `anchors`; index pairing expanded the
+      wrong waypoint — the car path keeps index pairing).
+    - Detour repair in `fetchOSRMRouteAdjusted` (walking loops):
+      `findWaypointDetours` walks back from each via waypoint along the
+      incoming leg while the outgoing leg's early part (≤ 2× walked-back +
+      400m) passes within 25m, tolerating ≤400m gaps (lollipops); ≥80m doubled
+      counts. `applyDetourRepairs` moves the waypoint to the divergence point
+      (drops it when the whole leg doubles and ≥2 waypoints remain); the next
+      attempt scales for the distance minus the detours; a route with a detour
+      isn't accepted while attempts remain; best-so-far error adds the detour
+      share. A final `trimStubs` pass after the pendant / retraced-spur trims
+      removes few-meter reversals those cuts leave (a 2m-in/2m-out Mapbox
+      U-turn at a waypoint failed the 0-stub requirement).
+    - Gates: off-street gate uses park bounding boxes for unnamed steps on
+      walking profiles (Mapbox park paths); the straight-segment "tunnel"
+      heuristic is skipped on foot (car tunnels are motorways); ferries
+      rejected via step mode/class (`routeUsesFerry`, p2p included);
+      geographic drift cap 0.45×target with no 8km cap (start-on-perimeter
+      loops reach ~0.28×target; the cap rejected every 20mi+ candidate).
+    **Measured (45 NYC fixtures, synthetic greens):** running profile 39 → 45;
+    shortest-path stand-in for Mapbox (running.lua with flat preferences,
+    turn penalty 2: `~/osrm-data/walkplain`, port 5005) 36 → 45 (old vs new
+    generator). Loops: retrace mean 3.0% → 0.8%, overlap 2.6% → 0.3%,
+    Polsby-Popper 0.32 → 0.58; distance error median 3.1% → 1.6%; turns/km
+    ~2.1 either way; long loops (>7mi) 0/5 → 5/5. Mapbox spot check (new code):
+    10/10 (Columbus 5mi now a clean loop instead of in-and-out of Central Park;
+    DUMBO along Brooklyn Bridge Park instead of into the Navy Yard). Cost:
+    route calls per generation 28.4 → 36.0 (detour repair forces more
+    attempts; 27% of candidates use all 5). Ablation with the final stub trim:
+    repair off 44/45 + 43/45 at 29 calls; ≥150m only 44/45 + 45/45 at 33;
+    ≥80m (chosen) 45/45 + 45/45 at 36.
+    **Open:** wire Mapbox in (URL builder + token, no /nearest — skip snapping
+    or use returned waypoint locations, `alternatives=true` boolean only,
+    on-device check); Mapbox terms changes (no persisted route cache
+    (osrm-persist), favorites store waypoints and re-route on open, GPX export
+    off for Mapbox routes, Mapbox logo + © Mapbox © OpenStreetMap under the
+    map); route names still credit an anchor a detour repair moved away from;
+    Mapbox walking ignores greenways (`walkway_bias=1` changed nothing on
+    W 14th→W 34th), so path share relies on anchors.
 
 ### Recurring-fix discipline
 
